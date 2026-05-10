@@ -35,63 +35,170 @@ backup-able) and lets the tooling iterate independently.
 
 ## Install
 
+The install splits into two parts:
+
+- **(A) The tooling** — clone this repo and `pip install` once per machine.
+- **(B) Per-dev wiring** — link the skill, install the `/pp-chat:*` slash
+  commands, set env vars. Repeat for each Claude Code user on the box.
+
+You only need part B for Claude Code users. MCP-only users (Cursor / Cline /
+opencode) skip the skill + slash command steps and configure their MCP client
+to launch `pair-pressure-mcp` instead.
+
+### A. Tooling install (once per machine)
+
 ```bash
 git clone https://github.com/walangstudio/pair-pressure.git
 cd pair-pressure
 pip install -e .                  # installs `pp`, `pp-init`
-pip install -e ".[mcp]"           # also installs the MCP server deps
+pip install -e ".[mcp]"           # also installs the MCP server deps (optional)
 ```
 
 Editable install is recommended — the skill scripts at
-`.claude/skills/pair-pressure/scripts/` stay the source of truth, and `pp` /
-`pp-init` are thin console-script entry points that call into them. Pull the
-repo to upgrade.
+`.claude/skills/pair-pressure/scripts/` stay the source of truth and `pp` /
+`pp-init` are thin console-script entry points that call into them. To
+upgrade, `git pull` the repo.
 
-Verify:
+Verify the CLI is on PATH:
 
 ```bash
-pp --version            # → pair-pressure 0.2.0
+pp --version              # → pair-pressure 0.2.0
 pp-init --version
 ```
 
-> **No-install fallback.** If you'd rather not pip-install, the scripts work
-> standalone:
-> `python3 .claude/skills/pair-pressure/scripts/pp.py …`
-> `python3 scripts/pp-init.py …`
-> Same behavior; longer to type.
+If `pp` is **not found**, your Python install's `Scripts/` (Windows) or
+`bin/` (POSIX) directory isn't on PATH. Either fix PATH (run
+`python -m site --user-base` to find the prefix; add `<prefix>/Scripts` or
+`<prefix>/bin` to PATH), or use the no-install fallback:
 
-## Setup (per dev)
+> **No-install fallback.** Skip `pip install` and run the scripts directly:
+> ```
+> python3 .claude/skills/pair-pressure/scripts/pp.py <verb> [args]
+> python3 scripts/pp-init.py [args]
+> ```
+> Same behavior; longer to type. The slash commands and MCP server still
+> assume `pp` is on PATH, so this fallback is for ad-hoc CLI use only.
 
-1. **Clone the chat repo** somewhere local:
+### B. Per-dev wiring
 
-   ```bash
-   git clone <your-team-chat-remote-url> ~/code/pair-pressure-chat
-   cd ~/code/pair-pressure-chat
-   git config user.name alice
-   git config user.email alice@team.com
-   ```
+You'll do this once per Claude Code user on the machine. The chat repo
+(separate from this tooling repo — see [Repos](#repos)) must already exist;
+if it doesn't, see [Bootstrapping the chat repo](#bootstrapping-the-chat-repo-once-by-whoever-creates-it).
 
-2. **Install the skill** for Claude Code:
+#### B1. Clone the chat repo
 
-   ```bash
-   ln -s "$(pwd)/.claude/skills/pair-pressure" ~/.claude/skills/pair-pressure
-   ```
+```bash
+git clone <your-team-chat-remote-url> ~/code/pair-pressure-chat
+cd ~/code/pair-pressure-chat
+git config user.name alice
+git config user.email alice@team.com
+```
 
-   …from inside this repo's checkout. Or copy the directory if you'd rather
-   not symlink.
+The `user.name` you set here is **only for git commit attribution**. The
+identity pair-pressure uses for posts comes from the `PAIR_PRESSURE_AUTHOR`
+env var (step B4) — different devs on the same machine can each have their
+own author identity by setting that variable per session.
 
-3. **Set env vars** in `~/.claude/settings.local.json`:
+#### B2. Install the skill into Claude Code
 
-   ```json
-   {
-     "env": {
-       "PAIR_PRESSURE_REPO": "/home/alice/code/pair-pressure-chat",
-       "PAIR_PRESSURE_AUTHOR": "alice"
-     }
-   }
-   ```
+Link `.claude/skills/pair-pressure` from this tooling repo into your
+user-global Claude config so the skill loads in any working directory.
 
-4. In Claude Code, prompt: *"list pair-pressure channels"* — confirms wiring.
+**macOS / Linux:**
+```bash
+ln -s "$(pwd)/.claude/skills/pair-pressure" ~/.claude/skills/pair-pressure
+```
+…run from inside the tooling repo's checkout.
+
+**Windows (PowerShell):**
+```powershell
+# Junction works without admin / dev mode; symlink would need either.
+cmd /c mklink /j "$env:USERPROFILE\.claude\skills\pair-pressure" `
+    "C:\path\to\pair-pressure\.claude\skills\pair-pressure"
+```
+
+If you'd rather not symlink/junction, just copy the directory in instead.
+
+#### B3. Install the `/pp-chat:*` slash commands
+
+The slash commands live as one `.md` file per verb under
+`~/.claude/commands/pp-chat/`. Copy them in from this repo (they're not
+versioned here — they're user-global Claude Code config).
+
+**macOS / Linux:**
+```bash
+mkdir -p ~/.claude/commands/pp-chat
+# (copy from a teammate's machine, or generate per the skill's docs)
+```
+
+**Windows (PowerShell):**
+```powershell
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude\commands\pp-chat" | Out-Null
+```
+
+You should end up with 12 files: `new`, `join`, `list`, `read`, `reply`,
+`dev-reply`, `send-md`, `send-task`, `claim`, `complete`, `resolve`,
+`status`. Each is a short markdown file telling Claude how to call the
+underlying `pp` verb. (If you're starting from scratch, ask Claude to
+"install the pp-chat slash commands" with the skill loaded — it knows the
+mappings and will write them out.)
+
+#### B4. Set environment variables
+
+In `~/.claude/settings.local.json`:
+
+```json
+{
+  "env": {
+    "PAIR_PRESSURE_REPO": "/home/alice/code/pair-pressure-chat",
+    "PAIR_PRESSURE_AUTHOR": "alice"
+  }
+}
+```
+
+On Windows, use the absolute Windows path with forward slashes or
+double-escaped backslashes:
+```json
+{ "env": {
+    "PAIR_PRESSURE_REPO": "C:/Users/alice/code/pair-pressure-chat",
+    "PAIR_PRESSURE_AUTHOR": "alice"
+}}
+```
+
+Two devs sharing one machine: each starts Claude Code from a shell where
+they've set `PAIR_PRESSURE_AUTHOR` themselves (overrides the file).
+
+#### B5. Verify
+
+In Claude Code:
+
+```
+/pp-chat:status
+```
+
+Expected output:
+
+```
+Author: alice
+Repo:   /home/alice/code/pair-pressure-chat
+Current thread: none — use /pp-chat:join or /pp-chat:new to set one
+```
+
+If author/repo show as "(not set)", env vars aren't being picked up — check
+`~/.claude/settings.local.json` JSON syntax and restart Claude Code. If the
+slash command doesn't autocomplete, the files in
+`~/.claude/commands/pp-chat/` aren't being discovered — check filenames
+(must be `<verb>.md`, lowercase, no extra spaces).
+
+Then try a real round-trip:
+
+```
+/pp-chat:list
+/pp-chat:new "test thread" --kind discussion
+```
+
+You should see the new thread land in your chat repo (`git log` in the
+chat repo will show the commit).
 
 ## Bootstrapping the chat repo (once, by whoever creates it)
 
