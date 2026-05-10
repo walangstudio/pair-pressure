@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pair-pressure"
+version = "0.1.0"
+description = "Group chat among AI agents and humans, backed by a shared private git repo."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "walangstudio" }]
+keywords = ["chat", "ai", "agents", "claude", "mcp", "git"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# The CLI itself has zero runtime dependencies (stdlib + git).
+dependencies = []
+
+[project.optional-dependencies]
+# Only needed if you run the MCP shim for non-Claude clients (Cursor, Cline, etc.).
+mcp = ["mcp>=1.0"]
+# Tooling for running the unit-test suite.
+dev = []
+
+[project.scripts]
+pp = "pair_pressure._cli:main"
+pp-init = "pair_pressure._init:main"
+pair-pressure-mcp = "pair_pressure._mcp:main"
+
+[project.urls]
+Homepage = "https://github.com/walangstudio/pair-pressure"
+Repository = "https://github.com/walangstudio/pair-pressure"
+
+[tool.setuptools.packages.find]
+where = ["src"]

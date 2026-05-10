@@ -1,0 +1,245 @@
+"""Unit tests for pp.py pure functions.
+
+Run from the scripts/ directory:
+    python3 -m unittest tests.test_pp
+or:
+    python3 tests/test_pp.py
+"""
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+
+# pp imports require these env vars only when verb functions run; importing
+# the module is fine without them.
+import pp  # noqa: E402
+
+
+class FrontmatterTests(unittest.TestCase):
+    def test_parse_basic(self):
+        fm, body = pp.parse_fm("---\nid: 001\nauthor: alice\n---\nhello\n")
+        self.assertEqual(fm, {"id": "001", "author": "alice"})
+        self.assertEqual(body, "hello\n")
+
+    def test_parse_no_frontmatter(self):
+        fm, body = pp.parse_fm("just a body\n")
+        self.assertEqual(fm, {})
+        self.assertEqual(body, "just a body\n")
+
+    def test_parse_null_values(self):
+        fm, _ = pp.parse_fm("---\nin_reply_to: null\nmodel: ~\nstance:\n---\n")
+        self.assertIsNone(fm["in_reply_to"])
+        self.assertIsNone(fm["model"])
+        self.assertIsNone(fm["stance"])
+
+    def test_parse_quoted_string(self):
+        fm, _ = pp.parse_fm('---\ntitle: "has: colon"\n---\n')
+        self.assertEqual(fm["title"], "has: colon")
+
+    def test_parse_quoted_with_escape(self):
+        fm, _ = pp.parse_fm('---\ntitle: "she said \\"hi\\""\n---\n')
+        self.assertEqual(fm["title"], 'she said "hi"')
+
+    def test_dump_basic(self):
+        text = pp.dump_fm({"id": "001", "author": "alice"}, "hello")
+        self.assertTrue(text.startswith("---\nid: 001\nauthor: alice\n---\n"))
+        self.assertTrue(text.endswith("hello"))
+
+    def test_dump_null(self):
+        text = pp.dump_fm({"x": None}, "")
+        self.assertIn("x: null", text)
+
+    def test_dump_quotes_special_chars(self):
+        text = pp.dump_fm({"title": "has: colon"}, "")
+        self.assertIn('title: "has: colon"', text)
+
+    def test_dump_quotes_null_lookalike(self):
+        # The string "null" must be quoted, otherwise re-parsing turns it into None.
+        text = pp.dump_fm({"value": "null"}, "")
+        fm, _ = pp.parse_fm(text)
+        self.assertEqual(fm["value"], "null")
+
+    def test_roundtrip(self):
+        original = {
+            "id": "042",
+            "in_reply_to": None,
+            "author": "alice-bot",
+            "via": "claude-code",
+            "model": "claude-opus-4-7",
+            "stance": "contradict",
+            "timestamp": "2026-05-10T14:22:11Z",
+        }
+        text = pp.dump_fm(original, "body content here\n")
+        parsed, body = pp.parse_fm(text)
+        self.assertEqual(parsed, original)
+        self.assertEqual(body, "body content here\n")
+
+
+class SlugifyTests(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(pp.slugify("Hello World"), "hello-world")
+
+    def test_special_chars(self):
+        self.assertEqual(pp.slugify("OAuth refresh-token race!"), "oauth-refresh-token-race")
+
+    def test_collapses_separators(self):
+        self.assertEqual(pp.slugify("a   b___c"), "a-b-c")
+
+    def test_strips_edge_dashes(self):
+        self.assertEqual(pp.slugify("---weird---"), "weird")
+
+    def test_empty_falls_back(self):
+        self.assertEqual(pp.slugify("!!!"), "untitled")
+        self.assertEqual(pp.slugify(""), "untitled")
+
+    def test_length_cap(self):
+        s = pp.slugify("a" * 200)
+        self.assertLessEqual(len(s), 48)
+
+
+class InitialStatusTests(unittest.TestCase):
+    def test_task(self):
+        self.assertEqual(pp._initial_status("task"), "unclaimed")
+
+    def test_decision(self):
+        self.assertEqual(pp._initial_status("decision"), "proposed")
+
+    def test_discussion(self):
+        self.assertEqual(pp._initial_status("discussion"), "open")
+
+    def test_investigation(self):
+        self.assertEqual(pp._initial_status("investigation"), "open")
+
+
+class OrdinalTests(unittest.TestCase):
+    def test_ord_extracts_prefix(self):
+        self.assertEqual(pp._ord(Path("000-seed.md")), 0)
+        self.assertEqual(pp._ord(Path("042-reply.md")), 42)
+
+    def test_post_files_sorted_numerically(self):
+        # Build a temp thread with out-of-order filenames; _post_files must
+        # return them sorted by the numeric prefix, not lexicographically.
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d)
+            for n in (10, 2, 100, 0, 5):
+                (t / f"{n:03d}-x.md").write_text("---\n---\nx\n")
+            (t / "meta.json").write_text("{}")  # decoy
+            (t / "ignore.md").write_text("decoy")  # decoy
+            ordered = [p.name for p in pp._post_files(t)]
+        self.assertEqual(
+            ordered,
+            ["000-x.md", "002-x.md", "005-x.md", "010-x.md", "100-x.md"],
+        )
+
+    def test_post_files_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(pp._post_files(Path(d)), [])
+
+
+class SnippetTests(unittest.TestCase):
+    def test_match_returns_line(self):
+        text = "---\nid: 001\n---\nfirst line\nsecond OAuth line\nthird\n"
+        self.assertEqual(pp._snippet(text, "oauth"), "second OAuth line")
+
+    def test_no_match_returns_first_body_line(self):
+        text = "---\nid: 001\n---\n\nactual content here\nmore\n"
+        self.assertEqual(pp._snippet(text, "missing"), "actual content here")
+
+    def test_long_line_centered(self):
+        # 300-char line; the snippet should be capped and contain the match.
+        line = "x" * 200 + " NEEDLE " + "y" * 200
+        text = f"---\n---\n{line}\n"
+        snip = pp._snippet(text, "needle", width=80)
+        self.assertLessEqual(len(snip), 82)  # +/- ellipsis chars
+        self.assertIn("NEEDLE", snip)
+
+
+class LockHelperTests(unittest.TestCase):
+    def test_no_claim_is_unlocked(self):
+        self.assertFalse(pp._is_locked_by_other(None, "alice"))
+
+    def test_abandoned_is_unlocked(self):
+        c = {"assignee": "alice", "state": "abandoned"}
+        self.assertFalse(pp._is_locked_by_other(c, "bob"))
+
+    def test_claim_by_other_is_locked(self):
+        c = {"assignee": "alice", "state": "claimed"}
+        self.assertTrue(pp._is_locked_by_other(c, "bob"))
+
+    def test_own_claim_is_not_locked_against_self(self):
+        c = {"assignee": "alice", "state": "in_progress"}
+        self.assertFalse(pp._is_locked_by_other(c, "alice"))
+
+
+class RequireAssigneeTests(unittest.TestCase):
+    def test_missing_claim_returns_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            err = pp._require_assignee(Path(d), "alice")
+            self.assertEqual(err["ok"], False)
+            self.assertIn("not claimed", err["error"])
+
+    def test_other_assignee_returns_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d)
+            pp.write_json(t / "claim.json",
+                          {"assignee": "alice", "state": "claimed"})
+            err = pp._require_assignee(t, "bob")
+            self.assertEqual(err["error"], "not assignee")
+            self.assertEqual(err["claimed_by"], "alice")
+
+    def test_self_assignee_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d)
+            pp.write_json(t / "claim.json",
+                          {"assignee": "alice", "state": "claimed"})
+            self.assertIsNone(pp._require_assignee(t, "alice"))
+
+    def test_abandoned_blocks_even_for_self(self):
+        # Once abandoned, the assignee must re-claim before mutating.
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d)
+            pp.write_json(t / "claim.json",
+                          {"assignee": "alice", "state": "abandoned"})
+            err = pp._require_assignee(t, "alice")
+            self.assertIn("abandoned", err["error"])
+
+
+class SafeSubpathTests(unittest.TestCase):
+    def test_accepts_simple_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d)
+            (parent / "general").mkdir()
+            self.assertEqual(
+                pp._safe_subpath(parent, "general"),
+                (parent / "general").resolve(),
+            )
+
+    def test_rejects_dotdot_escape(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d) / "channels"
+            parent.mkdir()
+            with self.assertRaises(SystemExit):
+                pp._safe_subpath(parent, "../escaped")
+
+    def test_rejects_absolute_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d)
+            with self.assertRaises(SystemExit):
+                pp._safe_subpath(parent, str(Path(d).anchor or "/") + "etc")
+
+    def test_rejects_parent_itself(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d)
+            with self.assertRaises(SystemExit):
+                pp._safe_subpath(parent, ".")
+
+
+if __name__ == "__main__":
+    # Don't require env vars to be set just to run tests.
+    os.environ.setdefault("PAIR_PRESSURE_REPO", "/tmp/_pp_unused")
+    os.environ.setdefault("PAIR_PRESSURE_AUTHOR", "test")
+    unittest.main()
