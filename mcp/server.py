@@ -120,14 +120,27 @@ def new_thread(
     summary: str = "",
     via: str = "mcp",
     model: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> dict:
-    """Create a new thread. `kind` is one of discussion|investigation|task|decision."""
+    """Create a new thread. `kind` is one of discussion|investigation|task|decision.
+
+    `password` is advisory in v1: it is sha256-hashed into the thread meta
+    and required at `join` time, but does not gate reads or replies. The
+    thread creator is automatically added to members.json.
+
+    SECURITY: `password` is forwarded to pp.py via subprocess argv. It
+    will appear in process listings (`ps`), shell history if the MCP
+    client logs commands, and CI logs of the MCP host. Treat it as
+    semi-public. Real secret material should not be used here in v1.
+    """
     args = [
         "new-thread", "--channel", channel, "--title", title,
         "--kind", kind, "--body-file", "-", "--summary", summary, "--via", via,
     ]
     if model:
         args += ["--model", model]
+    if password:
+        args += ["--password", password]
     return _run(*args, body=body)
 
 
@@ -196,6 +209,41 @@ def abandon_task(
 def handoff(channel: str, thread: str, to: str) -> dict:
     """Reassign a claim to another user (current assignee only)."""
     return _run("handoff", "--channel", channel, "--thread", thread, "--to", to)
+
+
+# ---- membership / lifecycle ----
+
+@mcp.tool()
+def join(channel: str, thread: str, password: Optional[str] = None) -> dict:
+    """Record current author as a thread member.
+
+    Returns {ok:false, reason:"password_required"|"bad_password"} on
+    failure. Idempotent — re-joining is a success no-op.
+
+    SECURITY: `password` is forwarded via subprocess argv (see new_thread
+    docstring for the implications).
+    """
+    args = ["join", "--channel", channel, "--thread", thread]
+    if password:
+        args += ["--password", password]
+    return _run(*args)
+
+
+@mcp.tool()
+def resolve(
+    channel: str, thread: str, outcome: Optional[str] = None, via: str = "mcp",
+) -> dict:
+    """Mark a discussion/investigation/decision thread resolved.
+
+    For decision threads, `outcome` should be one of
+    accepted|rejected|superseded and becomes the new status. For other
+    kinds, `outcome` is appended as a free-text summary post and status
+    becomes "resolved". Rejects task threads (use complete_task instead).
+    """
+    args = ["resolve", "--channel", channel, "--thread", thread, "--via", via]
+    if outcome is not None:
+        args += ["--outcome", outcome]
+    return _run(*args)
 
 
 if __name__ == "__main__":

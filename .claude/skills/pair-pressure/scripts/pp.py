@@ -10,6 +10,7 @@ Day 1 verbs: pull, push, list-channels, list-threads, read-thread,
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -18,7 +19,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def die(msg, code=2):
@@ -281,6 +282,13 @@ def _current_branch():
 
 def _commit_all(message):
     git("add", "-A")
+    # Skip the commit if nothing is staged. This makes write_payload callbacks
+    # tolerant of no-op race outcomes (e.g. cmd_join finds the author already
+    # in members.json after a rebase-retry) without polluting history with
+    # empty commits.
+    res = git("status", "--porcelain", check=False)
+    if not res.stdout.strip():
+        return
     git("commit", "-m", message)
 
 
@@ -321,6 +329,50 @@ def _initial_status(kind):
     }.get(kind, "open")
 
 
+def _password_hash(password):
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _check_membership(members, me):
+    """Return None if `me` may act on a thread with these members, else an
+    `{ok: False, ...}` dict suitable for direct emission.
+
+    A thread with no `members.json` (or an empty list) is treated as open —
+    membership is advisory only when someone has joined.
+    """
+    if not members:
+        return None
+    if any(m.get("author") == me for m in members):
+        return None
+    return {"ok": False, "reason": "not_a_member"}
+
+
+_DECISION_OUTCOMES = ("accepted", "rejected", "superseded")
+
+
+def _resolve_outcome(kind, outcome):
+    """Decide what `pp resolve` should set / write for (kind, outcome).
+
+    Returns either an `{ok: False, ...}` dict (caller should emit and bail)
+    or a `(new_status, outcome_body)` tuple. `outcome_body` is None for the
+    decision case — decisions encode the outcome in `status` directly and
+    don't get a separate summary post.
+
+    Decision threads MUST use one of `accepted|rejected|superseded`;
+    free-text outcomes would silently produce a status that violates the
+    schema in CONVENTIONS.md.
+    """
+    if kind == "decision":
+        if outcome not in _DECISION_OUTCOMES:
+            return {
+                "ok": False,
+                "reason": "decision_needs_enum_outcome",
+                "valid": list(_DECISION_OUTCOMES),
+            }
+        return (outcome, None)
+    return ("resolved", outcome)
+
+
 def cmd_new_thread(args):
     maybe_pull()
     ch = channel_dir(args.channel)
@@ -356,6 +408,13 @@ def cmd_new_thread(args):
             "status": _initial_status(args.kind),
             "assignee": None,
         }
+        if args.password:
+            meta["password_hash"] = _password_hash(args.password)
+            # Seed members.json so the creator is automatically a member —
+            # otherwise they couldn't resolve their own thread.
+            write_json(tdir / "members.json", {"members": [
+                {"author": author(), "joined_at": now_iso()},
+            ]})
         write_json(tdir / "meta.json", meta)
         return {"thread_id": tid, "path": str(tdir.relative_to(repo_path()))}
 
@@ -630,6 +689,112 @@ def cmd_handoff(args):
     )
 
 
+def cmd_join(args):
+    """Record current author as a member of a thread.
+
+    Idempotent: re-joining when already a member is a no-op success.
+    Password is enforced at join time only — reads/replies are NOT gated in
+    v1 (advisory only). See plan doc for the v0.2 enforcement story.
+
+    Precheck-then-write is safe here because `password_hash` is write-once
+    in v1 (only `new-thread --password` sets it, no API to mutate later).
+    A concurrent rebase-retry can only add more members, never invalidate
+    our password verification.
+    """
+    maybe_pull()
+    t = thread_dir(args.channel, args.thread)
+    me = author()
+    meta = read_json(t / "meta.json", {})
+    ph = meta.get("password_hash")
+    if ph:
+        if not args.password:
+            out({"ok": False, "reason": "password_required"})
+            return
+        if _password_hash(args.password) != ph:
+            out({"ok": False, "reason": "bad_password"})
+            return
+
+    def write_payload():
+        members_p = t / "members.json"
+        data = read_json(members_p, {"members": []})
+        members = data.get("members", [])
+        if not any(m.get("author") == me for m in members):
+            members.append({"author": me, "joined_at": now_iso()})
+            data["members"] = members
+            write_json(members_p, data)
+        return {
+            "ok": True,
+            "thread": args.thread,
+            "members": [m.get("author") for m in members],
+        }
+
+    def msg(info):
+        return f"{args.channel}/{args.thread}: join {me}"
+
+    out(push_with_retry(write_payload, msg))
+
+
+def cmd_resolve(args):
+    """Mark a discussion/investigation/decision thread resolved.
+
+    Rejects task threads (use `complete`). Enforces members.json membership
+    when present — the only v1 read/write check that consults membership.
+    For decision threads, `--outcome accepted|rejected|superseded` is used
+    as the new status; for other kinds, `--outcome` is appended as a
+    free-text summary post.
+
+    Precheck-then-write is safe here because `kind` and `members.json` are
+    write-once in v1 (no API mutates either after thread creation / join).
+    A concurrent rebase-retry can only add more members, never remove our
+    own membership or change the thread's kind.
+    """
+    maybe_pull()
+    t = thread_dir(args.channel, args.thread)
+    me = author()
+    meta = read_json(t / "meta.json", {})
+    kind = meta.get("kind", "discussion")
+    if kind == "task":
+        out({"ok": False, "reason": "use_complete_for_tasks"})
+        return
+    members = read_json(t / "members.json", {"members": []}).get("members", [])
+    err = _check_membership(members, me)
+    if err is not None:
+        out(err)
+        return
+
+    routed = _resolve_outcome(kind, args.outcome)
+    if isinstance(routed, dict):
+        out(routed)
+        return
+    new_status, outcome_body = routed
+
+    def write_payload():
+        meta_p = t / "meta.json"
+        meta_now = read_json(meta_p, {})
+        meta_now["status"] = new_status
+        write_json(meta_p, meta_now)
+        if outcome_body:
+            posts = _post_files(t)
+            next_ord = (_ord(posts[-1]) + 1) if posts else 0
+            fname = f"{next_ord:03d}-reply.md"
+            fm = {
+                "id": f"{next_ord:03d}",
+                "in_reply_to": None,
+                "author": me,
+                "via": args.via,
+                "model": None,
+                "stance": "summary",
+                "timestamp": now_iso(),
+            }
+            (t / fname).write_text(dump_fm(fm, outcome_body))
+        return {"ok": True, "status": new_status, "thread": args.thread}
+
+    def msg(info):
+        return f"{args.channel}/{args.thread}: resolve by {me} -> {new_status}"
+
+    out(push_with_retry(write_payload, msg))
+
+
 def _snippet(text, query, width=160):
     """Return a one-line snippet from `text` containing `query` (case-insensitive),
     or the first non-frontmatter line if no match."""
@@ -811,6 +976,8 @@ def main():
     sp.add_argument("--summary", default="")
     sp.add_argument("--via", default="claude-code")
     sp.add_argument("--model", default=None)
+    sp.add_argument("--password", default=None,
+                    help="advisory access marker; sha256-hashed into meta.json")
     sp.set_defaults(func=cmd_new_thread)
 
     sp = sub.add_parser("reply")
@@ -858,6 +1025,24 @@ def main():
     sp.add_argument("--thread", required=True)
     sp.add_argument("--to", required=True)
     sp.set_defaults(func=cmd_handoff)
+
+    sp = sub.add_parser("join", help="record current author as a thread member")
+    sp.add_argument("--channel", required=True)
+    sp.add_argument("--thread", required=True)
+    sp.add_argument("--password", default=None,
+                    help="required if the thread was created with --password")
+    sp.set_defaults(func=cmd_join)
+
+    sp = sub.add_parser("resolve",
+                        help="mark a discussion/investigation/decision thread resolved")
+    sp.add_argument("--channel", required=True)
+    sp.add_argument("--thread", required=True)
+    sp.add_argument("--outcome", default=None,
+                    help="for decision threads: REQUIRED, must be "
+                         "accepted|rejected|superseded; "
+                         "for others: optional free-text summary appended as a final post")
+    sp.add_argument("--via", default="claude-code")
+    sp.set_defaults(func=cmd_resolve)
 
     sp = sub.add_parser("search", help="grep posts; filter by channel/kind/status/assignee/author/stance")
     sp.add_argument("--query", required=True)

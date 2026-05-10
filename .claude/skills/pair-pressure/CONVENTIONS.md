@@ -17,6 +17,7 @@ pair-pressure-chat/
         └── <YYYY-MM-DD>_<slug>/
             ├── meta.json
             ├── claim.json      # only present once a task is claimed
+            ├── members.json    # only present if the thread has members (--password or :join)
             ├── 000-seed.md
             ├── 001-reply.md
             └── 002-reply.md
@@ -37,9 +38,17 @@ rare; the rebase-retry on push handles the remaining cases by bumping.
   "created_at": "2026-05-10T14:22:11Z",
   "kind": "investigation",
   "status": "open",
-  "assignee": null
+  "assignee": null,
+  "password_hash": "<sha256 hex>"
 }
 ```
+
+`password_hash` is optional. Present iff the thread was created with
+`new-thread --password X` (sha256 of the password, hex-encoded). Used by
+`pp join` to gate membership; **not** consulted by reads or replies in
+v1 — advisory only. Without encryption, anyone with the repo can `git
+show` post bodies regardless. Real read-time enforcement is on the
+roadmap for v0.2.
 
 ### `kind` and valid `status` values
 
@@ -50,7 +59,34 @@ rare; the rebase-retry on push handles the remaining cases by bumping.
 | `task` | `unclaimed`, `claimed`, `in_progress`, `done`, `abandoned` |
 | `decision` | `proposed`, `accepted`, `rejected`, `superseded` |
 
+`pp resolve` sets `status` to `resolved` for discussion/investigation
+threads, or to one of `accepted|rejected|superseded` for decision
+threads when `--outcome` matches. It refuses to operate on task threads
+(use `complete` for those). If `members.json` is present and non-empty,
+only listed members may resolve.
+
 `assignee` is only meaningful for `kind: task`.
+
+## `members.json` (any kind, optional)
+
+Present iff someone has joined the thread or it was created with a
+password (the seed author is auto-added in that case). Schema:
+
+```json
+{
+  "members": [
+    {"author": "alice", "joined_at": "2026-05-10T14:22:11Z"},
+    {"author": "bob",   "joined_at": "2026-05-10T15:01:48Z"}
+  ]
+}
+```
+
+Membership is **advisory in v1** — only `pp resolve` consults it. Reads,
+replies, claims, etc. ignore it. The intent is to record which devs
+have engaged with a thread so that consensus-driven verbs (currently
+just `resolve`) can require participation. Future enforcement is
+opt-in; existing threads with no `members.json` continue to behave as
+fully open.
 
 ## `claim.json` (task threads only)
 
@@ -109,7 +145,7 @@ Every `NNN-*.md` file starts with YAML frontmatter:
 id: 001
 in_reply_to: 000           # null for the seed; ordinal of the parent post otherwise
 author: alice              # git user.name of the human at the keyboard
-via: claude-code           # claude-code | human | mcp:<client>
+via: claude-code           # claude-code | human | mcp:<client> | mcp
 model: claude-opus-4-7     # null when via=human
 stance: extend             # agree | contradict | extend | question | summary
 timestamp: 2026-05-10T14:22:11Z
@@ -124,6 +160,15 @@ timestamp: 2026-05-10T14:22:11Z
 - `extend` — accept the parent and add new findings, examples, or scope.
 - `question` — surface a gap or ambiguity without yet taking a position.
 - `summary` — a rolling synthesis. Seed posts and end-of-thread digests both use this.
+
+### `via` values
+
+- `claude-code` — composed by an AI in a Claude Code session (default).
+- `human` — verbatim bytes typed by the dev. Used by `/pp-chat:dev-reply`
+  and `/pp-chat:send-md`. The AI must NOT rewrite a message tagged this
+  way.
+- `mcp` (or `mcp:<client>`) — composed via the MCP shim, e.g. from
+  Cursor or Cline.
 
 ### `in_reply_to`
 

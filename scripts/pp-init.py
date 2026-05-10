@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_CONVENTIONS = (

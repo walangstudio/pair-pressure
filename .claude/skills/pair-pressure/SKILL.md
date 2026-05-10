@@ -55,6 +55,8 @@ All output is JSON on stdout.
 | `complete --channel X --thread Y [--summary "..."]` | Mark your task `done` (assignee only). |
 | `abandon --channel X --thread Y [--reason "..."]` | Release your claim (assignee only; `--force` overrides). |
 | `handoff --channel X --thread Y --to <user>` | Reassign your claim to another agent. |
+| `join --channel X --thread Y [--password P]` | Record yourself as a thread member. Required if the thread was created with a password. Idempotent. |
+| `resolve --channel X --thread Y [--outcome "..."]` | Mark a discussion/investigation/decision thread resolved. For decisions, `--outcome accepted\|rejected\|superseded` sets the status; for other kinds it's appended as a free-text final summary post. Rejects task threads (use `complete`). |
 
 ### Thread `kind`
 
@@ -165,6 +167,35 @@ EOF
 - Reads `pull --rebase` automatically before scanning (skip with `--no-pull`).
 - Writes pull → write file → commit → push, with one rebase-retry on push reject.
 - Two simultaneous replies pick different ordinals after the rebase, so no data is lost.
+
+## Slash commands (`/pp-chat:*`)
+
+When the user invokes a `/pp-chat:<verb>` slash command, dispatch directly
+to the corresponding `pp` verb — don't re-interpret intent. The slash
+command body in `~/.claude/commands/pp-chat/<verb>.md` already specifies
+the exact mapping. Quick reference:
+
+| Slash | Calls | Notes |
+|---|---|---|
+| `/pp-chat:new <title>` | `new-thread` | defaults `--channel general --kind investigation` |
+| `/pp-chat:join <title-or-id>` | `join` | fuzzy title match; prompt for password if needed |
+| `/pp-chat:list [--channel X]` | `list-threads` | |
+| `/pp-chat:read [<title-or-id>]` | `pull` + `read-thread` | summarize + flag any task assigned to current author |
+| `/pp-chat:reply [stance] [extra]` | `reply --via claude-code` | AI composes body from thread context |
+| `/pp-chat:dev-reply <message>` | `reply --via human --body-file -` | **verbatim** — do NOT rewrite the message |
+| `/pp-chat:send-md <path> [stance]` | `reply --via human --body-file <path>` | |
+| `/pp-chat:send-task <title> [--to user]` | `new-thread --kind task` (+ optional `handoff`) | |
+| `/pp-chat:claim` / `:complete` | `claim` / `complete` | task threads only |
+| `/pp-chat:resolve [outcome]` | `resolve` | discussion/investigation/decision |
+| `/pp-chat:status` | (no pp call) | print current author / repo / joined thread from conversation context |
+
+The "current thread" after `/pp-chat:join` lives in conversation context —
+remember it for the rest of the session and pass it to subsequent
+commands. Re-resolve fuzzily on each `:join`; `/clear` loses it.
+
+The `via: human` value on a post means the dev typed those exact bytes
+(used by `:dev-reply` and `:send-md`); `via: claude-code` means the AI
+composed it (used by `:reply`). Preserve this distinction faithfully.
 
 ## See also
 

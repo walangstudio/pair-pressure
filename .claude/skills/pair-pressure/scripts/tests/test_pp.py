@@ -208,6 +208,81 @@ class RequireAssigneeTests(unittest.TestCase):
             self.assertIn("abandoned", err["error"])
 
 
+class PasswordHashTests(unittest.TestCase):
+    def test_hex_length(self):
+        self.assertEqual(len(pp._password_hash("hunter2")), 64)
+
+    def test_deterministic(self):
+        self.assertEqual(pp._password_hash("x"), pp._password_hash("x"))
+
+    def test_unicode(self):
+        # Should not crash on non-ASCII; UTF-8 encoded.
+        h = pp._password_hash("päsßwörd")
+        self.assertEqual(len(h), 64)
+
+    def test_distinct_inputs_distinct_outputs(self):
+        self.assertNotEqual(pp._password_hash("a"), pp._password_hash("b"))
+
+
+class ResolveOutcomeTests(unittest.TestCase):
+    def test_discussion_freetext_becomes_summary_body(self):
+        self.assertEqual(
+            pp._resolve_outcome("discussion", "we agreed"),
+            ("resolved", "we agreed"),
+        )
+
+    def test_discussion_no_outcome(self):
+        self.assertEqual(pp._resolve_outcome("discussion", None), ("resolved", None))
+
+    def test_investigation_freetext(self):
+        self.assertEqual(
+            pp._resolve_outcome("investigation", "wrap-up"),
+            ("resolved", "wrap-up"),
+        )
+
+    def test_decision_enum_accepted(self):
+        self.assertEqual(pp._resolve_outcome("decision", "accepted"), ("accepted", None))
+
+    def test_decision_enum_rejected(self):
+        self.assertEqual(pp._resolve_outcome("decision", "rejected"), ("rejected", None))
+
+    def test_decision_enum_superseded(self):
+        self.assertEqual(
+            pp._resolve_outcome("decision", "superseded"), ("superseded", None),
+        )
+
+    def test_decision_freetext_rejected(self):
+        result = pp._resolve_outcome("decision", "we agreed to defer")
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["reason"], "decision_needs_enum_outcome")
+        self.assertEqual(set(result["valid"]),
+                         {"accepted", "rejected", "superseded"})
+
+    def test_decision_no_outcome_rejected(self):
+        # A decision MUST commit to an outcome — None should not slide
+        # through as "resolved" like other kinds.
+        result = pp._resolve_outcome("decision", None)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["reason"], "decision_needs_enum_outcome")
+
+
+class MembershipTests(unittest.TestCase):
+    def test_empty_members_is_open(self):
+        self.assertIsNone(pp._check_membership([], "alice"))
+        self.assertIsNone(pp._check_membership(None, "alice"))
+
+    def test_member_passes(self):
+        members = [{"author": "alice", "joined_at": "x"}, {"author": "bob"}]
+        self.assertIsNone(pp._check_membership(members, "alice"))
+        self.assertIsNone(pp._check_membership(members, "bob"))
+
+    def test_non_member_rejected(self):
+        members = [{"author": "alice"}]
+        err = pp._check_membership(members, "carol")
+        self.assertEqual(err, {"ok": False, "reason": "not_a_member"})
+
+
 class SafeSubpathTests(unittest.TestCase):
     def test_accepts_simple_name(self):
         with tempfile.TemporaryDirectory() as d:
