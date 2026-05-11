@@ -19,7 +19,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 def die(msg, code=2):
@@ -139,6 +139,21 @@ def cmd_pull(args):
         out({"updated": False, "head": git("rev-parse", "HEAD", check=False).stdout.strip(), "note": "no remote configured"})
         return
     head_before = git("rev-parse", "HEAD", check=False).stdout.strip()
+    branch = _current_branch()
+    # Check ONCE whether origin already has our branch. If not, try a
+    # fetch (which is a no-op if the ref still doesn't exist), then
+    # re-check. If still missing, the remote is empty / our branch was
+    # never pushed -- nothing to pull, treat as success.
+    if not _origin_branch_exists(branch):
+        git("fetch", "origin", branch, check=False)
+        if not _origin_branch_exists(branch):
+            out({
+                "updated": False,
+                "head": head_before,
+                "note": f"origin has no {branch!r} ref yet (push it once with "
+                        f"`git push -u origin {branch}`)",
+            })
+            return
     res = git("pull", "--rebase", "--autostash", check=False)
     if res.returncode != 0:
         die(f"git pull failed: {res.stderr.strip() or res.stdout.strip()}")
@@ -157,8 +172,21 @@ def cmd_push(args):
 
 
 def maybe_pull():
-    if has_remote():
-        git("pull", "--rebase", "--autostash", check=False)
+    """Auto-pull before reads. Tolerant of every realistic failure mode:
+    no remote, empty remote (no origin/<branch>), transient network error.
+    Never raises -- the worst case is reading slightly stale local state.
+    """
+    if not has_remote():
+        return
+    branch = _current_branch()
+    if not _origin_branch_exists(branch):
+        # Try fetching; the branch may have been pushed by someone else
+        # while we worked. After the fetch, if origin/<branch> still
+        # doesn't exist, the remote is empty -- nothing to pull.
+        git("fetch", "origin", branch, check=False)
+        if not _origin_branch_exists(branch):
+            return
+    git("pull", "--rebase", "--autostash", check=False)
 
 
 def cmd_list_channels(args):
@@ -292,15 +320,32 @@ def _commit_all(message):
     git("commit", "-m", message)
 
 
+def _origin_branch_exists(branch):
+    """Return True iff origin/<branch> resolves to a commit locally.
+
+    Distinguishes "the remote already has our branch" (standard push-retry
+    territory) from "the remote is empty / our branch was never pushed"
+    (first-push needs `git push -u origin <branch>` instead of the
+    rebase-retry path).
+    """
+    res = git("rev-parse", "--verify", f"origin/{branch}", check=False)
+    return res.returncode == 0
+
+
 def push_with_retry(write_payload, build_message):
     """Write → commit → push, with one rebase-retry on reject.
 
     `write_payload()` writes files into the working tree and returns a dict.
     `build_message(info)` returns the commit message.
 
-    On push reject: abort any in-progress rebase, hard-reset to the remote
-    tip, re-invoke `write_payload()` (which recomputes ordinals/dir-names
-    from the fresh tree), re-commit, push again. One retry only.
+    On push reject:
+      - if origin/<branch> exists: abort any in-progress rebase, hard-reset
+        to the remote tip, re-invoke `write_payload()` (which recomputes
+        ordinals/dir-names from the fresh tree), re-commit, push again.
+      - if origin/<branch> does NOT exist (empty remote, first push):
+        retry with `git push -u origin <branch>` to set upstream. No
+        rebase needed — there's nothing to rebase onto.
+    One retry only either way.
     """
     info = write_payload()
     _commit_all(build_message(info))
@@ -309,10 +354,16 @@ def push_with_retry(write_payload, build_message):
     res = git("push", check=False)
     if res.returncode == 0:
         return info
-    # Push rejected. Recover and retry.
-    git("rebase", "--abort", check=False)
     branch = _current_branch()
     git("fetch", "origin", branch, check=False)
+    if not _origin_branch_exists(branch):
+        # First push to an empty remote -- set upstream and retry once.
+        res2 = git("push", "-u", "origin", branch, check=False)
+        if res2.returncode != 0:
+            die(f"first push to empty remote failed: {res2.stderr.strip()}")
+        return info
+    # Push rejected against an existing remote branch. Rebase-retry path.
+    git("rebase", "--abort", check=False)
     git("reset", "--hard", f"origin/{branch}")
     info = write_payload()
     _commit_all(build_message(info))
@@ -497,9 +548,17 @@ def lock_transition(t, precheck, apply_fn, success_response, commit_message):
     if res.returncode == 0:
         out(success_response)
         return
-    git("rebase", "--abort", check=False)
     branch = _current_branch()
     git("fetch", "origin", branch, check=False)
+    if not _origin_branch_exists(branch):
+        # Empty remote -- first push needs --set-upstream and skips the
+        # rebase entirely (nothing to rebase onto).
+        res2 = git("push", "-u", "origin", branch, check=False)
+        if res2.returncode != 0:
+            die(f"first push to empty remote failed: {res2.stderr.strip()}")
+        out(success_response)
+        return
+    git("rebase", "--abort", check=False)
     git("reset", "--hard", f"origin/{branch}")
     err = precheck()
     if err is not None:
@@ -795,6 +854,93 @@ def cmd_resolve(args):
     out(push_with_retry(write_payload, msg))
 
 
+def _read_saved_env():
+    """Walk both Claude Code settings files for saved PAIR_PRESSURE_* values.
+
+    Designed never to die: malformed JSON / missing files just contribute
+    nothing. Returns a dict of the keys that were found (settings.local.json
+    wins over settings.json when both define the same key).
+    """
+    saved = {}
+    candidates = [
+        Path.home() / ".claude" / "settings.local.json",
+        Path.home() / ".claude" / "settings.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        env_block = data.get("env") or {}
+        if not isinstance(env_block, dict):
+            continue
+        for k in ("PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_REPO"):
+            if k in env_block and k not in saved:
+                saved[k] = env_block[k]
+    return saved
+
+
+def cmd_status(args):
+    """Print pair-pressure identity status (saved vs active env vars).
+
+    Works even when env vars aren't loaded yet -- that's the main use case
+    (diagnosing "saved but not active" right after pp-install, before a
+    Claude Code restart). Does NOT call env() / repo_path() / author(),
+    all of which die() if PAIR_PRESSURE_REPO / _AUTHOR are unset.
+
+    Output schema:
+        {
+          "saved":   {"PAIR_PRESSURE_AUTHOR": "...", "PAIR_PRESSURE_REPO": "..."},
+          "active":  {"PAIR_PRESSURE_AUTHOR": "...", "PAIR_PRESSURE_REPO": "..."},
+          "verdict": "ready" | "needs_restart" | "not_configured" |
+                     "mismatch" | "active_only",
+          "message": "<one-line summary suitable for direct display>"
+        }
+    """
+    saved = _read_saved_env()
+    active = {
+        "PAIR_PRESSURE_AUTHOR": os.environ.get("PAIR_PRESSURE_AUTHOR") or None,
+        "PAIR_PRESSURE_REPO":   os.environ.get("PAIR_PRESSURE_REPO")   or None,
+    }
+    keys = ("PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_REPO")
+    saved_full  = all(saved.get(k)  for k in keys)
+    active_full = all(active.get(k) for k in keys)
+
+    if not saved_full and not active_full:
+        verdict = "not_configured"
+        message = "Not configured. Run `pp-install` or `./install.ps1` to set up."
+    elif saved_full and not active_full:
+        verdict = "needs_restart"
+        message = ("Saved but not yet loaded -- fully quit and reopen Claude Code "
+                   "(not /clear) to pick up these env vars.")
+    elif saved_full and active_full:
+        if all(saved.get(k) == active.get(k) for k in keys):
+            verdict = "ready"
+            message = "Ready."
+        else:
+            verdict = "mismatch"
+            message = ("Saved and active values differ -- restart Claude Code to "
+                       "sync to the saved values.")
+    else:
+        verdict = "active_only"
+        message = ("Env vars set in shell but not in settings.local.json. "
+                   "Run `pp-install` to persist them.")
+    out({
+        "saved": saved,
+        "active": active,
+        "verdict": verdict,
+        "message": message,
+    })
+
+
 def _snippet(text, query, width=160):
     """Return a one-line snippet from `text` containing `query` (case-insensitive),
     or the first non-frontmatter line if no match."""
@@ -1043,6 +1189,10 @@ def main():
                          "for others: optional free-text summary appended as a final post")
     sp.add_argument("--via", default="claude-code")
     sp.set_defaults(func=cmd_resolve)
+
+    sp = sub.add_parser("status",
+                        help="show saved vs active env vars; works without configuration")
+    sp.set_defaults(func=cmd_status)
 
     sp = sub.add_parser("search", help="grep posts; filter by channel/kind/status/assignee/author/stance")
     sp.add_argument("--query", required=True)

@@ -313,6 +313,24 @@ class SafeSubpathTests(unittest.TestCase):
                 pp._safe_subpath(parent, ".")
 
 
+class OriginBranchExistsTests(unittest.TestCase):
+    """`_origin_branch_exists` distinguishes "remote already has our branch"
+    (rebase-retry territory) from "empty remote" (first-push needs -u)."""
+
+    def test_returns_false_on_missing_ref(self):
+        # Simulate `git rev-parse --verify origin/main` returning non-zero.
+        from unittest import mock
+        fake = mock.MagicMock(returncode=128, stdout="", stderr="unknown revision")
+        with mock.patch.object(pp, "git", return_value=fake):
+            self.assertFalse(pp._origin_branch_exists("main"))
+
+    def test_returns_true_on_existing_ref(self):
+        from unittest import mock
+        fake = mock.MagicMock(returncode=0, stdout="abc123\n", stderr="")
+        with mock.patch.object(pp, "git", return_value=fake):
+            self.assertTrue(pp._origin_branch_exists("main"))
+
+
 if __name__ == "__main__":
     # Don't require env vars to be set just to run tests.
     os.environ.setdefault("PAIR_PRESSURE_REPO", "/tmp/_pp_unused")

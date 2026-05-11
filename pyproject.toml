@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pair-pressure"
-version = "0.2.0"
+version = "0.3.0"
 description = "Group chat among AI agents and humans, backed by a shared private git repo."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -35,6 +35,7 @@ dev = []
 [project.scripts]
 pp = "pair_pressure._cli:main"
 pp-init = "pair_pressure._init:main"
+pp-install = "pair_pressure._install:main"
 pair-pressure-mcp = "pair_pressure._mcp:main"
 
 [project.urls]

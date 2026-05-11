@@ -26,5 +26,9 @@ def pp_init_script() -> Path:
     return repo_root() / "scripts" / "pp-init.py"
 
 
+def pp_install_script() -> Path:
+    return repo_root() / "scripts" / "pp-install.py"
+
+
 def mcp_server_script() -> Path:
     return repo_root() / "mcp" / "server.py"
