@@ -333,10 +333,10 @@ class InstallSlashCommandsTests(unittest.TestCase):
 
     def test_copies_new_files(self):
         actions = self.mod.install_slash_commands()
-        # 6 canonical files ship in v0.4.1 (consolidated from 15: send,
-        # ai-reply, read, server, task, status). All should be 'new' on a
+        # 5 canonical files ship in v0.4.2 (send absorbed ai-reply:
+        # send, read, server, task, status). All should be 'new' on a
         # blank user-commands dir.
-        self.assertEqual(actions["new"], 6)
+        self.assertEqual(actions["new"], 5)
         self.assertEqual(actions["updated"], 0)
         self.assertEqual(actions["kept"], 0)
         self.assertEqual(actions["unchanged"], 0)
@@ -348,7 +348,7 @@ class InstallSlashCommandsTests(unittest.TestCase):
         # 'unchanged' (same checksum).
         self.mod.install_slash_commands()
         actions = self.mod.install_slash_commands()
-        self.assertEqual(actions["unchanged"], 6)
+        self.assertEqual(actions["unchanged"], 5)
         self.assertEqual(actions["new"], 0)
 
     def test_bin_name_rewrite(self):

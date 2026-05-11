@@ -35,7 +35,7 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 # `__file__` resolves to one of:
 #   - editable install: <repo>/src/pair_pressure/_data/scripts/pp-install.py
@@ -214,6 +214,42 @@ def detect_pp_on_path():
 
 
 # ---- settings.local.json merge ----
+
+def _merge_permissions_into_settings_file(path, allow_entries):
+    """Merge allow_entries into permissions.allow in a Claude Code settings file.
+
+    Creates the file and the permissions.allow list if absent; deduplicates
+    entries so re-running the wizard is idempotent.
+    """
+    data = {}
+    if path.exists():
+        text = path.read_text(encoding="utf-8-sig").strip()
+        if text:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return  # don't clobber a broken file; env merge will catch it
+    perms = data.setdefault("permissions", {})
+    existing = perms.setdefault("allow", [])
+    for entry in allow_entries:
+        if entry not in existing:
+            existing.append(entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def merge_permissions(bin_name="pp"):
+    """Add pp-related bash commands to permissions.allow in both settings files."""
+    entries = [
+        f"Bash({bin_name})",
+        f"Bash({bin_name} *)",
+        "Bash(pp-init *)",
+        "Bash(pp-install *)",
+        "Bash(pair-pressure-mcp *)",
+    ]
+    _merge_permissions_into_settings_file(SETTINGS_PATH, entries)
+    _merge_permissions_into_settings_file(SETTINGS_GLOBAL_PATH, entries)
+
 
 def _merge_into_settings_file(path, env_updates, backup=True):
     """Merge env_updates into the `env` block of a Claude Code settings file.
@@ -889,6 +925,8 @@ def fresh_install_flow(args):
     if "PAIR_PRESSURE_SERVER" in env_updates:
         print(f"  + PAIR_PRESSURE_SERVER = {env_updates['PAIR_PRESSURE_SERVER']}")
     merge_settings(env_updates)
+    merge_permissions(bin_name=args.bin_name or "pp")
+    print(f"  + permissions.allow: pp / pp-init / pp-install / pair-pressure-mcp (no-confirm)")
     for path, action in write_shell_profile(env_updates):
         print(f"  shell profile: {action} {path}")
 

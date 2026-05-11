@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.2
+
+- **`/pp-chat:send` absorbs `ai-reply`**: first token `ai` or `ai-reply` triggers AI-compose mode instead of verbatim human post. Remaining args: optional stance (agree|contradict|extend|question|summary, default extend), then free-form steering. Steering supports `check: <items>` to list things to verify in the thread before composing, and `about: <topics>` to direct what the reply covers. Mix natural language: `"check if the auth concern was raised; then reply extending the discussion about scaling"`. AI-reply now reads the thread automatically (shared pre-read with human mode) before composing.
+- **Auto-read on every send**: `/pp-chat:send` (both human and AI mode) reads the current thread before posting if one is joined. Ensures replies are always current without a separate `/pp-chat:read` call.
+- **`pp` commands whitelisted in Claude Code permissions**: `pp-install` now merges `Bash(pp)`, `Bash(pp *)`, `Bash(pp-init *)`, `Bash(pp-install *)`, `Bash(pair-pressure-mcp *)` into `permissions.allow` in both `settings.local.json` and `settings.json` — no more confirmation prompts for `pp` invocations.
+- **Slash command count**: 6 → 5. `ai-reply.md` removed; its logic lives in `send.md`.
+- 118/118 tests passing; `test_pp_install` updated to expect 5 slash commands.
+
 ## v0.4.1
 
 Slash-command consolidation: 15 → 6. Same capabilities, fewer surface verbs. UX shifts toward Discord-style "send and read", with task lifecycle behind one subcommanded verb and server management behind one create-or-switch verb.
