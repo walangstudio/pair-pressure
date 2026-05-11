@@ -14,15 +14,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-# Locate the script. HERE = .../scripts/tests/. Walk up to repo root:
-#   parents[0] = scripts/
-#   parents[1] = pair-pressure/  (the skill)
-#   parents[2] = skills/
-#   parents[3] = .claude/
-#   parents[4] = pair-pressure/  (repo root)
+# Locate pp-install.py. HERE = .../skill/scripts/tests/. Walk up to _data/
+# and across to the sibling `scripts/` dir that holds the install script:
+#   parents[0] = scripts/  (the skill's own scripts)
+#   parents[1] = skill/
+#   parents[2] = _data/     <- both `skill/` and `scripts/` (the install
+#                              tooling) live here in v0.4
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[4]
-INSTALL_PATH = REPO_ROOT / "scripts" / "pp-install.py"
+DATA_ROOT = HERE.parents[2]
+INSTALL_PATH = DATA_ROOT / "scripts" / "pp-install.py"
 
 
 def _load_install_module():
@@ -333,9 +333,9 @@ class InstallSlashCommandsTests(unittest.TestCase):
 
     def test_copies_new_files(self):
         actions = self.mod.install_slash_commands()
-        # 12 canonical files ship in the repo; all should be 'new' on a
-        # blank user-commands dir.
-        self.assertEqual(actions["new"], 12)
+        # 15 canonical files ship in v0.4 (12 thread/task verbs + 3 server
+        # management verbs); all should be 'new' on a blank user-commands dir.
+        self.assertEqual(actions["new"], 15)
         self.assertEqual(actions["updated"], 0)
         self.assertEqual(actions["kept"], 0)
         self.assertEqual(actions["unchanged"], 0)
@@ -347,7 +347,7 @@ class InstallSlashCommandsTests(unittest.TestCase):
         # 'unchanged' (same checksum).
         self.mod.install_slash_commands()
         actions = self.mod.install_slash_commands()
-        self.assertEqual(actions["unchanged"], 12)
+        self.assertEqual(actions["unchanged"], 15)
         self.assertEqual(actions["new"], 0)
 
     def test_bin_name_rewrite(self):

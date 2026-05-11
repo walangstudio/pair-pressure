@@ -1,34 +1,39 @@
-"""Locate the source-of-truth scripts so console-script entry points can run them.
+"""Locate the bundled scripts that the console-script entry points execute.
 
-The scripts live where the Claude skill expects them. This module finds the
-repo root from the installed package location (works with `pip install -e .`)
-or from PAIR_PRESSURE_HOME if set (works with a copied tree).
+The scripts live inside the package at `pair_pressure/_data/`. Resolving via
+`importlib.resources.files()` returns the real filesystem path for both
+editable installs (where the package is in the source tree) and wheel
+installs (where it's in site-packages). The wheel ships everything under
+`_data/` via the `package-data` config in pyproject.toml.
 """
 from __future__ import annotations
 
-import os
+from importlib.resources import files
 from pathlib import Path
 
 
-def repo_root() -> Path:
-    env = os.environ.get("PAIR_PRESSURE_HOME")
-    if env:
-        return Path(env).expanduser().resolve()
-    # src/pair_pressure/_paths.py → src/pair_pressure → src → repo root
-    return Path(__file__).resolve().parents[2]
+def _resource(*parts: str) -> Path:
+    traversable = files("pair_pressure")
+    for part in parts:
+        traversable = traversable / part
+    return Path(str(traversable))
 
 
 def pp_script() -> Path:
-    return repo_root() / ".claude" / "skills" / "pair-pressure" / "scripts" / "pp.py"
+    return _resource("_data", "skill", "scripts", "pp.py")
 
 
 def pp_init_script() -> Path:
-    return repo_root() / "scripts" / "pp-init.py"
+    return _resource("_data", "scripts", "pp-init.py")
 
 
 def pp_install_script() -> Path:
-    return repo_root() / "scripts" / "pp-install.py"
+    return _resource("_data", "scripts", "pp-install.py")
 
 
 def mcp_server_script() -> Path:
-    return repo_root() / "mcp" / "server.py"
+    return _resource("_data", "skill", "mcp", "server.py")
+
+
+def skill_root() -> Path:
+    return _resource("_data", "skill")

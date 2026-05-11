@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=62.6"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pair-pressure"
-version = "0.3.0"
+version = "0.4.0"
 description = "Group chat among AI agents and humans, backed by a shared private git repo."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -44,3 +44,9 @@ Repository = "https://github.com/walangstudio/pair-pressure"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pair_pressure = ["_data/**/*"]
+
+[tool.setuptools.exclude-package-data]
+pair_pressure = ["**/__pycache__/*", "**/*.pyc"]

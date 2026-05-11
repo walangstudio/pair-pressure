@@ -331,6 +331,167 @@ class OriginBranchExistsTests(unittest.TestCase):
             self.assertTrue(pp._origin_branch_exists("main"))
 
 
+class ServerBranchTests(unittest.TestCase):
+    def test_prefix(self):
+        self.assertEqual(pp._server_branch("alpha"), "server/alpha")
+
+    def test_prefix_with_dots_and_hyphens(self):
+        self.assertEqual(pp._server_branch("team-a.b"), "server/team-a.b")
+
+    def test_constant_is_stable(self):
+        self.assertEqual(pp.SERVER_BRANCH_PREFIX, "server/")
+
+
+class ValidServerNameTests(unittest.TestCase):
+    def test_accepts_simple(self):
+        self.assertTrue(pp._valid_server_name("alpha"))
+        self.assertTrue(pp._valid_server_name("a"))
+        self.assertTrue(pp._valid_server_name("0abc"))
+        self.assertTrue(pp._valid_server_name("team-1.alpha_beta"))
+
+    def test_rejects_empty(self):
+        self.assertFalse(pp._valid_server_name(""))
+
+    def test_rejects_uppercase(self):
+        self.assertFalse(pp._valid_server_name("Alpha"))
+
+    def test_rejects_leading_punctuation(self):
+        self.assertFalse(pp._valid_server_name(".start"))
+        self.assertFalse(pp._valid_server_name("-start"))
+        self.assertFalse(pp._valid_server_name("_start"))
+
+    def test_rejects_space(self):
+        self.assertFalse(pp._valid_server_name("has space"))
+
+    def test_rejects_too_long(self):
+        self.assertFalse(pp._valid_server_name("a" * 65))
+
+    def test_accepts_max_length(self):
+        self.assertTrue(pp._valid_server_name("a" + "b" * 63))
+
+
+class ServerArgPriorityTests(unittest.TestCase):
+    """`_server_arg` priority chain:
+    1. explicit args.server  2. PAIR_PRESSURE_SERVER  3. sole-server  4. die.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.pop("PAIR_PRESSURE_SERVER", None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ["PAIR_PRESSURE_SERVER"] = self._saved
+        else:
+            os.environ.pop("PAIR_PRESSURE_SERVER", None)
+
+    def _args(self, server=None):
+        import argparse
+        ns = argparse.Namespace()
+        ns.server = server
+        return ns
+
+    def test_explicit_flag_wins_over_env(self):
+        from unittest import mock
+        os.environ["PAIR_PRESSURE_SERVER"] = "env-val"
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": [{"name": "only"}]}):
+            self.assertEqual(pp._server_arg(self._args("explicit")), "explicit")
+
+    def test_env_used_when_no_flag(self):
+        from unittest import mock
+        os.environ["PAIR_PRESSURE_SERVER"] = "from-env"
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": [{"name": "x"},
+                                                          {"name": "y"}]}):
+            self.assertEqual(pp._server_arg(self._args(None)), "from-env")
+
+    def test_sole_server_fallback(self):
+        from unittest import mock
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": [{"name": "only-one"}]}):
+            self.assertEqual(pp._server_arg(self._args(None)), "only-one")
+
+    def test_ambiguous_registry_dies(self):
+        from unittest import mock
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": [{"name": "a"},
+                                                          {"name": "b"}]}):
+            with self.assertRaises(SystemExit):
+                pp._server_arg(self._args(None))
+
+    def test_empty_registry_dies(self):
+        from unittest import mock
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": []}):
+            with self.assertRaises(SystemExit):
+                pp._server_arg(self._args(None))
+
+
+class RegistryRoundtripTests(unittest.TestCase):
+    """Save and load servers.json off a tempdir repo."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        repo = Path(self._td.name)
+        (repo / ".git").mkdir()
+        self._saved_repo = os.environ.get("PAIR_PRESSURE_REPO")
+        os.environ["PAIR_PRESSURE_REPO"] = str(repo)
+
+    def tearDown(self):
+        if self._saved_repo is not None:
+            os.environ["PAIR_PRESSURE_REPO"] = self._saved_repo
+        self._td.cleanup()
+
+    def test_load_default_when_missing(self):
+        data = pp._registry_load()
+        self.assertEqual(data["schema_version"], 2)
+        self.assertEqual(data["servers"], [])
+
+    def test_save_then_load(self):
+        original = {
+            "schema_version": 2,
+            "servers": [
+                {"name": "alpha", "description": "x", "channels": ["general"]},
+                {"name": "beta",  "description": "y", "channels": ["general", "deploys"]},
+            ],
+        }
+        pp._registry_save(original)
+        loaded = pp._registry_load()
+        self.assertEqual(loaded, original)
+
+    def test_registry_path_under_main_checkout(self):
+        # _registry_path is always anchored at _main_repo_path(), not the
+        # active worktree, so server-content writes never accidentally
+        # touch the registry.
+        self.assertEqual(
+            pp._registry_path(),
+            pp._main_repo_path() / ".pair-pressure" / "servers.json",
+        )
+
+
+class WorktreeRootTests(unittest.TestCase):
+    """`_worktree_root` always returns a path under the main checkout."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        repo = Path(self._td.name)
+        (repo / ".git").mkdir()
+        self._saved_repo = os.environ.get("PAIR_PRESSURE_REPO")
+        os.environ["PAIR_PRESSURE_REPO"] = str(repo)
+
+    def tearDown(self):
+        if self._saved_repo is not None:
+            os.environ["PAIR_PRESSURE_REPO"] = self._saved_repo
+        else:
+            os.environ.pop("PAIR_PRESSURE_REPO", None)
+        self._td.cleanup()
+
+    def test_returns_pp_worktrees_subdir(self):
+        wt_root = pp._worktree_root()
+        self.assertEqual(wt_root.name, ".pp-worktrees")
+        self.assertEqual(wt_root.parent, pp._main_repo_path())
+
+
 if __name__ == "__main__":
     # Don't require env vars to be set just to run tests.
     os.environ.setdefault("PAIR_PRESSURE_REPO", "/tmp/_pp_unused")

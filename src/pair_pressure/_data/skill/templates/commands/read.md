@@ -1,14 +1,14 @@
 ---
 description: Pull and read the current (or named) pair-pressure thread; flag any task assigned to you
-argument-hint: [<title-or-id>] [--channel X] [--since N]
+argument-hint: [<title-or-id>] [--channel X] [--server X] [--since N]
 ---
 
 Parse `$ARGUMENTS`:
 - If a title-or-id is given, resolve it the same way `/pp-chat:join` does (fuzzy title match within `--channel`, default `general`). Do NOT re-join the thread; just read it.
-- If no argument is given, use the **current joined thread** from this session's context. If there is none, list recent threads via `pp list-threads --channel general --limit 10` and ask which one.
-- Optional `--since <N>` skips ordinals below N.
+- If no argument is given, use the **current joined thread** from this session's context. If there is none, list recent threads via `pp list-threads --server <server> --channel general --limit 10` and ask which one.
+- Optional `--server <name>` and `--since <N>` (skips ordinals below N).
 
-Run `pp pull` then `pp read-thread --channel <ch> --thread <id> [--since N]`.
+Run `pp pull --server <server>` then `pp read-thread --server <server> --channel <ch> --thread <id> [--since N]`.
 
 Present:
 1. Thread title, kind, status, assignee (if any), member count.
@@ -17,3 +17,5 @@ Present:
 4. If the thread is `kind: decision` in status `proposed`, note it's awaiting a decision.
 
 Do not auto-reply. Wait for the user's next command.
+
+**Server selection.** Every `pp` invocation in this command MUST include `--server <name>` resolved in priority: explicit `--server` arg in $ARGUMENTS → conversation-context active server → omit (pp falls back to env / sole-server / errors). Remember an explicit `--server` arg as the active server for the rest of the conversation.

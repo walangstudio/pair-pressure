@@ -17,6 +17,8 @@
 #   --uninstall           remove package + skill + slash commands + env vars
 #   --keep-settings       with --uninstall, leave settings.local.json alone
 #   --yes                 with --uninstall, skip the confirmation prompt
+#   --dev                 editable install (keep source clone alive; only for
+#                         contributors developing pair-pressure itself)
 #
 # Requires: bash, python3 (>=3.9), git. One of: uv, pipx, pip.
 
@@ -30,6 +32,7 @@ REINSTALL=0
 UNINSTALL=0
 KEEP_SETTINGS=0
 YES=0
+DEV=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --uninstall)     UNINSTALL=1; shift ;;
     --keep-settings) KEEP_SETTINGS=1; shift ;;
     --yes)           YES=1; shift ;;
+    --dev)           DEV=1; shift ;;
     -h|--help)
       sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)
@@ -239,17 +243,21 @@ fi
 
 # ---- Phase 2: install the package ----
 echo "==> installing pair-pressure via $PICKED"
+EDITABLE_FLAG=()
+if [[ "$DEV" -eq 1 ]]; then
+  EDITABLE_FLAG=(--editable)
+fi
 case "$PICKED" in
   uv)
-    uv tool install --editable "$REPO_ROOT" --reinstall
+    uv tool install "${EDITABLE_FLAG[@]}" "$REPO_ROOT" --reinstall
     uv tool update-shell >/dev/null 2>&1 || true
     ;;
   pipx)
-    pipx install --editable "$REPO_ROOT" --force
+    pipx install "${EDITABLE_FLAG[@]}" "$REPO_ROOT" --force
     pipx ensurepath >/dev/null 2>&1 || true
     ;;
   pip)
-    "$PYTHON" -m pip install --user --editable "$REPO_ROOT" --upgrade
+    "$PYTHON" -m pip install --user "${EDITABLE_FLAG[@]}" "$REPO_ROOT" --upgrade
     ;;
 esac
 

@@ -45,6 +45,13 @@
 .PARAMETER Yes
   Skip the confirmation prompt on -Uninstall (for scripted teardowns).
 
+.PARAMETER Dev
+  Install in editable mode (uv/pipx/pip --editable). Use this only when
+  developing pair-pressure itself -- you keep the source clone alive and
+  source edits become live without re-running install. The default
+  (non-editable) install bakes the source into the venv so the clone can
+  be safely deleted afterwards.
+
 .NOTES
   Requires: PowerShell 5+, Python 3.9+, git. One of: uv, pipx, pip.
 #>
@@ -57,7 +64,8 @@ param(
     [switch] $Reinstall,
     [switch] $Uninstall,
     [switch] $KeepSettings,
-    [switch] $Yes
+    [switch] $Yes,
+    [switch] $Dev
 )
 
 # Native exes (uv, pipx, git) routinely write friendly progress / success
@@ -270,9 +278,10 @@ if (Test-Path "$PSScriptRoot\pyproject.toml") {
 
 # ---- Phase 2: install the package ----
 Write-Host "==> installing pair-pressure via $picked" -ForegroundColor Cyan
+$editableFlag = if ($Dev) { @('--editable') } else { @() }
 switch ($picked) {
     'uv' {
-        & uv tool install --editable $repoRoot --reinstall
+        & uv tool install @editableFlag $repoRoot --reinstall
         if ($LASTEXITCODE -ne 0) { Die "uv tool install failed (exit $LASTEXITCODE)" }
         # update-shell writes a friendly "already in PATH" / "added X to PATH"
         # line to stderr on success; we want neither aborting the run nor
@@ -280,12 +289,12 @@ switch ($picked) {
         & uv tool update-shell *> $null
     }
     'pipx' {
-        & pipx install --editable $repoRoot --force
+        & pipx install @editableFlag $repoRoot --force
         if ($LASTEXITCODE -ne 0) { Die "pipx install failed (exit $LASTEXITCODE)" }
         & pipx ensurepath *> $null
     }
     'pip' {
-        & $python -m pip install --user --editable $repoRoot --upgrade
+        & $python -m pip install --user @editableFlag $repoRoot --upgrade
         if ($LASTEXITCODE -ne 0) { Die "pip install failed (exit $LASTEXITCODE)" }
     }
 }

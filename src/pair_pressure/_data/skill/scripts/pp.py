@@ -14,12 +14,21 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.3.0"
+SERVER_BRANCH_PREFIX = "server/"
+SCHEMA_VERSION = "2"
+
+# Set by _activate_server() so that all downstream code (repo_path(), git()
+# default cwd, file paths) automatically scopes to the active worktree.
+# None means "registry / main checkout", used by server-management verbs.
+_CURRENT_REPO: "Path | None" = None
+
+__version__ = "0.4.0"
 
 
 def die(msg, code=2):
@@ -34,11 +43,129 @@ def env(name):
     return val
 
 
-def repo_path():
+def _main_repo_path():
+    """The main checkout (where the registry on `main` lives)."""
     p = Path(env("PAIR_PRESSURE_REPO")).expanduser()
     if not (p / ".git").exists():
         die(f"PAIR_PRESSURE_REPO={p} is not a git repository.")
     return p
+
+
+def repo_path():
+    """The path the current verb operates against.
+
+    Server-scoped verbs call `_activate_server(args)` which sets the active
+    worktree. Server-management verbs (servers, server new/switch) leave it
+    unset and operate on the main checkout.
+    """
+    if _CURRENT_REPO is not None:
+        return _CURRENT_REPO
+    return _main_repo_path()
+
+
+def _server_branch(name):
+    return SERVER_BRANCH_PREFIX + name
+
+
+def _worktree_root():
+    """Where server worktrees live. Always under the main checkout."""
+    return _main_repo_path() / ".pp-worktrees"
+
+
+def _registry_path():
+    return _main_repo_path() / ".pair-pressure" / "servers.json"
+
+
+def _registry_load():
+    """Read .pair-pressure/servers.json off the main checkout.
+
+    Returns an empty registry if the file is missing — server-management
+    verbs handle "no servers yet" gracefully rather than dying.
+    """
+    p = _registry_path()
+    if not p.exists():
+        return {"schema_version": int(SCHEMA_VERSION), "servers": []}
+    try:
+        return json.loads(p.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"servers.json is unreadable: {e}")
+
+
+def _registry_save(data):
+    p = _registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def worktree_path(server):
+    """Resolve (and lazy-create) the worktree dir for a server.
+
+    Idempotent: re-running on an existing worktree returns its path. If the
+    worktree dir is missing but the remote branch exists, it's materialized
+    via `git worktree add` from origin/<branch>.
+    """
+    main = _main_repo_path()
+    wt = main / ".pp-worktrees" / server
+    if wt.exists() and (wt / ".git").exists():
+        return wt
+    branch = _server_branch(server)
+    git("fetch", "origin", branch, cwd=main, check=False)
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    if _origin_branch_exists(branch, cwd=main):
+        git("worktree", "add", str(wt), f"origin/{branch}", cwd=main)
+        # Detach from origin/<branch> onto a local tracking branch so writes work.
+        git("checkout", "-B", branch, f"origin/{branch}", cwd=wt)
+    else:
+        die(
+            f"server '{server}' does not exist on remote (no branch {branch}). "
+            f"Use `pp server new {server}` to create it."
+        )
+    return wt
+
+
+def _server_arg(args):
+    """Resolve the active server name in priority order.
+
+    1. explicit args.server (--server flag)
+    2. PAIR_PRESSURE_SERVER env var
+    3. sole server in registry (when exactly one exists)
+    4. die() with remediation
+    """
+    if getattr(args, "server", None):
+        return args.server
+    env_s = os.environ.get("PAIR_PRESSURE_SERVER")
+    if env_s:
+        return env_s
+    servers = _registry_load().get("servers", [])
+    if len(servers) == 1:
+        return servers[0]["name"]
+    die(
+        "no server specified; pass --server <name> or set "
+        "PAIR_PRESSURE_SERVER (try `pp servers` to list)"
+    )
+
+
+def _activate_server(args):
+    """Resolve the target server and pin _CURRENT_REPO to its worktree.
+
+    Called at the top of every content verb so the rest of the code (which
+    calls repo_path() and lets git() default cwd) operates on the right
+    worktree without per-callsite changes.
+    """
+    global _CURRENT_REPO
+    name = _server_arg(args)
+    _CURRENT_REPO = worktree_path(name)
+    return name
+
+
+def _add_server_arg(sp):
+    """Attach the standard --server flag to a subparser."""
+    sp.add_argument(
+        "--server", default=None,
+        help="server name (see `pp servers`); overrides "
+             "PAIR_PRESSURE_SERVER. If exactly one server exists in the "
+             "registry, it is used by default.",
+    )
 
 
 def author():
@@ -134,7 +261,23 @@ def write_json(path, obj):
 
 # ---- verbs ----
 
+def _maybe_activate_server(args):
+    """Activate a worktree only when --server is explicitly resolvable.
+
+    Used by pull/push/status -- they default to the main checkout if no
+    server was specified. The sole-server fallback in `_activate_server`
+    is deliberately skipped here: silently pulling the only server's
+    worktree on a bare `pp pull` would be surprising.
+    """
+    global _CURRENT_REPO
+    name = getattr(args, "server", None) or os.environ.get("PAIR_PRESSURE_SERVER")
+    if name:
+        _CURRENT_REPO = worktree_path(name)
+    return name
+
+
 def cmd_pull(args):
+    _maybe_activate_server(args)
     if not has_remote():
         out({"updated": False, "head": git("rev-parse", "HEAD", check=False).stdout.strip(), "note": "no remote configured"})
         return
@@ -162,6 +305,7 @@ def cmd_pull(args):
 
 
 def cmd_push(args):
+    _maybe_activate_server(args)
     if not has_remote():
         out({"pushed": False, "note": "no remote configured"})
         return
@@ -190,6 +334,7 @@ def maybe_pull():
 
 
 def cmd_list_channels(args):
+    _activate_server(args)
     if not args.no_pull:
         maybe_pull()
     root = repo_path() / "channels"
@@ -244,6 +389,7 @@ def _post_files(tdir):
 
 
 def cmd_list_threads(args):
+    _activate_server(args)
     if not args.no_pull:
         maybe_pull()
     ch = channel_dir(args.channel)
@@ -273,6 +419,7 @@ def cmd_list_threads(args):
 
 
 def cmd_read_thread(args):
+    _activate_server(args)
     if not args.no_pull:
         maybe_pull()
     t = thread_dir(args.channel, args.thread)
@@ -320,15 +467,18 @@ def _commit_all(message):
     git("commit", "-m", message)
 
 
-def _origin_branch_exists(branch):
+def _origin_branch_exists(branch, cwd=None):
     """Return True iff origin/<branch> resolves to a commit locally.
 
     Distinguishes "the remote already has our branch" (standard push-retry
     territory) from "the remote is empty / our branch was never pushed"
     (first-push needs `git push -u origin <branch>` instead of the
     rebase-retry path).
+
+    `cwd` lets server-management verbs probe the main checkout regardless of
+    whichever worktree is currently active.
     """
-    res = git("rev-parse", "--verify", f"origin/{branch}", check=False)
+    res = git("rev-parse", "--verify", f"origin/{branch}", cwd=cwd, check=False)
     return res.returncode == 0
 
 
@@ -425,6 +575,7 @@ def _resolve_outcome(kind, outcome):
 
 
 def cmd_new_thread(args):
+    _activate_server(args)
     maybe_pull()
     ch = channel_dir(args.channel)
     body = read_body(args)
@@ -476,6 +627,7 @@ def cmd_new_thread(args):
 
 
 def cmd_reply(args):
+    _activate_server(args)
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     body = read_body(args)
@@ -573,6 +725,7 @@ def lock_transition(t, precheck, apply_fn, success_response, commit_message):
 
 
 def cmd_claim(args):
+    _activate_server(args)
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     me = author()
@@ -642,6 +795,7 @@ def _set_state(t, new_claim_state, new_meta_status, **extra_meta):
 
 
 def cmd_start(args):
+    _activate_server(args)
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     me = author()
@@ -661,6 +815,7 @@ def cmd_start(args):
 
 
 def cmd_complete(args):
+    _activate_server(args)
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     me = author()
@@ -681,6 +836,7 @@ def cmd_complete(args):
 
 
 def cmd_abandon(args):
+    _activate_server(args)
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     me = author()
@@ -719,6 +875,7 @@ def cmd_abandon(args):
 
 
 def cmd_handoff(args):
+    _activate_server(args)
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     me = author()
@@ -760,6 +917,7 @@ def cmd_join(args):
     A concurrent rebase-retry can only add more members, never invalidate
     our password verification.
     """
+    _activate_server(args)
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     me = author()
@@ -807,6 +965,7 @@ def cmd_resolve(args):
     A concurrent rebase-retry can only add more members, never remove our
     own membership or change the thread's kind.
     """
+    _activate_server(args)
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     me = author()
@@ -933,11 +1092,26 @@ def cmd_status(args):
         verdict = "active_only"
         message = ("Env vars set in shell but not in settings.local.json. "
                    "Run `pp-install` to persist them.")
+    # Server info: tolerant of missing repo/registry. The status verb is the
+    # main thing users run before they have anything set up, so failures
+    # here become null fields rather than die().
+    servers_list = []
+    active_server = None
+    try:
+        servers_list = [s.get("name") for s in _registry_load().get("servers", [])]
+    except SystemExit:
+        pass
+    active_server = (
+        os.environ.get("PAIR_PRESSURE_SERVER")
+        or (servers_list[0] if len(servers_list) == 1 else None)
+    )
     out({
         "saved": saved,
         "active": active,
         "verdict": verdict,
         "message": message,
+        "servers": servers_list,
+        "active_server": active_server,
     })
 
 
@@ -976,6 +1150,7 @@ def _snippet(text, query, width=160):
 
 
 def cmd_search(args):
+    _activate_server(args)
     if not args.no_pull:
         maybe_pull()
     repo = repo_path()
@@ -1082,25 +1257,218 @@ def cmd_search(args):
     out(results)
 
 
+def _valid_server_name(name):
+    return bool(re.match(r"^[a-z0-9][a-z0-9._-]{0,63}$", name))
+
+
+def cmd_servers(args):
+    """List servers in the registry, cross-checked against remote branches.
+
+    Reports for each server whether it has a local worktree materialized
+    and whether the branch is on the remote. Surfaces orphan branches
+    (on remote but absent from the registry).
+    """
+    main = _main_repo_path()
+    git("fetch", "origin", "main", cwd=main, check=False)
+    git("fetch", "origin", "--prune", cwd=main, check=False)
+    git("pull", "--rebase", "--autostash", cwd=main, check=False)
+
+    reg = _registry_load()
+    res = git("branch", "-r", "--list", f"origin/{SERVER_BRANCH_PREFIX}*",
+              cwd=main, check=False)
+    remote_servers = set()
+    prefix = f"origin/{SERVER_BRANCH_PREFIX}"
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if line.startswith(prefix):
+            remote_servers.add(line[len(prefix):])
+
+    wt_root = main / ".pp-worktrees"
+    local_worktrees = (
+        {p.name for p in wt_root.iterdir() if p.is_dir()}
+        if wt_root.exists() else set()
+    )
+
+    rows = []
+    in_registry = set()
+    for s in reg.get("servers", []):
+        name = s["name"]
+        in_registry.add(name)
+        rows.append({
+            "name": name,
+            "description": s.get("description", ""),
+            "created_by": s.get("created_by", ""),
+            "created_at": s.get("created_at", ""),
+            "channels": s.get("channels", []),
+            "on_remote": name in remote_servers,
+            "local_worktree": name in local_worktrees,
+        })
+    for r in sorted(remote_servers - in_registry):
+        rows.append({
+            "name": r,
+            "orphan_branch": True,
+            "on_remote": True,
+            "local_worktree": r in local_worktrees,
+        })
+    out({
+        "servers": rows,
+        "active": os.environ.get("PAIR_PRESSURE_SERVER"),
+    })
+
+
+def cmd_server_new(args):
+    """Create a server: branch off main + worktree + channels + registry append."""
+    name = args.name
+    if not _valid_server_name(name):
+        die("server name must match ^[a-z0-9][a-z0-9._-]{0,63}$")
+
+    main = _main_repo_path()
+    branch = _server_branch(name)
+
+    git("fetch", "origin", "main", cwd=main, check=False)
+    git("pull", "--rebase", "--autostash", cwd=main, check=False)
+
+    reg = _registry_load()
+    if any(s.get("name") == name for s in reg.get("servers", [])):
+        die(f"server '{name}' already in registry")
+    if _origin_branch_exists(branch, cwd=main):
+        die(f"branch {branch} already exists on remote -- "
+            "either someone else just created it (try `pp servers`) "
+            "or it's an orphan; resolve manually")
+
+    wt = main / ".pp-worktrees" / name
+    git("worktree", "add", "-b", branch, str(wt), "main", cwd=main)
+
+    # The registry lives ONLY on main -- strip it from server branches so it
+    # can't drift between branches.
+    pp_dir = wt / ".pair-pressure"
+    if pp_dir.exists():
+        shutil.rmtree(pp_dir)
+
+    channels = [c.strip() for c in (args.channels or "general").split(",") if c.strip()]
+    if not channels:
+        channels = ["general"]
+    for ch in channels:
+        chdir = wt / "channels" / ch
+        chdir.mkdir(parents=True, exist_ok=True)
+        write_json(chdir / "channel.json", {"name": ch, "description": ""})
+
+    git("add", "-A", cwd=wt)
+    if git("status", "--porcelain", cwd=wt, check=False).stdout.strip():
+        git("commit", "-m", f"init server {name}", cwd=wt)
+    if has_remote():
+        push = git("push", "-u", "origin", branch, cwd=wt, check=False)
+        if push.returncode != 0:
+            die(f"failed to push {branch}: {push.stderr.strip()}")
+
+    # Update registry on main, with rebase-retry if someone raced us.
+    global _CURRENT_REPO
+    _CURRENT_REPO = main
+
+    def write_payload():
+        cur = _registry_load()
+        if not any(s.get("name") == name for s in cur.get("servers", [])):
+            cur.setdefault("servers", []).append({
+                "name": name,
+                "description": args.description or "",
+                "created_at": now_iso(),
+                "created_by": author(),
+                "channels": channels,
+            })
+            _registry_save(cur)
+        return {
+            "ok": True,
+            "name": name,
+            "branch": branch,
+            "worktree": str(wt),
+            "channels": channels,
+        }
+
+    def msg(info):
+        return f"register server {name}"
+
+    out(push_with_retry(write_payload, msg))
+
+
+def cmd_server_switch(args):
+    """Validate target server and lazy-materialize its worktree.
+
+    Prints both POSIX and PowerShell export lines for CLI ergonomics.
+    Slash commands read the JSON and update conversation context instead.
+    """
+    name = args.name
+    reg = _registry_load()
+    in_registry = any(s.get("name") == name for s in reg.get("servers", []))
+    if not in_registry:
+        # Allow switching to a remote-only orphan branch (real branch, not in
+        # registry yet) -- still useful. But typos must fail cleanly.
+        main = _main_repo_path()
+        git("fetch", "origin", _server_branch(name), cwd=main, check=False)
+        if not _origin_branch_exists(_server_branch(name), cwd=main):
+            die(f"server '{name}' not in registry (try `pp servers`)")
+    worktree_path(name)
+    out({
+        "ok": True,
+        "active_server": name,
+        "shell_export": f"export PAIR_PRESSURE_SERVER={name}",
+        "powershell": f"$env:PAIR_PRESSURE_SERVER = '{name}'",
+        "hint": "CLI: eval the shell_export line. Claude Code slash command: "
+                "remember this in conversation context for subsequent /pp-chat:* calls.",
+    })
+
+
+def cmd_server_remove(args):
+    """Delete worktree + local + remote branch + registry entry. --yes required."""
+    name = args.name
+    if not args.yes:
+        die("refusing to remove without --yes (this deletes the branch and worktree)")
+    main = _main_repo_path()
+    branch = _server_branch(name)
+    wt = main / ".pp-worktrees" / name
+    if wt.exists():
+        git("worktree", "remove", "--force", str(wt), cwd=main, check=False)
+    git("branch", "-D", branch, cwd=main, check=False)
+    if has_remote():
+        git("push", "origin", "--delete", branch, cwd=main, check=False)
+
+    global _CURRENT_REPO
+    _CURRENT_REPO = main
+
+    def write_payload():
+        cur = _registry_load()
+        cur["servers"] = [s for s in cur.get("servers", []) if s.get("name") != name]
+        _registry_save(cur)
+        return {"ok": True, "removed": name}
+
+    def msg(info):
+        return f"unregister server {name}"
+
+    out(push_with_retry(write_payload, msg))
+
+
 def main():
     p = argparse.ArgumentParser(prog="pp", description="pair-pressure CLI")
     p.add_argument("--version", action="version", version=f"pair-pressure {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("pull", help="git pull --rebase --autostash")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_pull)
 
     sp = sub.add_parser("push", help="git push if ahead")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_push)
 
     sp = sub.add_parser("list-channels")
     sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_list_channels)
 
     sp = sub.add_parser("list-threads")
     sp.add_argument("--channel", required=True)
     sp.add_argument("--limit", type=int, default=0)
     sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_list_threads)
 
     sp = sub.add_parser("read-thread")
@@ -1108,6 +1476,7 @@ def main():
     sp.add_argument("--thread", required=True)
     sp.add_argument("--since", type=int, default=0)
     sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_read_thread)
 
     sp = sub.add_parser("new-thread")
@@ -1124,6 +1493,7 @@ def main():
     sp.add_argument("--model", default=None)
     sp.add_argument("--password", default=None,
                     help="advisory access marker; sha256-hashed into meta.json")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_new_thread)
 
     sp = sub.add_parser("reply")
@@ -1139,23 +1509,27 @@ def main():
     sp.add_argument("--summary", default=None)
     sp.add_argument("--via", default="claude-code")
     sp.add_argument("--model", default=None)
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_reply)
 
     sp = sub.add_parser("claim", help="atomically claim a task thread")
     sp.add_argument("--channel", required=True)
     sp.add_argument("--thread", required=True)
     sp.add_argument("--via", default="claude-code")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_claim)
 
     sp = sub.add_parser("start", help="mark a claimed task as in_progress (assignee only)")
     sp.add_argument("--channel", required=True)
     sp.add_argument("--thread", required=True)
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_start)
 
     sp = sub.add_parser("complete", help="mark a task done (assignee only)")
     sp.add_argument("--channel", required=True)
     sp.add_argument("--thread", required=True)
     sp.add_argument("--summary", default=None)
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_complete)
 
     sp = sub.add_parser("abandon", help="release a claim (assignee only by default)")
@@ -1164,12 +1538,14 @@ def main():
     sp.add_argument("--reason", default=None)
     sp.add_argument("--force", action="store_true",
                     help="abandon even if you are not the assignee")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_abandon)
 
     sp = sub.add_parser("handoff", help="reassign a claim (current assignee only)")
     sp.add_argument("--channel", required=True)
     sp.add_argument("--thread", required=True)
     sp.add_argument("--to", required=True)
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_handoff)
 
     sp = sub.add_parser("join", help="record current author as a thread member")
@@ -1177,6 +1553,7 @@ def main():
     sp.add_argument("--thread", required=True)
     sp.add_argument("--password", default=None,
                     help="required if the thread was created with --password")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_join)
 
     sp = sub.add_parser("resolve",
@@ -1188,6 +1565,7 @@ def main():
                          "accepted|rejected|superseded; "
                          "for others: optional free-text summary appended as a final post")
     sp.add_argument("--via", default="claude-code")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_resolve)
 
     sp = sub.add_parser("status",
@@ -1212,7 +1590,38 @@ def main():
     )
     sp.add_argument("--limit", type=int, default=0)
     sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
     sp.set_defaults(func=cmd_search)
+
+    sub.add_parser("servers", help="list servers (alias for `pp server list`)") \
+        .set_defaults(func=cmd_servers)
+
+    sp_server = sub.add_parser("server", help="server management")
+    sub_server = sp_server.add_subparsers(dest="server_cmd", required=True)
+
+    sub_server.add_parser("list", help="list servers in the registry") \
+        .set_defaults(func=cmd_servers)
+
+    sp = sub_server.add_parser("new", help="create a new server (branch + worktree + channels)")
+    sp.add_argument("name")
+    sp.add_argument("--description", default=None,
+                    help="short description stored in the registry")
+    sp.add_argument("--channels", default=None,
+                    help="comma-separated channel list (default: general)")
+    sp.set_defaults(func=cmd_server_new)
+
+    sp = sub_server.add_parser("switch",
+                               help="validate + materialize a server worktree; "
+                                    "prints env-export hints")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_server_switch)
+
+    sp = sub_server.add_parser("remove",
+                               help="delete a server branch + worktree + registry entry "
+                                    "(requires --yes)")
+    sp.add_argument("name")
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=cmd_server_remove)
 
     args = p.parse_args()
     try:

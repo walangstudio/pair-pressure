@@ -32,12 +32,33 @@ import re
 import shutil
 import subprocess
 import sys
+from importlib.resources import files
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-SKILL_DIR = REPO_ROOT / ".claude" / "skills" / "pair-pressure"
+# `__file__` resolves to one of:
+#   - editable install: <repo>/src/pair_pressure/_data/scripts/pp-install.py
+#   - wheel install:    <venv>/Lib/site-packages/pair_pressure/_data/scripts/pp-install.py
+# parents[1] = .../_data ; parents[2] = .../pair_pressure ; parents[3] = .../src or site-packages
+DATA_ROOT = Path(__file__).resolve().parent.parent  # _data/
+PP_INIT_SCRIPT = DATA_ROOT / "scripts" / "pp-init.py"
+
+
+def _bundled_skill_root() -> Path:
+    """Locate the skill source tree via importlib.resources.
+
+    Works for both editable (source dir) and wheel (site-packages) installs.
+    Falls back to DATA_ROOT/skill which equals the resource path when the
+    package is importable.
+    """
+    try:
+        return Path(str(files("pair_pressure") / "_data" / "skill"))
+    except (ModuleNotFoundError, OSError):
+        return DATA_ROOT / "skill"
+
+
+SKILL_DIR = _bundled_skill_root()
 COMMAND_SOURCES = SKILL_DIR / "templates" / "commands"
 CLAUDE_HOME = Path.home() / ".claude"
 SETTINGS_PATH = CLAUDE_HOME / "settings.local.json"
@@ -49,7 +70,7 @@ USER_COMMANDS_PATH = CLAUDE_HOME / "commands" / "pp-chat"
 # idempotently rather than appending duplicates on re-runs.
 PROFILE_BEGIN = "# >>> pair-pressure env vars (pp-install) >>>"
 PROFILE_END   = "# <<< pair-pressure env vars <<<"
-PP_ENV_KEYS = ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR")
+PP_ENV_KEYS = ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_SERVER")
 
 
 # ---- helpers ----
@@ -311,35 +332,61 @@ def write_shell_profile(env_updates):
 
 # ---- skill install ----
 
-def install_skill():
-    """Junction (Windows) or symlink (POSIX) the skill into ~/.claude/skills.
+def _is_junction_or_symlink(p: Path) -> bool:
+    if p.is_symlink():
+        return True
+    if os.name == "nt":
+        # Windows junctions are not symlinks; detect via FILE_ATTRIBUTE_REPARSE_POINT.
+        try:
+            import stat
+            return bool(p.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)  # type: ignore[attr-defined]
+        except (OSError, AttributeError):
+            return False
+    return False
 
-    Idempotent: if the destination already exists and points at the right
-    place, no-op. If it points somewhere else, leaves it alone and warns.
+
+def install_skill():
+    """Copy the bundled skill tree into ~/.claude/skills/pair-pressure.
+
+    v0.4 ships skill data inside the wheel (`pair_pressure._data.skill`),
+    so the source IS the install. We copy rather than junction so the
+    user's source clone can be deleted/moved without breaking the skill.
+
+    Idempotent:
+      - missing destination -> copy
+      - existing copy       -> overwrite (skill is the authoritative source)
+      - junction/symlink (old v0.3 install) -> remove + replace with a copy
+
+    Writes ~/.claude/skills/pair-pressure/.pp-version so future re-runs
+    can detect stale skill files vs the installed wheel.
     """
     src = SKILL_DIR
     dst = USER_SKILL_PATH
-    if dst.exists() or dst.is_symlink():
-        # Resolve and compare. On Windows, junctions resolve via .resolve().
-        try:
-            existing_target = dst.resolve(strict=False)
-            if existing_target == src.resolve():
-                return "already-installed"
-        except OSError:
-            pass
-        return "exists-different-target"
+    if not src.is_dir():
+        die(f"bundled skill not found at {src} (wheel built without _data?)")
+
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        # mklink /j needs string paths and works without admin / dev mode
-        r = subprocess.run(
-            ["cmd", "/c", "mklink", "/j", str(dst), str(src)],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0:
-            die(f"failed to create junction: {r.stderr.strip() or r.stdout.strip()}")
-    else:
-        dst.symlink_to(src)
-    return "installed"
+    action = "installed"
+    if dst.exists() or _is_junction_or_symlink(dst):
+        if _is_junction_or_symlink(dst):
+            # v0.3 left a junction here. Remove it cleanly so we can copy.
+            try:
+                if os.name == "nt":
+                    # rmdir works for junctions; unlink fails. shutil handles both.
+                    os.rmdir(dst)
+                else:
+                    dst.unlink()
+            except OSError:
+                die(f"cannot remove existing junction/symlink at {dst} -- "
+                    "delete it manually and re-run pp-install")
+            action = "replaced-junction"
+        else:
+            shutil.rmtree(dst)
+            action = "refreshed"
+
+    shutil.copytree(src, dst)
+    (dst / ".pp-version").write_text(__version__ + "\n", encoding="utf-8")
+    return action
 
 
 # ---- slash command install ----
@@ -431,23 +478,21 @@ def repo_name_from_url(url):
 
 
 def _refuse_inside_tooling(target):
-    """Hard-fail if target lands inside the tooling repo (REPO_ROOT).
+    """Hard-fail if target lands inside the install-time tooling clone.
 
-    Cloning chat data into the tooling clone is almost never what the user
-    intended -- they get a nested repo and confusing git output. Hard-error
-    with a clear message rather than silently doing the wrong thing.
+    v0.4 installs are wheel-based by default, so the "tooling repo" is the
+    site-packages dir -- never a place a user would deliberately put their
+    chat repo. We still refuse if the target's resolved path contains a
+    `pyproject.toml`, which is a strong "this is a Python project" signal.
     """
-    try:
-        target.relative_to(REPO_ROOT)
-    except ValueError:
-        return  # target is NOT inside the tooling repo -- good
-    die(
-        f"Refusing to place chat repo at {target}\n"
-        f"  -- that's inside the tooling repo ({REPO_ROOT}).\n"
-        f"  Chat data should live elsewhere. Re-run the wizard and supply\n"
-        f"  an absolute path (e.g. {Path.home() / 'code' / target.name}),\n"
-        f"  or just press Enter at the prompt to accept the default."
-    )
+    for parent in [target, *target.parents]:
+        if (parent / "pyproject.toml").is_file():
+            die(
+                f"Refusing to place chat repo at {target}\n"
+                f"  -- {parent} is a Python project root (pyproject.toml exists).\n"
+                f"  Chat data should live in its own dir. Re-run the wizard and\n"
+                f"  supply an absolute path (e.g. {Path.home() / 'code' / target.name})."
+            )
 
 
 def resolve_chat_repo(args):
@@ -520,27 +565,31 @@ def resolve_chat_repo(args):
         default_dir,
     )
     _refuse_inside_tooling(target)
-    channels = prompt("Channels (comma-separated)", default="general,planning,brainstorm")
     remote = prompt("Remote URL to set as origin (blank to skip)", default="")
-    _pp_init(target, channels, remote or None)
+    # In v0.4 pp-init scaffolds the registry only -- channels live on server
+    # branches. We'll prompt to create the first server after chat-repo
+    # resolution, so the "init" branch here is just the empty registry.
+    _pp_init(target, channels="", remote=remote or None)
     return (target, True)
 
 
-def _pp_init(target, channels, remote, force=False):
+def _pp_init(target, channels, remote, force=False, with_server=None):
     """Invoke pp-init on a target dir.
 
+    v0.4 scaffolds an empty v2 registry. If `with_server` is provided,
+    pp-init also runs `pp server new <name> --channels <channels>` to
+    create an initial server in one step.
+
     `force=True` lets pp-init proceed when the target already exists with
-    content (the typical case: we just `git clone`d an empty remote, so
-    the target has a `.git/` directory and nothing else). pp-init's own
-    `git init -b main` is idempotent, so it won't damage existing git
-    state -- it will leave `origin` configured to whatever the clone set.
+    content (typical case: we just `git clone`d an empty remote).
     """
-    pp_init = REPO_ROOT / "scripts" / "pp-init.py"
-    args = [sys.executable, str(pp_init), str(target), "--channels", channels]
+    args = [sys.executable, str(PP_INIT_SCRIPT), str(target)]
     if remote:
         args += ["--remote", remote]
     if force:
         args += ["--force"]
+    if with_server:
+        args += ["--with-server", with_server, "--channels", channels]
     print(f"Running pp-init {target} ...")
     subprocess.run(args, check=True)
 
@@ -571,30 +620,27 @@ def _push_initial_commit(target):
 
 
 def _scaffold_if_needed(target, url=None):
-    """If `target` is a git dir without pair-pressure scaffolding, offer to
-    create it. Used by the wizard right after a `git clone`. The clone may
-    have brought down an empty remote, or a populated-but-different repo.
+    """If `target` is a git dir without v2 scaffolding, offer to bootstrap it.
+
+    Used by the wizard right after a `git clone`. The clone may have
+    brought down an empty remote, or a v1-or-other repo. v0.4 is a clean
+    break -- no migration -- so v1 schemas trigger a force re-init.
 
     After scaffolding, if `target` has an `origin` remote, offer to push
-    the initial commit. Otherwise `pp new-thread` and friends would hit
-    "fatal: ambiguous argument 'origin/main'" on the first write
-    (push_with_retry handles this in v0.3+, but pushing now also avoids
-    the trap for any older `pp` in the wild).
+    the initial commit so future `pp` ops don't trip over an empty remote.
     """
     if _is_scaffolded(target):
         return
     print()
-    print(f"  {target} is a git repo but has no pair-pressure scaffolding yet.")
-    print(f"  (probably: the remote is empty, or it's not a pair-pressure chat repo).")
-    if not yes_no("  Scaffold it now? (channels + schema-version + initial commit)",
+    print(f"  {target} is a git repo but has no v2 pair-pressure scaffolding yet.")
+    print(f"  (probably: the remote is empty, or it's an older / unrelated repo).")
+    if not yes_no("  Scaffold it now? (registry + .gitignore + initial commit)",
                   default_yes=True):
         die("Aborting -- chat repo is not scaffolded. "
             "Run pp-init on it manually, or rerun pp-install and pick option 3.")
-    channels = prompt("Channels (comma-separated)",
-                      default="general,planning,brainstorm")
     # Don't pass --remote: the clone already set origin. pp-init's --remote
     # would try to `git remote add origin` and fail with "already exists".
-    _pp_init(target, channels, remote=None, force=True)
+    _pp_init(target, channels="", remote=None, force=True)
 
     if _has_remote(target):
         if yes_no(f"  Push the scaffold to origin now? "
@@ -634,38 +680,121 @@ def verify(chat_repo, author):
         return ("fail", "pp list-channels did not return JSON")
 
 
+# ---- first-server bootstrap ----
+
+_SERVER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _registry_has_servers(chat_repo: Path) -> bool:
+    p = chat_repo / ".pair-pressure" / "servers.json"
+    if not p.is_file():
+        return False
+    try:
+        return bool(json.loads(p.read_text(encoding="utf-8-sig")).get("servers"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def maybe_create_first_server(chat_repo: Path, args, author: str):
+    """If the chat repo's registry is empty, offer to create a first server.
+
+    Honors --server-name / --channels for non-interactive runs. Returns the
+    name of the created server, or None if none was created.
+    """
+    if not (chat_repo / ".pair-pressure" / "servers.json").is_file():
+        return None
+    if _registry_has_servers(chat_repo):
+        return None
+
+    if args.server_name:
+        name = args.server_name
+    elif PromptCtx.non_interactive:
+        return None
+    else:
+        print()
+        if not yes_no(
+            "The chat repo has no servers yet. Create your first server now?",
+            default_yes=True,
+        ):
+            return None
+        name = prompt(
+            "Server name", default="general",
+            validate=lambda s: None if _SERVER_NAME_RE.match(s)
+                                    else "must match ^[a-z0-9][a-z0-9._-]{0,63}$",
+        )
+
+    channels = args.channels or "general"
+    if not PromptCtx.non_interactive and not args.channels:
+        channels = prompt(
+            "Channels for this server (comma-separated)",
+            default="general",
+        )
+
+    env = os.environ.copy()
+    env["PAIR_PRESSURE_REPO"] = str(chat_repo)
+    env["PAIR_PRESSURE_AUTHOR"] = author
+    print(f"Creating server '{name}' (channels: {channels})...")
+    pp = shutil.which("pp")
+    cmd = [pp or "pp", "server", "new", name, "--channels", channels]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  failed: {(r.stderr or r.stdout).strip()}")
+        print(f"  You can retry manually: pp server new {name} --channels {channels}")
+        return None
+    try:
+        info = json.loads(r.stdout)
+        print(f"  ok: server/{info.get('name', name)} at {info.get('worktree', '?')}")
+    except json.JSONDecodeError:
+        print(f"  ok (raw): {r.stdout.strip()}")
+    return name
+
+
 # ---- upgrade flow ----
 
 def upgrade_flow(existing_version, install_method, args):
-    """Re-install package via same method, refresh slash commands, preserve env."""
-    print(f"\nFound existing pair-pressure {existing_version} (installed via: {install_method})")
-    if not yes_no(f"Upgrade to {__version__}?", default_yes=True):
+    """Refresh skill + slash commands + verify config; preserve env vars.
+
+    v0.4 wheel-based install means the package itself is upgraded via
+    `./install.ps1` (or `uv tool upgrade pair-pressure`), NOT inside
+    pp-install. This flow refreshes the user-visible artifacts that
+    don't live in the wheel (skill copy in ~/.claude, slash commands)
+    and validates the existing config.
+    """
+    print(f"\nFound existing pair-pressure {existing_version} "
+          f"(installed via: {install_method})")
+    if existing_version != __version__:
+        print(f"pp-install bundled with {__version__}; pp on PATH is {existing_version}.")
+        print("Run `./install.ps1` (or `uv tool upgrade pair-pressure`) to update "
+              "the package first, then re-run pp-install.")
+        if not yes_no("Refresh skill + slash commands anyway?", default_yes=False):
+            sys.exit(0)
+    elif not yes_no("Refresh skill + slash commands (preserves your env vars)?",
+                    default_yes=True):
         print("Cancelled.")
         sys.exit(0)
     print()
-    print(f"[1/4] Reinstalling package via {install_method}...")
-    if install_method == "uv":
-        run("uv", "tool", "install", "--editable", str(REPO_ROOT), "--reinstall", capture=False, check=False)
-    elif install_method == "pipx":
-        run("pipx", "install", "--editable", str(REPO_ROOT), "--force", capture=False, check=False)
-    elif install_method == "pip":
-        run(sys.executable, "-m", "pip", "install", "--user", "--editable",
-            str(REPO_ROOT), "--upgrade", capture=False, check=False)
-    else:
-        print(f"  unknown install method; skipping package step. Run `{install_method} upgrade pair-pressure` manually.")
+
+    print("[1/4] Refreshing skill at "
+          f"{USER_SKILL_PATH} (copy from bundled wheel)...")
+    print(f"   skill: {install_skill()}")
 
     print("[2/4] Refreshing slash commands (preserving any you customized)...")
-    actions = install_slash_commands(bin_name=args.bin_name, force_overwrite=args.overwrite_commands)
-    print(f"   new={actions['new']} updated={actions['updated']} kept-customized={actions['kept']} unchanged={actions['unchanged']}")
+    actions = install_slash_commands(
+        bin_name=args.bin_name,
+        force_overwrite=args.overwrite_commands,
+    )
+    print(f"   new={actions['new']} updated={actions['updated']} "
+          f"kept-customized={actions['kept']} unchanged={actions['unchanged']}")
 
     print("[3/4] Preserving existing settings.local.json env vars...")
     existing = {}
     if SETTINGS_PATH.exists():
         try:
-            existing = json.loads(SETTINGS_PATH.read_text() or "{}").get("env", {})
+            existing = (json.loads(SETTINGS_PATH.read_text(encoding="utf-8-sig") or "{}")
+                        .get("env", {}))
         except json.JSONDecodeError:
             pass
-    for k in ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR"):
+    for k in PP_ENV_KEYS:
         v = existing.get(k)
         mark = "OK" if v else "MISSING"
         print(f"   {k}: {mark}{' = ' + v if v else ''}")
@@ -677,9 +806,9 @@ def upgrade_flow(existing_version, install_method, args):
         status, msg = verify(Path(repo), author)
         print(f"   {status}: {msg}")
     else:
-        print("   skipped (env vars incomplete) — run `pp-install` without --yes to fix")
+        print("   skipped (env vars incomplete) -- run `pp-install` without --yes to fix")
 
-    print(f"\nUpgraded to {__version__}. Restart Claude Code to pick up any new env vars.")
+    print(f"\nRefreshed for {__version__}. Restart Claude Code if env vars changed.")
 
 
 # ---- fresh install flow ----
@@ -733,6 +862,16 @@ def fresh_install_flow(args):
         actions = install_slash_commands(bin_name=args.bin_name, force_overwrite=args.overwrite_commands)
         print(f"  slash commands: new={actions['new']} updated={actions['updated']} kept-customized={actions['kept']} unchanged={actions['unchanged']}")
 
+    # First-server bootstrap (if registry is empty)
+    first_server = maybe_create_first_server(chat_repo, args, author)
+    if first_server and not PromptCtx.non_interactive and not args.no_default_server:
+        set_default = args.set_default_server or yes_no(
+            f"Set PAIR_PRESSURE_SERVER={first_server} as the default for this shell?",
+            default_yes=True,
+        )
+    else:
+        set_default = bool(first_server and args.set_default_server)
+
     # Settings merge -- write to BOTH settings.local.json and settings.json,
     # plus the user's shell profile, so env vars are picked up regardless
     # of which mechanism the Claude Code build honors.
@@ -740,11 +879,15 @@ def fresh_install_flow(args):
         "PAIR_PRESSURE_REPO": str(chat_repo),
         "PAIR_PRESSURE_AUTHOR": author,
     }
+    if set_default and first_server:
+        env_updates["PAIR_PRESSURE_SERVER"] = first_server
     print(f"\nMerging env vars into:")
     print(f"  {SETTINGS_PATH}")
     print(f"  {SETTINGS_GLOBAL_PATH}")
     print(f"  + PAIR_PRESSURE_REPO   = {chat_repo}")
     print(f"  + PAIR_PRESSURE_AUTHOR = {author}")
+    if "PAIR_PRESSURE_SERVER" in env_updates:
+        print(f"  + PAIR_PRESSURE_SERVER = {env_updates['PAIR_PRESSURE_SERVER']}")
     merge_settings(env_updates)
     for path, action in write_shell_profile(env_updates):
         print(f"  shell profile: {action} {path}")
@@ -784,6 +927,14 @@ def main():
                     help="channels when --create-if-missing creates a fresh chat repo")
     ap.add_argument("--create-if-missing", action="store_true",
                     help="if --repo path doesn't exist, run pp-init on it")
+
+    # Server / first-server options
+    ap.add_argument("--server-name", default=None,
+                    help="name for the first server (skips prompt if registry is empty)")
+    ap.add_argument("--set-default-server", action="store_true",
+                    help="write PAIR_PRESSURE_SERVER=<first-server> to env vars")
+    ap.add_argument("--no-default-server", action="store_true",
+                    help="skip the prompt about PAIR_PRESSURE_SERVER")
 
     # Yes/no toggles for skill+commands
     ap.add_argument("--skill",    action="store_true", help="install the skill (default: prompt yes)")
