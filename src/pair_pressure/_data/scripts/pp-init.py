@@ -28,7 +28,7 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 SCHEMA_VERSION = "2"
 

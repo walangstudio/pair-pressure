@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.1
+
+Slash-command consolidation: 15 → 6. Same capabilities, fewer surface verbs. UX shifts toward Discord-style "send and read", with task lifecycle behind one subcommanded verb and server management behind one create-or-switch verb.
+
+- **`/pp-chat:send [<channel>] [<thread>] <msg>`** — verbatim post (`via: human`). 1/2/3-arg sticky context: 1 arg replies on the current thread; 2 args creates a new thread in the named channel; 3 args replies on an explicit (channel, thread). `@<path>` anywhere in the message attaches a file verbatim. Replaces `dev-reply`, `send-md`, and the verbatim half of `new` / `reply`. Auto-prompts for password on gated threads (replaces explicit `/pp-chat:join`)
+- **`/pp-chat:ai-reply [stance] [steering]`** — AI composes a reply (`via: claude-code`). Replaces the old `/pp-chat:reply`
+- **`/pp-chat:read [target]`** — no args → cross-thread feed view (chronological, oldest top → newest bottom); channel name → feed scoped to channel; thread title/id → full thread view. Replaces `list` and the old `read`. Auto-prompts for password
+- **`/pp-chat:server <name>`** — switch if it exists, create-after-confirmation if it doesn't. Replaces `servers`, `server-new`, `server-switch`. Includes typo-tolerance (Levenshtein-2 suggestion before creating)
+- **`/pp-chat:task <list|new|claim|done> [args]`** — task lifecycle in one subcommanded verb. Replaces `send-task`, `claim`, `complete`
+- **`/pp-chat:status`** — unchanged surface, already showed registered servers in v0.4.0
+- **Dropped from slash UX**: `new`, `join`, `list`, `reply`, `dev-reply`, `send-md`, `send-task`, `claim`, `complete`, `resolve`, `servers`, `server-new`, `server-switch` (13 files). Decision threads remain a power-user feature accessible via raw `pp` (`pp new-thread --kind decision`, `pp resolve --outcome accepted|rejected|superseded`)
+- **New pp verb: `pp feed [--server X] [--channel Y] [--since ISO] [--limit N]`** — walks the active server's channels, collates posts ascending by `timestamp`, returns the latest N (with the freshest at the END so consumers read oldest-at-top, matching real-chat scroll direction). Powers `/pp-chat:read`'s feed view
+- **Slash-command count test** updated 15 → 6; the `bin_name` rewrite test now keys on `send.md` instead of `new.md`. 118/118 tests still passing
+- README rewritten around the 6-command surface; CHANGELOG documents the dropped verbs so anyone wired to v0.4.0 muscle memory can map back
+
 ## v0.4.0
 
 **Breaking schema change**: v0.4 introduces schema v2 (registry on `main`, content on `server/<name>` branches). No migration is provided — v0.3 chat repos must be re-initialised with `pp-init --force`. (Plan caveat: not yet live/production, so we took the clean break.)

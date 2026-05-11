@@ -333,26 +333,27 @@ class InstallSlashCommandsTests(unittest.TestCase):
 
     def test_copies_new_files(self):
         actions = self.mod.install_slash_commands()
-        # 15 canonical files ship in v0.4 (12 thread/task verbs + 3 server
-        # management verbs); all should be 'new' on a blank user-commands dir.
-        self.assertEqual(actions["new"], 15)
+        # 6 canonical files ship in v0.4.1 (consolidated from 15: send,
+        # ai-reply, read, server, task, status). All should be 'new' on a
+        # blank user-commands dir.
+        self.assertEqual(actions["new"], 6)
         self.assertEqual(actions["updated"], 0)
         self.assertEqual(actions["kept"], 0)
         self.assertEqual(actions["unchanged"], 0)
         # Sanity-check one specific file landed.
-        self.assertTrue((self.user_commands / "new.md").is_file())
+        self.assertTrue((self.user_commands / "send.md").is_file())
 
     def test_skip_unchanged(self):
         # First install, then immediately re-run: everything should be
         # 'unchanged' (same checksum).
         self.mod.install_slash_commands()
         actions = self.mod.install_slash_commands()
-        self.assertEqual(actions["unchanged"], 15)
+        self.assertEqual(actions["unchanged"], 6)
         self.assertEqual(actions["new"], 0)
 
     def test_bin_name_rewrite(self):
         actions = self.mod.install_slash_commands(bin_name="pair-pp")
-        body = (self.user_commands / "new.md").read_text()
+        body = (self.user_commands / "send.md").read_text()
         # 'pp' standalone should be rewritten; longer words containing
         # 'pp' should not (regex \bpp\b enforces word boundaries).
         self.assertIn("pair-pp", body)

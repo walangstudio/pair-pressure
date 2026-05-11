@@ -28,7 +28,7 @@ SCHEMA_VERSION = "2"
 # None means "registry / main checkout", used by server-management verbs.
 _CURRENT_REPO: "Path | None" = None
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 def die(msg, code=2):
@@ -1257,6 +1257,78 @@ def cmd_search(args):
     out(results)
 
 
+def cmd_feed(args):
+    """Cross-thread feed view: posts ordered ASCENDING by timestamp.
+
+    Replaces the need for the user to read each thread separately to catch
+    up. Returns at most --limit posts, with the most recent at the END of
+    the list (chronological / first-pushed first, matching real chat scroll
+    direction).
+
+    --channel narrows to a single channel; --since trims to posts at or
+    after the given ISO timestamp. Body is truncated to 240 chars per post
+    for feed scanability.
+    """
+    _activate_server(args)
+    if not args.no_pull:
+        maybe_pull()
+
+    channels_root = repo_path() / "channels"
+    if not channels_root.is_dir():
+        out([])
+        return
+
+    targets = (
+        [channels_root / args.channel] if args.channel
+        else sorted(p for p in channels_root.iterdir() if p.is_dir())
+    )
+
+    posts = []
+    for ch_dir in targets:
+        if not ch_dir.is_dir():
+            continue
+        ch_name = ch_dir.name
+        for thread_dir in sorted(p for p in ch_dir.iterdir() if p.is_dir()):
+            meta = read_json(thread_dir / "meta.json", {})
+            title = meta.get("title", thread_dir.name)
+            for post_file in _post_files(thread_dir):
+                fm, body = parse_fm(post_file.read_text())
+                ts = fm.get("timestamp") or ""
+                if args.since and ts < args.since:
+                    continue
+                snippet = body.strip()
+                if len(snippet) > 240:
+                    snippet = snippet[:240].rstrip() + "..."
+                posts.append({
+                    "channel": ch_name,
+                    "thread": thread_dir.name,
+                    "thread_title": title,
+                    "thread_kind": meta.get("kind", "discussion"),
+                    "thread_status": meta.get("status"),
+                    "ordinal": fm.get("id", post_file.name[:3]),
+                    "author": fm.get("author"),
+                    "via": fm.get("via"),
+                    "stance": fm.get("stance"),
+                    "timestamp": ts,
+                    "body": snippet,
+                    "filename": post_file.name,
+                })
+
+    # Ascending by timestamp (oldest first). For ties (same second), fall
+    # back to (channel, thread, ordinal) for deterministic ordering.
+    posts.sort(key=lambda p: (
+        p.get("timestamp") or "",
+        p.get("channel") or "",
+        p.get("thread") or "",
+        p.get("ordinal") or "",
+    ))
+    if args.limit:
+        # Keep the LAST `limit` (newest), but preserve chronological order
+        # so the consumer reads oldest-at-top.
+        posts = posts[-args.limit:]
+    out(posts)
+
+
 def _valid_server_name(name):
     return bool(re.match(r"^[a-z0-9][a-z0-9._-]{0,63}$", name))
 
@@ -1592,6 +1664,17 @@ def main():
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_search)
+
+    sp = sub.add_parser("feed",
+                        help="cross-thread feed view: posts chronological "
+                             "(oldest first); --channel narrows scope")
+    sp.add_argument("--channel", default=None)
+    sp.add_argument("--since", default=None,
+                    help="ISO timestamp; only posts >= this are returned")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_feed)
 
     sub.add_parser("servers", help="list servers (alias for `pp server list`)") \
         .set_defaults(func=cmd_servers)

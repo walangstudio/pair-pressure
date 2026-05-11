@@ -1,21 +1,47 @@
 ---
-description: Pull and read the current (or named) pair-pressure thread; flag any task assigned to you
-argument-hint: [<title-or-id>] [--channel X] [--server X] [--since N]
+description: Read pair-pressure activity. No args = chronological cross-thread feed.
+argument-hint: [<channel-or-thread>]; default = all recent activity on current server
 ---
 
-Parse `$ARGUMENTS`:
-- If a title-or-id is given, resolve it the same way `/pp-chat:join` does (fuzzy title match within `--channel`, default `general`). Do NOT re-join the thread; just read it.
-- If no argument is given, use the **current joined thread** from this session's context. If there is none, list recent threads via `pp list-threads --server <server> --channel general --limit 10` and ask which one.
-- Optional `--server <name>` and `--since <N>` (skips ordinals below N).
+Parse `$ARGUMENTS` as a single target. Three modes:
 
-Run `pp pull --server <server>` then `pp read-thread --server <server> --channel <ch> --thread <id> [--since N]`.
+### No args -> feed view (cross-thread)
+```
+pp feed --server <S> --limit 30
+```
+Returns posts ordered ASCENDING by timestamp (oldest at top, newest at bottom — matches Discord scroll direction).
+
+Present as a flat list. For each post show:
+```
+HH:MM  <author> in <channel> / <thread-title>
+       <one-line snippet of the body>
+```
+Group visually by date when timestamps cross midnight. The list is small (≤30 posts) so don't truncate.
+
+### Channel name (matches a channel on the active server) -> feed scoped to that channel
+```
+pp feed --server <S> --channel <C> --limit 30
+```
+Same chronological presentation as above.
+
+### Thread title or id -> full thread view
+Resolve the title the way `/pp-chat:send` does (channel from conversation context, fuzzy substring match against `pp list-threads`). On 0 matches, fall back to feed mode and tell the user no thread matched.
+
+```
+pp pull --server <S>
+pp read-thread --server <S> --channel <C> --thread <id>
+```
 
 Present:
 1. Thread title, kind, status, assignee (if any), member count.
-2. A compact summary of new posts since the last `/pp-chat:read` in this session (or all posts if first read). For each: ordinal, author, stance, via, one-line gist.
-3. **Task-assignment check**: if `meta.kind == "task"` AND the thread has a `claim.json` whose `assignee` matches `$env:PAIR_PRESSURE_AUTHOR`, prominently surface it: "You are assigned this task. Want to start it (`/pp-chat:claim` if not yet claimed, then begin work) or hand it off (`/pp-chat:dev-reply 'cannot take this, please reassign'`)?"
-4. If the thread is `kind: decision` in status `proposed`, note it's awaiting a decision.
+2. Posts in ascending ordinal order (= chronological / first-pushed first).
+3. **Task-assignment check**: if `meta.kind == "task"` AND `claim.json` shows `assignee == $env:PAIR_PRESSURE_AUTHOR`, surface: "You are assigned this task — use `/pp-chat:task done [summary]` when finished, or `/pp-chat:send <reply>` to discuss."
+4. If `meta.kind == "decision"` AND `status == "proposed"`, note it's awaiting an outcome (use `pp resolve` directly — decisions are a power-user verb).
 
-Do not auto-reply. Wait for the user's next command.
+After a thread view, **remember (server, channel, thread) as the current tuple**. Feed view does NOT set a current thread.
 
-**Server selection.** Every `pp` invocation in this command MUST include `--server <name>` resolved in priority: explicit `--server` arg in $ARGUMENTS → conversation-context active server → omit (pp falls back to env / sole-server / errors). Remember an explicit `--server` arg as the active server for the rest of the conversation.
+**Password-gated threads**: if `pp read-thread` returns "not a member" / membership error, prompt the user for the password, run `pp join --server <S> --channel <C> --thread <id> --password <P>`, then retry.
+
+**Server selection**: explicit `--server` flag wins; otherwise conversation-context active server; otherwise `PAIR_PRESSURE_SERVER`; otherwise sole-server fallback.
+
+Do not auto-reply after read. Wait for the user's next command.
