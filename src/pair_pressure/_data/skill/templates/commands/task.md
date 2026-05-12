@@ -9,44 +9,40 @@ Parse the first token of `$ARGUMENTS` as the subcommand. Remaining text is per-s
 
 List open and claimable tasks on the active server.
 ```
-pp search --server <S> --kind task --no-pull
+pp search --kind task --no-pull
 ```
-Present as a compact table: title, status (unclaimed / claimed / in_progress / done), assignee, last activity, thread id. Default sort: descending by last activity (newest first).
+Present as a compact table: title, status (unclaimed / claimed / in_progress / done), assignee, last activity, thread id. Default sort: descending by last activity (newest first). `pp search` already uses state for server selection.
 
 ### `task new <title> [--to <user>] [--channel <C>] [--password <P>] [body-or-@file]`
 
-Create a task thread.
-- Title: first quoted string in $ARGUMENTS, or everything before the first `--`.
-- `--to <user>`: auto-claim then handoff to `<user>`.
-- `--channel <C>`: target channel (default: `general`).
-- `--password <P>`: gate the thread.
-- Body: remaining tokens after flags. `@<path>` reads a file verbatim (same rules as `/pp-chat:send`). If body is empty, draft a short default using the seed template:
-  ```
-  ## Context
-  <one-sentence problem statement>
-  ## What "done" looks like
-  <observable acceptance>
-  ## Constraints
-  <known constraints, or "none">
-  ```
+Create a task thread in one call. Single tool call:
 
-Create. If no password, pipe the body alone:
+- Title: first quoted string in `$ARGUMENTS`, or everything before the first `--`.
+- `--to <user>`: auto-claim then handoff to `<user>`. `pp task new` does this in-process.
+- `--channel <C>`: target channel; if omitted, defaults via state → env → `general` (channel auto-created if missing).
+- `--password <P>`: gate the thread. Prefer the stdin form below.
+- Body: remaining tokens after flags. `@<path>` reads a file verbatim. If body is empty, `pp task new` writes a seed template (Context / What "done" looks like / Constraints) automatically.
+
+No password:
 ```
-pp new-thread --server <S> --channel <C> --title "<T>" --kind task --via human --body-file -
+pp task new "<T>" [--to <U>] [--channel <C>] --body-file -
 ```
-If `--password <P>` was supplied, pipe the password as the first stdin line
-followed by the body (keeps the password out of process listings):
+Pipe the body on stdin.
+
+With password (keep it off process listings):
 ```
 { printf '%s\n' "<P>"; printf '%s' "<body>"; } |
-  pp new-thread --server <S> --channel <C> --title "<T>" --kind task --password-stdin --via human --body-file -
-```
-If `--to <user>`:
-```
-pp claim   --server <S> --channel <C> --thread <new_id>
-pp handoff --server <S> --channel <C> --thread <new_id> --to <user>
+  pp task new "<T>" [--to <U>] [--channel <C>] --password-stdin --body-file -
 ```
 
-Remember (server, channel, thread_id) as the current tuple. Echo the thread id and assignee.
+Response:
+```json
+{"ok": true, "server": "...", "channel": "...", "thread_id": "...", "assignee": "<U>|null"}
+```
+
+`pp task new` updates state to the new thread, so subsequent `/pp-chat:send`
+or `/pp-chat:task done` operate on it without further args. Echo the
+thread id and assignee.
 
 ### `task claim <title-or-id>`
 
@@ -56,23 +52,33 @@ post id):
 - Otherwise → fuzzy substring match against open tasks (status ≠ done): single match → use it; multiple → ask which; zero → say "no open task matched `<input>`".
 
 ```
-pp claim --server <S> --channel <C> --thread <id>
+pp claim --channel <C> --thread <id>
 ```
 Possible responses:
 - `{"ok": true, ...}` → confirm; suggest the user begin work and use `/pp-chat:task done` when finished.
 - `{"ok": false, "claimed_by": "<other>", ...}` → tell the user `<other>` already holds this task. Do not retry.
 
-Remember the claimed thread as the current tuple.
+Remember the claimed thread as the current tuple. (`pp claim` doesn't update
+state for you yet — pass the same `(server, channel, thread)` to subsequent
+`pp` calls or run `pp read <id>` afterward to set state.)
 
 ### `task done [summary]`
 
-Use the **current joined thread** from conversation context. Refuse if its kind is not `task` — for discussions/investigations, use `/pp-chat:send <summary>` to post a final summary post; for decisions, the user must invoke `pp resolve` directly (decisions are a power-user verb).
+Use the **current joined thread** from state. Refuse if it's not a task —
+`pp task done` checks this and returns an error rather than completing.
 
 ```
-pp complete --server <S> --channel <C> --thread <id> [--summary "<text>"]
+pp task done [--summary "<text>"]
 ```
 Possible responses:
 - `{"ok": true, "state": "done"}` → confirm.
 - `{"ok": false, "error": "not assignee", ...}` → tell the user only the current assignee can complete; suggest `/pp-chat:send` instead.
+- `{"ok": false, "error": "current thread is not a task", "kind": "..."}` →
+  for discussions/investigations, suggest `/pp-chat:send <summary>` to post a
+  final summary post; for decisions, `pp resolve` directly.
+- `{"ok": false, "error": "no current thread in state ..."}` → tell the user
+  to first `/pp-chat:read <title>` to set context.
 
-**Server selection**: explicit `--server` wins; otherwise conversation-context active server; otherwise `PAIR_PRESSURE_SERVER`; otherwise sole-server fallback. Remember an explicit `--server` as the active server going forward.
+**Server selection**: handled internally by `pp` — explicit `--server` >
+per-session state > global state > env > sole-server fallback. You don't need
+to pass `--server` unless the user named one explicitly.

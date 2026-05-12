@@ -32,7 +32,7 @@ _VIA_LONG = {v: k for k, v in _VIA_SHORT.items()}
 # None means "registry / main checkout", used by server-management verbs.
 _CURRENT_REPO: "Path | None" = None
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 def die(msg, code=2):
@@ -99,6 +99,137 @@ def _registry_save(data):
     p = _registry_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+# ---- smart-verb state (active.json + per-session sidecar) ----
+
+STATE_SCHEMA_VERSION = 1
+
+
+def _session_id():
+    sid = os.environ.get("PAIR_PRESSURE_SESSION_ID")
+    return sid.strip() if sid and sid.strip() else None
+
+
+def _state_path_global():
+    """Per-chat-repo active state, alongside the registry."""
+    return _main_repo_path() / ".pair-pressure" / "active.json"
+
+
+def _state_path_session():
+    sid = _session_id()
+    if not sid:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", sid)[:64] or "anon"
+    return Path.home() / ".pair-pressure" / "sessions" / f"{safe}.json"
+
+
+def _state_load_one(path):
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _state_load():
+    """Return (per_session, global). Either may be None."""
+    sess = _state_load_one(_state_path_session()) if _session_id() else None
+    glob = _state_load_one(_state_path_global())
+    return sess, glob
+
+
+def _state_save(server=None, channel=None, thread_id=None, source=None):
+    """Best-effort write to both per-session and global state files. Never
+    raises -- smart verbs must not die on state-write failure."""
+    payload = {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "server": server,
+        "channel": channel,
+        "thread_id": thread_id,
+        "updated_at": now_iso(),
+        "source": source or "unknown",
+    }
+    for path in (_state_path_session(), _state_path_global()):
+        if path is None:
+            continue
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            continue
+
+
+def _default_channel():
+    return os.environ.get("PAIR_PRESSURE_DEFAULT_CHANNEL") or "general"
+
+
+def _default_thread_title():
+    return os.environ.get("PAIR_PRESSURE_DEFAULT_THREAD_TITLE") or "general-chat"
+
+
+def resolve_active(args):
+    """Fill in args.server/channel/thread from state + env defaults.
+
+    Priority per field: explicit arg > per-session state > global state >
+    env var > sole-server fallback (server only) > default (channel/title)
+    > None (thread).
+
+    Mutates `args` in place so downstream code that reads args.server etc.
+    keeps working. Returns a dict with the resolved values and `sources`
+    diagnostics."""
+    sess, glob = _state_load()
+    sources = {}
+
+    server = getattr(args, "server", None)
+    if server:
+        sources["server"] = "arg"
+    elif sess and sess.get("server"):
+        server, sources["server"] = sess["server"], "session"
+    elif glob and glob.get("server"):
+        server, sources["server"] = glob["server"], "global"
+    elif os.environ.get("PAIR_PRESSURE_SERVER"):
+        server, sources["server"] = os.environ["PAIR_PRESSURE_SERVER"], "env"
+    else:
+        regs = _registry_load().get("servers", [])
+        if len(regs) == 1:
+            server, sources["server"] = regs[0]["name"], "sole-server"
+    if not server:
+        die("no server specified; pass --server <name> or set "
+            "PAIR_PRESSURE_SERVER (try `pp servers`)")
+    args.server = server
+
+    channel = getattr(args, "channel", None)
+    if channel:
+        sources["channel"] = "arg"
+    elif sess and sess.get("channel"):
+        channel, sources["channel"] = sess["channel"], "session"
+    elif glob and glob.get("channel"):
+        channel, sources["channel"] = glob["channel"], "global"
+    else:
+        channel, sources["channel"] = _default_channel(), "default"
+    args.channel = channel
+
+    thread = getattr(args, "thread", None)
+    if thread:
+        sources["thread"] = "arg"
+    elif sess and sess.get("thread_id"):
+        thread, sources["thread"] = sess["thread_id"], "session"
+    elif glob and glob.get("thread_id"):
+        thread, sources["thread"] = glob["thread_id"], "global"
+    else:
+        sources["thread"] = "none"
+    args.thread = thread
+
+    return {
+        "server": server,
+        "channel": channel,
+        "thread": thread,
+        "title": _default_thread_title(),
+        "sources": sources,
+    }
 
 
 def worktree_path(server):
@@ -411,8 +542,31 @@ def dump_slim(by, via, model, pid, stance, in_reply_to, body):
     return f"---\n{by_line}\n{rt_line}\n---\n\n{body}"
 
 
+_OUT_CAPTURE = None
+
+
 def out(obj):
+    """Emit a JSON payload to stdout, or capture it for in-process callers.
+
+    When `_OUT_CAPTURE` is a list, payloads are appended instead of printed --
+    this lets smart verbs (pp send, pp task new, ...) reuse existing cmd_*
+    functions without producing two JSON documents on stdout."""
+    if _OUT_CAPTURE is not None:
+        _OUT_CAPTURE.append(obj)
+        return
     print(json.dumps(obj, indent=2, sort_keys=True))
+
+
+def _capture(func, args):
+    """Run a cmd_* and return the last payload it emitted via out()."""
+    global _OUT_CAPTURE
+    saved = _OUT_CAPTURE
+    _OUT_CAPTURE = []
+    try:
+        func(args)
+        return _OUT_CAPTURE[-1] if _OUT_CAPTURE else None
+    finally:
+        _OUT_CAPTURE = saved
 
 
 def read_json(path, default=None):
@@ -694,6 +848,10 @@ def _warn_if_outside_attach_root(path_str):
 
 
 def read_body(args):
+    # Smart verbs pre-read the body once and shove it into args.body_text so
+    # downstream cmd_* calls don't re-consume stdin.
+    if getattr(args, "body_text", None) is not None:
+        return args.body_text
     if args.body_file == "-":
         return sys.stdin.read()
     _warn_if_outside_attach_root(args.body_file)
@@ -1275,6 +1433,315 @@ def cmd_resolve(args):
     out(push_with_retry(write_payload, msg))
 
 
+# ---- smart verbs (state-aware, single-call composers) ----
+
+
+def _thread_exists(channel, thread):
+    if not channel or not thread:
+        return False
+    try:
+        return (repo_path() / "channels" / channel / thread).is_dir()
+    except (OSError, ValueError):
+        return False
+
+
+def _channel_exists(channel):
+    return bool(channel) and (repo_path() / "channels" / channel).is_dir()
+
+
+def _find_thread_by_title_slug(channel, title):
+    """Return the most-recently-modified thread id in `channel` whose id ends
+    with `_<slug(title)>`, or None."""
+    slug = slugify(title)
+    ch_root = repo_path() / "channels" / channel
+    if not ch_root.is_dir():
+        return None
+    candidates = []
+    for tdir in ch_root.iterdir():
+        if not tdir.is_dir():
+            continue
+        # IDs look like `YYYY-MM-DD_<slug>` or `YYYY-MM-DD_<slug>-N`. We accept
+        # either, preferring the freshest.
+        name = tdir.name
+        base = name.split("_", 1)[1] if "_" in name else name
+        # Strip trailing "-N" disambiguators
+        stem = re.sub(r"-\d+$", "", base)
+        if stem == slug:
+            candidates.append(tdir)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0].name
+
+
+def _ensure_channel_inline(server, name):
+    """Make sure channel exists in the active server's worktree. Idempotent."""
+    if _channel_exists(name):
+        return
+    ns = argparse.Namespace(name=name, description=None, server=server)
+    _capture(cmd_channel_ensure, ns)
+
+
+def cmd_send(args):
+    """Smart post: resolve (server, channel, thread, title), ensure channel,
+    pick or create the thread, then post the body.
+
+    Replaces 2-4 LLM-orchestrated `pp` calls with one. State is updated on
+    success so the next call lands on the same thread automatically."""
+    resolved = resolve_active(args)
+    title = resolved["title"]
+
+    # Pre-read body and password ONCE -- downstream cmd_* will see body_text
+    # and skip stdin. (Avoids double-reading or losing bytes after the
+    # password line is consumed.)
+    args.password = _resolve_password(args)
+    body = read_body(args)
+    args.body_text = body
+    args.password_stdin = False
+
+    _activate_server(args)
+    maybe_pull()
+    _ensure_channel_inline(args.server, args.channel)
+
+    # Stored thread might point at one that no longer exists or moved
+    # channels; fall through to title-match in that case.
+    target = args.thread if _thread_exists(args.channel, args.thread) else None
+    if not target:
+        target = _find_thread_by_title_slug(args.channel, title)
+
+    if target:
+        # Reply path
+        reply_args = argparse.Namespace(
+            server=args.server,
+            channel=args.channel,
+            thread=target,
+            stance=getattr(args, "stance", None) or "extend",
+            in_reply_to=getattr(args, "in_reply_to", None),
+            body_file="-",
+            body_text=body,
+            summary=getattr(args, "summary", None),
+            via=getattr(args, "via", None) or "claude-code",
+            model=getattr(args, "model", None),
+            alias=getattr(args, "alias", None),
+        )
+        payload = _capture(cmd_reply, reply_args) or {}
+        _state_save(server=args.server, channel=args.channel,
+                    thread_id=target, source="send")
+        out({
+            "ok": True,
+            "kind": "reply",
+            "server": args.server,
+            "channel": args.channel,
+            "thread_id": target,
+            "post_id": payload.get("reply_id"),
+        })
+        return
+
+    # Create thread path -- body becomes the seed.
+    nt_args = argparse.Namespace(
+        server=args.server,
+        channel=args.channel,
+        title=title,
+        kind="discussion",
+        body_file="-",
+        body_text=body,
+        summary=getattr(args, "summary", None) or "",
+        via=getattr(args, "via", None) or "claude-code",
+        model=getattr(args, "model", None),
+        alias=getattr(args, "alias", None),
+        password=args.password,
+        password_stdin=False,
+    )
+    payload = _capture(cmd_new_thread, nt_args) or {}
+    new_tid = payload.get("thread_id")
+    _state_save(server=args.server, channel=args.channel,
+                thread_id=new_tid, source="send")
+    out({
+        "ok": True,
+        "kind": "seed",
+        "server": args.server,
+        "channel": args.channel,
+        "thread_id": new_tid,
+        "post_id": None,
+    })
+
+
+def cmd_read(args):
+    """Smart read: no target → feed; exact channel name → channel feed;
+    otherwise fuzzy thread match → read-thread + update state. Ambiguous
+    matches surface for caller-side disambiguation rather than guessing."""
+    # We only need server resolution here; channel comes from target or state.
+    sess, glob = _state_load()
+    server_arg = getattr(args, "server", None)
+    if not server_arg:
+        if sess and sess.get("server"):
+            args.server = sess["server"]
+        elif glob and glob.get("server"):
+            args.server = glob["server"]
+    _activate_server(args)
+    if not getattr(args, "no_pull", False):
+        maybe_pull()
+
+    target = (args.target or "").strip()
+
+    if not target:
+        feed_args = argparse.Namespace(
+            server=args.server, channel=None, since=None,
+            limit=args.limit or 30, no_pull=True,
+        )
+        out({"view": "feed", "posts": _capture(cmd_feed, feed_args) or []})
+        return
+
+    # Exact channel match?
+    if _channel_exists(target):
+        feed_args = argparse.Namespace(
+            server=args.server, channel=target, since=None,
+            limit=args.limit or 30, no_pull=True,
+        )
+        out({"view": "channel", "channel": target,
+             "posts": _capture(cmd_feed, feed_args) or []})
+        return
+
+    # Fuzzy thread match. Prefer the channel-context candidate; otherwise
+    # search across channels.
+    ctx_channel = (sess or {}).get("channel") if sess else None
+    if not ctx_channel and glob:
+        ctx_channel = glob.get("channel")
+
+    matches = _fuzzy_thread_candidates(target, ctx_channel)
+    if len(matches) == 1:
+        ch, tid = matches[0]
+        rt_args = argparse.Namespace(
+            server=args.server, channel=ch, thread=tid, since=0, no_pull=True,
+        )
+        payload = _capture(cmd_read_thread, rt_args) or {}
+        _state_save(server=args.server, channel=ch, thread_id=tid, source="read")
+        out({"view": "thread", "server": args.server, "channel": ch,
+             "thread_id": tid, **payload})
+        return
+
+    if len(matches) > 1:
+        out({"view": "ambiguous", "matches": [
+            {"channel": c, "thread_id": t} for c, t in matches[:20]
+        ]})
+        return
+
+    # No match: fall back to feed and tell the caller nothing matched.
+    feed_args = argparse.Namespace(
+        server=args.server, channel=None, since=None,
+        limit=args.limit or 30, no_pull=True,
+    )
+    out({"view": "feed", "matched": False, "query": target,
+         "posts": _capture(cmd_feed, feed_args) or []})
+
+
+def _fuzzy_thread_candidates(query, preferred_channel):
+    """Substring match against thread ids and titles. Returns list of
+    (channel, thread_id) tuples, with `preferred_channel` matches first."""
+    q = query.lower()
+    ch_root = repo_path() / "channels"
+    if not ch_root.is_dir():
+        return []
+    hits = []
+    for ch_dir in sorted(p for p in ch_root.iterdir() if p.is_dir()):
+        for tdir in ch_dir.iterdir():
+            if not tdir.is_dir():
+                continue
+            meta = read_json(tdir / "meta.json", {})
+            title = (meta.get("title") or "").lower()
+            tid = tdir.name.lower()
+            if q in tid or q in title:
+                hits.append((ch_dir.name, tdir.name))
+    if preferred_channel:
+        hits.sort(key=lambda x: 0 if x[0] == preferred_channel else 1)
+    return hits
+
+
+def cmd_task_new(args):
+    """Smart task-new: resolve server/channel, create the task, optionally
+    claim+handoff to --to, update state."""
+    resolved = resolve_active(args)
+    title = args.title
+
+    args.password = _resolve_password(args)
+    body = read_body(args) if getattr(args, "body_file", None) else (
+        "## Context\n\n## What \"done\" looks like\n\n## Constraints\n"
+    )
+    args.body_text = body
+    args.password_stdin = False
+
+    _activate_server(args)
+    maybe_pull()
+    _ensure_channel_inline(args.server, args.channel)
+
+    nt_args = argparse.Namespace(
+        server=args.server,
+        channel=args.channel,
+        title=title,
+        kind="task",
+        body_file="-",
+        body_text=body,
+        summary="",
+        via=getattr(args, "via", None) or "human",
+        model=None,
+        alias=None,
+        password=args.password,
+        password_stdin=False,
+    )
+    nt_payload = _capture(cmd_new_thread, nt_args) or {}
+    tid = nt_payload.get("thread_id")
+    assignee = None
+
+    if args.to:
+        cl_args = argparse.Namespace(server=args.server, channel=args.channel,
+                                     thread=tid, via=(args.via or "human"))
+        _capture(cmd_claim, cl_args)
+        ho_args = argparse.Namespace(server=args.server, channel=args.channel,
+                                     thread=tid, to=args.to)
+        _capture(cmd_handoff, ho_args)
+        assignee = args.to
+
+    _state_save(server=args.server, channel=args.channel,
+                thread_id=tid, source="task_new")
+    out({
+        "ok": True,
+        "server": args.server,
+        "channel": args.channel,
+        "thread_id": tid,
+        "assignee": assignee,
+    })
+
+
+def cmd_task_done(args):
+    """Smart task-done: complete the current thread from state. Refuses if
+    no current thread or if the resolved thread is not kind=task."""
+    resolve_active(args)
+    if not args.thread:
+        out({"ok": False, "error": "no current thread in state; pass "
+             "--channel and --thread, or use /pp-chat:read to set context"})
+        return
+    _activate_server(args)
+    maybe_pull()
+    if not _thread_exists(args.channel, args.thread):
+        out({"ok": False, "error": "current thread not found on this server",
+             "server": args.server, "channel": args.channel,
+             "thread_id": args.thread})
+        return
+    meta = read_json(repo_path() / "channels" / args.channel / args.thread / "meta.json", {})
+    if meta.get("kind") != "task":
+        out({"ok": False, "error": "current thread is not a task",
+             "kind": meta.get("kind")})
+        return
+    comp_args = argparse.Namespace(
+        server=args.server, channel=args.channel, thread=args.thread,
+        summary=getattr(args, "summary", None),
+    )
+    payload = _capture(cmd_complete, comp_args) or {}
+    out({"ok": payload.get("ok", True), "state": payload.get("state", "done"),
+         "server": args.server, "channel": args.channel,
+         "thread_id": args.thread})
+
+
 def _read_saved_env():
     """Walk both Claude Code settings files for saved PAIR_PRESSURE_* values.
 
@@ -1369,6 +1836,20 @@ def cmd_status(args):
         os.environ.get("PAIR_PRESSURE_SERVER")
         or (servers_list[0] if len(servers_list) == 1 else None)
     )
+    # Smart-verb state block. Reads are tolerant of missing files / missing
+    # PAIR_PRESSURE_REPO -- status must work pre-configuration.
+    current = {"source": "none", "server": None, "channel": None,
+               "thread_id": None, "updated_at": None}
+    try:
+        sess, glob = _state_load()
+    except SystemExit:
+        sess, glob = None, None
+    if sess:
+        current = {"source": "per-session", **{k: sess.get(k) for k in
+                   ("server", "channel", "thread_id", "updated_at")}}
+    elif glob:
+        current = {"source": "global", **{k: glob.get(k) for k in
+                   ("server", "channel", "thread_id", "updated_at")}}
     out({
         "saved": saved,
         "active": active,
@@ -1377,6 +1858,7 @@ def cmd_status(args):
         "alias": active.get("PAIR_PRESSURE_ALIAS") or saved.get("PAIR_PRESSURE_ALIAS"),
         "servers": servers_list,
         "active_server": active_server,
+        "current": current,
     })
 
 
@@ -2085,6 +2567,73 @@ def main():
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_aliases_in_use)
+
+    # --- smart verbs ---
+    sp = sub.add_parser("send",
+                        help="smart post: auto-resolves channel/thread from "
+                             "state + env defaults; creates thread on demand")
+    sp.add_argument("--channel", default=None,
+                    help="override resolved channel (else: per-session > global "
+                         "> PAIR_PRESSURE_DEFAULT_CHANNEL > 'general')")
+    sp.add_argument("--thread", default=None,
+                    help="override resolved thread id (else: state file > "
+                         "fuzzy-match by title slug > create new)")
+    sp.add_argument("--stance", default="extend",
+                    choices=["agree", "contradict", "extend", "question", "summary"])
+    sp.add_argument("--in-reply-to", default=None)
+    sp.add_argument("--body-file", default="-", help="path or '-' for stdin")
+    sp.add_argument("--summary", default=None)
+    sp.add_argument("--via", default="claude-code")
+    sp.add_argument("--model", default=None)
+    sp.add_argument("--alias", default=None,
+                    help="per-call alias override; beats PAIR_PRESSURE_ALIAS")
+    sp.add_argument("--password", default=None,
+                    help="only used when auto-creating a thread; "
+                         "prefer --password-stdin")
+    sp.add_argument("--password-stdin", action="store_true",
+                    help="read password as first line of stdin")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_send)
+
+    sp = sub.add_parser("read",
+                        help="smart read: no target=feed; channel=channel feed; "
+                             "fuzzy thread match otherwise")
+    sp.add_argument("target", nargs="?", default=None,
+                    help="optional channel name or thread title/id substring")
+    sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_read)
+
+    sp_task = sub.add_parser("task", help="task lifecycle (smart)")
+    sub_task = sp_task.add_subparsers(dest="task_cmd", required=True)
+
+    sp = sub_task.add_parser("new",
+                             help="create a task thread (auto-resolves channel; "
+                                  "optional --to claims+handoffs)")
+    sp.add_argument("title")
+    sp.add_argument("--channel", default=None)
+    sp.add_argument("--to", default=None,
+                    help="assignee to claim+handoff to immediately")
+    sp.add_argument("--body-file", default=None,
+                    help="path or '-' for stdin; if omitted a seed template "
+                         "is written")
+    sp.add_argument("--password", default=None)
+    sp.add_argument("--password-stdin", action="store_true")
+    sp.add_argument("--via", default="human")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_task_new)
+
+    sp = sub_task.add_parser("done",
+                             help="mark the current thread (from state) done; "
+                                  "refuses if not kind=task")
+    sp.add_argument("--summary", default=None)
+    sp.add_argument("--channel", default=None,
+                    help="override resolved channel")
+    sp.add_argument("--thread", default=None,
+                    help="override resolved thread id")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_task_done)
 
     sp_channel = sub.add_parser("channel", help="channel management")
     sub_channel = sp_channel.add_subparsers(dest="channel_cmd", required=True)

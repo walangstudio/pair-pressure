@@ -66,6 +66,10 @@ All output is JSON on stdout.
 
 | Verb | Purpose |
 |---|---|
+| `send "<body>" [--channel C] [--thread T] [--via human\|claude-code] [--stance ...]` | **Smart post.** Auto-resolves `(server, channel, thread)` from state/env, channel-ensures, picks an existing thread by default title or creates one. Updates state. One call replaces `channel ensure` + `list-threads` + `reply`/`new-thread`. |
+| `read [<target>] [--limit N]` | **Smart read.** No target → cross-thread feed. Channel name → channel feed. Anything else → fuzzy thread match (sets state on unique match). |
+| `task new "<title>" [--channel C] [--to U] [--body-file -]` | **Smart task creation.** Auto-resolves channel; auto-claims+handoffs when `--to` is set; updates state to the new thread. |
+| `task done [--summary "..."]` | Mark the current thread (from state) done. Refuses non-task threads with a structured error. |
 | `pull` | `git pull --rebase --autostash` on the chat repo. |
 | `push` | `git push` if local is ahead. (Most verbs auto-push.) |
 | `list-channels` | List channels with description, thread counts, last activity. |
@@ -82,7 +86,7 @@ All output is JSON on stdout.
 | `join --channel X --thread Y [--password-stdin]` | Record yourself as a thread member. For gated threads pipe the password via stdin (`printf '%s' "<P>" \| pp join ... --password-stdin`); `--password <P>` still works but is discouraged -- it shows up in process listings. Idempotent. |
 | `resolve --channel X --thread Y [--outcome "..."]` | Mark a discussion/investigation/decision thread resolved. For decisions, `--outcome accepted\|rejected\|superseded` sets the status; for other kinds it's appended as a free-text final summary post. Rejects task threads (use `complete`). |
 | `aliases-in-use [--since-minutes N]` | Report aliases active in the last N minutes (default 30). Used by `/pp-chat:alias` to detect collisions before claiming a name. |
-| `channel ensure --name <C> [--description "..."]` | Create channel `<C>` if missing; no-op if it exists. Used by the default-fallback path so `/pp-chat:send` can post to `general` even on a freshly-created server. |
+| `channel ensure --name <C> [--description "..."]` | Create channel `<C>` if missing; no-op if it exists. Called internally by `pp send`. |
 
 ### Thread `kind`
 
@@ -217,6 +221,31 @@ EOF
 - Reads `pull --rebase` automatically before scanning (skip with `--no-pull`).
 - Writes pull → write file → commit → push, with one rebase-retry on push reject.
 - Two simultaneous replies pick different ordinals after the rebase, so no data is lost.
+
+## Smart-verb state (v0.6+)
+
+The smart verbs (`pp send`, `pp read`, `pp task new`, `pp task done`)
+persist the "current thread" so subsequent calls don't need explicit
+`--server` / `--channel` / `--thread`.
+
+Two layers, last-writer-wins:
+
+- **Global** — `<chat-repo>/.pair-pressure/active.json`. Per-chat-repo;
+  shared across sessions on the machine.
+- **Per-session** — `~/.pair-pressure/sessions/<PAIR_PRESSURE_SESSION_ID>.json`.
+  Only used when the env var is set. Takes precedence over global.
+
+Resolution priority for every field:
+1. explicit `--server` / `--channel` / `--thread` flag,
+2. per-session state (if `PAIR_PRESSURE_SESSION_ID` set),
+3. global state,
+4. env vars (`PAIR_PRESSURE_SERVER`, `PAIR_PRESSURE_DEFAULT_CHANNEL`,
+   `PAIR_PRESSURE_DEFAULT_THREAD_TITLE`),
+5. sole-server fallback (server only) / `general` / `general-chat` defaults.
+
+`pp status` surfaces the resolved current thread under `current: {...}`.
+Set `PAIR_PRESSURE_SESSION_ID=<id>` per Claude session if you want two
+sessions on the same machine to track separate current threads.
 
 ## Slash commands (`/pp-chat:*`)
 

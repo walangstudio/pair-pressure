@@ -6,9 +6,11 @@ or:
     python3 tests/test_pp.py
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -490,6 +492,431 @@ class WorktreeRootTests(unittest.TestCase):
         wt_root = pp._worktree_root()
         self.assertEqual(wt_root.name, ".pp-worktrees")
         self.assertEqual(wt_root.parent, pp._main_repo_path())
+
+
+class StateFileTests(unittest.TestCase):
+    """Smart-verb state file: load/save, missing, malformed."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        repo = Path(self._td.name)
+        (repo / ".git").mkdir()
+        self._saved = {
+            "PAIR_PRESSURE_REPO": os.environ.get("PAIR_PRESSURE_REPO"),
+            "PAIR_PRESSURE_SESSION_ID": os.environ.get("PAIR_PRESSURE_SESSION_ID"),
+            "HOME": os.environ.get("HOME"),
+            "USERPROFILE": os.environ.get("USERPROFILE"),
+        }
+        os.environ["PAIR_PRESSURE_REPO"] = str(repo)
+        # Redirect HOME for per-session path tests
+        self._home = tempfile.TemporaryDirectory()
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        os.environ.pop("PAIR_PRESSURE_SESSION_ID", None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._td.cleanup()
+        self._home.cleanup()
+
+    def test_load_missing_returns_none_none(self):
+        sess, glob = pp._state_load()
+        self.assertIsNone(sess)
+        self.assertIsNone(glob)
+
+    def test_save_and_load_global(self):
+        pp._state_save(server="alpha", channel="general",
+                       thread_id="2026-05-13_foo", source="test")
+        sess, glob = pp._state_load()
+        self.assertIsNone(sess)
+        self.assertEqual(glob["server"], "alpha")
+        self.assertEqual(glob["channel"], "general")
+        self.assertEqual(glob["thread_id"], "2026-05-13_foo")
+        self.assertEqual(glob["schema_version"], pp.STATE_SCHEMA_VERSION)
+
+    def test_save_with_session_writes_both(self):
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "sess-1"
+        pp._state_save(server="alpha", channel="general",
+                       thread_id="t1", source="test")
+        sess, glob = pp._state_load()
+        self.assertEqual(sess["thread_id"], "t1")
+        self.assertEqual(glob["thread_id"], "t1")
+
+    def test_malformed_global_returns_none(self):
+        pp._state_path_global().parent.mkdir(parents=True, exist_ok=True)
+        pp._state_path_global().write_text("{not json", encoding="utf-8")
+        _, glob = pp._state_load()
+        self.assertIsNone(glob)
+
+    def test_session_id_sanitized(self):
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "../../etc/passwd"
+        p = pp._state_path_session()
+        # Must stay under ~/.pair-pressure/sessions
+        sessions_root = (Path.home() / ".pair-pressure" / "sessions").resolve()
+        self.assertEqual(p.resolve().parent, sessions_root)
+
+
+class ResolveActiveTests(unittest.TestCase):
+    """resolve_active precedence: arg > session > global > env > sole."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        repo = Path(self._td.name)
+        (repo / ".git").mkdir()
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_SERVER",
+                        "PAIR_PRESSURE_DEFAULT_CHANNEL",
+                        "PAIR_PRESSURE_DEFAULT_THREAD_TITLE",
+                        "PAIR_PRESSURE_SESSION_ID",
+                        "HOME", "USERPROFILE")}
+        os.environ["PAIR_PRESSURE_REPO"] = str(repo)
+        self._home = tempfile.TemporaryDirectory()
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        for k in ("PAIR_PRESSURE_SERVER", "PAIR_PRESSURE_DEFAULT_CHANNEL",
+                  "PAIR_PRESSURE_DEFAULT_THREAD_TITLE",
+                  "PAIR_PRESSURE_SESSION_ID"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._td.cleanup()
+        self._home.cleanup()
+
+    def _ns(self, **kw):
+        ns = unittest.mock.MagicMock()  # accepts any getattr
+        ns.server = kw.get("server")
+        ns.channel = kw.get("channel")
+        ns.thread = kw.get("thread")
+        return ns
+
+    def _ns_simple(self, **kw):
+        import argparse
+        return argparse.Namespace(server=kw.get("server"),
+                                  channel=kw.get("channel"),
+                                  thread=kw.get("thread"))
+
+    def test_arg_beats_state(self):
+        pp._state_save(server="from-state", channel="ch-state", thread_id="t-state")
+        ns = self._ns_simple(server="from-arg")
+        r = pp.resolve_active(ns)
+        self.assertEqual(r["server"], "from-arg")
+        self.assertEqual(r["sources"]["server"], "arg")
+
+    def test_session_beats_global(self):
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "s1"
+        # Write global, then overwrite with different per-session values.
+        pp._state_save(server="g-server", channel="g-ch", thread_id="g-t")
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "s2"
+        pp._state_save(server="ses-server", channel="ses-ch", thread_id="ses-t")
+        r = pp.resolve_active(self._ns_simple())
+        self.assertEqual(r["server"], "ses-server")
+        self.assertEqual(r["sources"]["server"], "session")
+        self.assertEqual(r["channel"], "ses-ch")
+        self.assertEqual(r["thread"], "ses-t")
+
+    def test_global_used_when_no_session(self):
+        # No session ID set; only global state file exists.
+        os.environ.pop("PAIR_PRESSURE_SESSION_ID", None)
+        pp._state_save(server="g-server", channel="g-ch", thread_id="g-t")
+        r = pp.resolve_active(self._ns_simple())
+        self.assertEqual(r["sources"]["server"], "global")
+        self.assertEqual(r["server"], "g-server")
+
+    def test_env_used_when_no_state(self):
+        os.environ["PAIR_PRESSURE_SERVER"] = "env-server"
+        # Stub registry to avoid sole-server fallback short-circuit.
+        from unittest import mock
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": [{"name": "a"}, {"name": "b"}]}):
+            r = pp.resolve_active(self._ns_simple())
+        self.assertEqual(r["server"], "env-server")
+        self.assertEqual(r["sources"]["server"], "env")
+
+    def test_sole_server_fallback(self):
+        from unittest import mock
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": [{"name": "only"}]}):
+            r = pp.resolve_active(self._ns_simple())
+        self.assertEqual(r["server"], "only")
+        self.assertEqual(r["sources"]["server"], "sole-server")
+
+    def test_no_server_dies(self):
+        from unittest import mock
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": []}):
+            with self.assertRaises(SystemExit):
+                pp.resolve_active(self._ns_simple())
+
+    def test_default_channel_falls_through_to_env_then_general(self):
+        os.environ["PAIR_PRESSURE_SERVER"] = "x"
+        from unittest import mock
+        with mock.patch.object(pp, "_registry_load",
+                               return_value={"servers": [{"name": "x"}]}):
+            r = pp.resolve_active(self._ns_simple())
+            self.assertEqual(r["channel"], "general")
+            self.assertEqual(r["sources"]["channel"], "default")
+            os.environ["PAIR_PRESSURE_DEFAULT_CHANNEL"] = "team"
+            r2 = pp.resolve_active(self._ns_simple())
+            self.assertEqual(r2["channel"], "team")
+
+
+class TitleSlugMatchTests(unittest.TestCase):
+    """_find_thread_by_title_slug picks the freshest thread whose id ends in
+    the slug."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.repo = Path(self._td.name)
+        self.ch = self.repo / "channels" / "general"
+        self.ch.mkdir(parents=True)
+        pp._CURRENT_REPO = self.repo
+
+    def tearDown(self):
+        pp._CURRENT_REPO = None
+        self._td.cleanup()
+
+    def _mk_thread(self, name, mtime=None):
+        d = self.ch / name
+        d.mkdir()
+        (d / "meta.json").write_text("{}")
+        if mtime is not None:
+            os.utime(d, (mtime, mtime))
+        return d
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(pp._find_thread_by_title_slug("general", "absent"))
+
+    def test_exact_slug_match(self):
+        self._mk_thread("2026-05-12_oauth-refresh-token")
+        self.assertEqual(
+            pp._find_thread_by_title_slug("general", "OAuth refresh-token"),
+            "2026-05-12_oauth-refresh-token",
+        )
+
+    def test_disambiguated_suffix_match(self):
+        self._mk_thread("2026-05-12_general-chat", mtime=1000)
+        self._mk_thread("2026-05-13_general-chat-2", mtime=2000)
+        self.assertEqual(
+            pp._find_thread_by_title_slug("general", "general-chat"),
+            "2026-05-13_general-chat-2",
+        )
+
+    def test_no_slug_collision(self):
+        # `general-chats` should NOT match `general-chat`.
+        self._mk_thread("2026-05-12_general-chats")
+        self.assertIsNone(pp._find_thread_by_title_slug("general", "general-chat"))
+
+
+class CaptureMechanismTests(unittest.TestCase):
+    """_capture intercepts out() payloads from nested cmd_* calls."""
+
+    def test_captures_single_payload(self):
+        def fake_cmd(args):
+            pp.out({"hello": "world"})
+        result = pp._capture(fake_cmd, None)
+        self.assertEqual(result, {"hello": "world"})
+
+    def test_captures_last_payload(self):
+        def fake_cmd(args):
+            pp.out({"first": 1})
+            pp.out({"last": 2})
+        self.assertEqual(pp._capture(fake_cmd, None), {"last": 2})
+
+    def test_does_not_leak_capture_state(self):
+        # After _capture returns, out() must go to stdout again.
+        pp._capture(lambda a: pp.out({"x": 1}), None)
+        self.assertIsNone(pp._OUT_CAPTURE)
+
+
+class SmartVerbsE2ETests(unittest.TestCase):
+    """End-to-end against real git: pp send seeds then replies on the same
+    thread; state file is updated after each call; pp status surfaces the
+    current thread."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git not on PATH")
+
+    def setUp(self):
+        import subprocess as _sp
+        self._td = tempfile.TemporaryDirectory()
+        self.repo = Path(self._td.name) / "chat"
+        self.repo.mkdir(parents=True)
+        self._home = tempfile.TemporaryDirectory()
+
+        # Init a git repo on `main` branch.
+        _sp.run(["git", "init", "-b", "main", str(self.repo)],
+                check=True, capture_output=True)
+        _sp.run(["git", "-C", str(self.repo), "config", "user.email", "t@t.t"],
+                check=True, capture_output=True)
+        _sp.run(["git", "-C", str(self.repo), "config", "user.name", "t"],
+                check=True, capture_output=True)
+        # Seed registry on main with one server.
+        (self.repo / ".pair-pressure").mkdir()
+        (self.repo / ".pair-pressure" / "servers.json").write_text(
+            '{"schema_version": 2, "servers": [{"name": "main", '
+            '"description": "", "channels": ["general"]}]}\n'
+        )
+        _sp.run(["git", "-C", str(self.repo), "add", "-A"],
+                check=True, capture_output=True)
+        _sp.run(["git", "-C", str(self.repo), "commit", "-m", "init"],
+                check=True, capture_output=True)
+        # Create a worktree on a server/main branch so pp can find it.
+        wt = self.repo / ".pp-worktrees" / "main"
+        _sp.run(["git", "-C", str(self.repo), "worktree", "add",
+                 "-b", "server/main", str(wt), "main"],
+                check=True, capture_output=True)
+        # Strip the registry from the server worktree (pp invariant).
+        for f in (wt / ".pair-pressure").iterdir():
+            f.unlink()
+        (wt / ".pair-pressure").rmdir()
+        _sp.run(["git", "-C", str(wt), "add", "-A"], check=True, capture_output=True)
+        _sp.run(["git", "-C", str(wt), "commit", "-m", "strip registry"],
+                check=True, capture_output=True)
+
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR",
+                        "PAIR_PRESSURE_SERVER", "PAIR_PRESSURE_SESSION_ID",
+                        "PAIR_PRESSURE_ALIAS", "PAIR_PRESSURE_DEFAULT_CHANNEL",
+                        "PAIR_PRESSURE_DEFAULT_THREAD_TITLE",
+                        "HOME", "USERPROFILE")}
+        os.environ["PAIR_PRESSURE_REPO"] = str(self.repo)
+        os.environ["PAIR_PRESSURE_AUTHOR"] = "alice"
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        for k in ("PAIR_PRESSURE_SERVER", "PAIR_PRESSURE_SESSION_ID",
+                  "PAIR_PRESSURE_ALIAS", "PAIR_PRESSURE_DEFAULT_CHANNEL",
+                  "PAIR_PRESSURE_DEFAULT_THREAD_TITLE"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        pp._CURRENT_REPO = None
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._td.cleanup()
+        self._home.cleanup()
+
+    def _send(self, body, **flags):
+        import argparse
+        ns = argparse.Namespace(
+            server=flags.get("server"),
+            channel=flags.get("channel"),
+            thread=flags.get("thread"),
+            stance=flags.get("stance", "extend"),
+            in_reply_to=None,
+            body_file="-",
+            body_text=body,
+            summary=None,
+            via=flags.get("via", "human"),
+            model=None,
+            alias=None,
+            password=None,
+            password_stdin=False,
+        )
+        return pp._capture(pp.cmd_send, ns)
+
+    def test_first_send_creates_thread(self):
+        result = self._send("hello team")
+        self.assertEqual(result["kind"], "seed")
+        self.assertEqual(result["channel"], "general")
+        self.assertTrue(result["thread_id"].endswith("_general-chat"))
+        # State got written.
+        _, glob = pp._state_load()
+        self.assertEqual(glob["thread_id"], result["thread_id"])
+        self.assertEqual(glob["source"], "send")
+
+    def test_second_send_replies_on_same_thread(self):
+        r1 = self._send("first")
+        pp._CURRENT_REPO = None  # simulate fresh process
+        r2 = self._send("second")
+        self.assertEqual(r2["kind"], "reply")
+        self.assertEqual(r2["thread_id"], r1["thread_id"])
+        self.assertIsNotNone(r2["post_id"])
+
+    def test_explicit_channel_creates_in_that_channel(self):
+        result = self._send("on-deploys", channel="deploys")
+        self.assertEqual(result["channel"], "deploys")
+        # Channel was auto-ensured.
+        self.assertTrue((self.repo / ".pp-worktrees" / "main"
+                         / "channels" / "deploys").is_dir())
+
+    def test_stored_thread_in_wrong_channel_falls_through_to_title_match(self):
+        # First send into channel A; then switch channel to B explicitly.
+        # The stored thread_id from the first send lives in A; pp send into B
+        # must NOT try to reply on a thread that doesn't exist in B.
+        r1 = self._send("init", channel="alpha")
+        pp._CURRENT_REPO = None
+        r2 = self._send("hello", channel="beta")
+        self.assertEqual(r2["kind"], "seed")
+        self.assertEqual(r2["channel"], "beta")
+        # Same date+slug yields the same id string, but the new thread lives
+        # in a different channel -- distinct on-disk paths.
+        wt = self.repo / ".pp-worktrees" / "main"
+        self.assertTrue((wt / "channels" / "alpha" / r1["thread_id"]).is_dir())
+        self.assertTrue((wt / "channels" / "beta" / r2["thread_id"]).is_dir())
+        self.assertNotEqual(r1["channel"], r2["channel"])
+
+
+class StatusCurrentBlockTests(unittest.TestCase):
+    """cmd_status emits a `current` block reflecting per-session > global > none."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        repo = Path(self._td.name)
+        (repo / ".git").mkdir()
+        self._home = tempfile.TemporaryDirectory()
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_SESSION_ID",
+                        "HOME", "USERPROFILE")}
+        os.environ["PAIR_PRESSURE_REPO"] = str(repo)
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        os.environ.pop("PAIR_PRESSURE_SESSION_ID", None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._td.cleanup()
+        self._home.cleanup()
+
+    def test_no_state_returns_source_none(self):
+        import argparse
+        payload = pp._capture(pp.cmd_status, argparse.Namespace())
+        self.assertEqual(payload["current"]["source"], "none")
+        self.assertIsNone(payload["current"]["thread_id"])
+
+    def test_global_state_surfaces(self):
+        import argparse
+        pp._state_save(server="alpha", channel="general",
+                       thread_id="2026-05-13_x", source="send")
+        payload = pp._capture(pp.cmd_status, argparse.Namespace())
+        self.assertEqual(payload["current"]["source"], "global")
+        self.assertEqual(payload["current"]["thread_id"], "2026-05-13_x")
+
+    def test_per_session_overrides_global(self):
+        import argparse
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "sid"
+        pp._state_save(server="alpha", channel="general",
+                       thread_id="sess-thread", source="send")
+        payload = pp._capture(pp.cmd_status, argparse.Namespace())
+        self.assertEqual(payload["current"]["source"], "per-session")
+        self.assertEqual(payload["current"]["thread_id"], "sess-thread")
 
 
 if __name__ == "__main__":

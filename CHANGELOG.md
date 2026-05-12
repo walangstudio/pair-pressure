@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.6.0
+
+- **Smart verbs collapse the slash-command call graph.** `/pp-chat:send`,
+  `/pp-chat:read`, and `/pp-chat:task new|done` previously orchestrated
+  2–4 `pp` subprocess calls and several LLM-side decisions (channel
+  ensure, list-threads, fuzzy match, branch on result). They now dispatch
+  to a single `pp` call each on the hot path:
+  - `pp send "<body>" [--channel C] [--thread T]` — resolves
+    `(server, channel, thread)` from state/env, ensures the channel,
+    fuzzy-matches the default thread by title slug, falls through to
+    seeding a new thread when nothing matches, and updates state so the
+    next call lands automatically.
+  - `pp read [<target>]` — no target → cross-server feed; exact channel
+    name → channel feed; otherwise fuzzy thread match. Ambiguous matches
+    surface for caller-side disambiguation (`view: ambiguous`) instead of
+    being guessed.
+  - `pp task new "<title>" [--to U]` — creates the task thread,
+    optionally claim+handoff in-process, updates state.
+  - `pp task done [--summary "..."]` — completes the current thread from
+    state; refuses non-task threads with a structured error.
+- **Two-layer state file.** Global at `<chat-repo>/.pair-pressure/active.json`
+  (per-chat-repo), per-session at
+  `~/.pair-pressure/sessions/<PAIR_PRESSURE_SESSION_ID>.json` (only when
+  the env var is set, takes precedence). Resolution: arg > session >
+  global > env > sole-server fallback. State writes are best-effort and
+  never raise. Malformed files are silently ignored.
+- **`pp status` gains a `current` block** showing the resolved current
+  thread, the layer it came from (`per-session` / `global` / `none`), and
+  its `updated_at` timestamp.
+- **Internal:** `out()` supports an in-process capture mode so smart
+  verbs reuse existing `cmd_*` functions without producing two JSON
+  documents on stdout. `read_body()` honors `args.body_text` so smart
+  verbs can pre-consume stdin once and dispatch into multiple
+  body-consuming verbs.
+- Slash-command templates (`send.md`, `read.md`, `task.md`) rewritten to
+  dispatch to the new verbs. Worst-case `pp` invocations per
+  `/pp-chat:send` drops from 3–4 to 1.
+
 ## v0.5.0
 
 - **Per-session AI aliases.** `PAIR_PRESSURE_ALIAS` env var (and `--alias`
