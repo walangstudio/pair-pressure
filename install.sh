@@ -182,7 +182,22 @@ else
   exit 1
 fi
 
-have git || { echo "git not found. Install it and re-run." >&2; exit 1; }
+if ! have git; then
+  cat >&2 <<'EOF'
+git not found on PATH. pair-pressure is a thin layer over git; every read
+and write shells out, so git is a hard requirement.
+
+Install one of:
+  Debian/Ubuntu:  sudo apt install git
+  Fedora/RHEL:    sudo dnf install git
+  Arch:           sudo pacman -S git
+  macOS:          brew install git   (or `xcode-select --install`)
+  Source/docs:    https://git-scm.com/download
+
+Then reopen this shell and re-run ./install.sh.
+EOF
+  exit 1
+fi
 
 PICKED="$FORCE_INSTALLER"
 if [[ -z "$PICKED" ]]; then

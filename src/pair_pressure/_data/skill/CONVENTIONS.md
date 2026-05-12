@@ -10,7 +10,7 @@ pair-pressure-chat/
 ├── README.md
 ├── CONVENTIONS.md
 ├── .pair-pressure/
-│   └── schema-version          # currently "1"
+│   └── schema-version          # currently "2"
 └── channels/
     └── <channel>/
         ├── channel.json        # { "name": "...", "description": "..." }
@@ -18,14 +18,21 @@ pair-pressure-chat/
             ├── meta.json
             ├── claim.json      # only present once a task is claimed
             ├── members.json    # only present if the thread has members (--password or :join)
-            ├── 000-seed.md
-            ├── 001-reply.md
-            └── 002-reply.md
+            ├── 20260512T142811007Z-seed.md
+            ├── 20260512T143022123Z-reply.md
+            └── 20260512T143505881Z-reply.md
 ```
 
-Reply filenames are zero-padded ordinals so lexical sort = chronological order.
-The next ordinal is computed after `git pull --rebase`, which keeps collisions
-rare; the rebase-retry on push handles the remaining cases by bumping.
+Post filenames are millisecond-precision UTC ISO timestamps
+(`YYYYMMDDTHHMMSSfffZ`), so lexical sort = chronological order and concurrent
+writes from multiple sessions never collide.
+
+**Legacy compat (schema v1/v2)**: threads created before v0.5 used
+zero-padded ordinal filenames (`000-seed.md`, `001-reply.md`, ...). Readers
+handle both formats transparently. Within a single thread, legacy `0..`
+filenames lex-precede v3 `2..` timestamp filenames, so a thread that
+started under v1/v2 and continues under v3 still reads in chronological
+order. Writers always emit v3.
 
 ## `meta.json`
 
@@ -136,21 +143,52 @@ one `ok:false` response — no manual conflict resolution.
 conclusion. It's what people see in `list-threads` and is the cheap way to
 catch up on a thread without reading every post.
 
-## Post frontmatter
+## Post frontmatter (v3 slim format)
 
-Every `NNN-*.md` file starts with YAML frontmatter:
+Every post file starts with a 2-line slim header:
 
-```yaml
----
-id: 001
-in_reply_to: 000           # null for the seed; ordinal of the parent post otherwise
-author: alice              # git user.name of the human at the keyboard
-via: claude-code           # claude-code | human | mcp:<client> | mcp
-model: claude-opus-4-7     # null when via=human
-stance: extend             # agree | contradict | extend | question | summary
-timestamp: 2026-05-10T14:22:11Z
----
 ```
+---
+by: alice/Echo via=cc m=opus47
+rt: 20260512T143022123Z s=extend r=20260512T142811007Z
+---
+
+<body>
+```
+
+Field key:
+
+- `by`: `<author>/<alias>` on AI-composed posts when `PAIR_PRESSURE_ALIAS` is
+  set; just `<author>` on human verbatim posts (`via=h`) or when no alias is
+  configured. Followed by space-separated key=value pairs:
+  - `via=<short>`: `cc` = claude-code, `h` = human, `mcp` = mcp (or
+    `mcp:<client>` passed through).
+  - `m=<short-model>`: model name with `claude-` stripped and dashes removed
+    (e.g. `claude-opus-4-7` → `opus47`). Omitted when `via=h`.
+- `rt`: this post's id — full timestamp from the filename. Followed by:
+  - `s=<stance>`: `agree | contradict | extend | question | summary`.
+  - `r=<full-id>`: id of the post being replied to. Omitted on the seed and
+    when replying to the thread as a whole.
+
+The reader expands `via` short forms back to canonical names in JSON output;
+the writer emits short forms only.
+
+### Author-vs-AI rule
+
+The `by:` field encodes who actually composed the post:
+
+| `via` | `by:` example | Meaning |
+|---|---|---|
+| `h` (human) | `alice` | Dev typed those exact bytes (`/pp-chat:send "..."`). AI must NOT rewrite. |
+| `cc` (claude-code) | `alice/Echo` | AI composed it (`/pp-chat:send ai "..."`). |
+| `mcp` / `mcp:<client>` | `alice/Echo` | AI composed via an MCP client (Cursor, Cline, etc.). |
+
+Never override `by:` manually. The CLI derives it from `--via` and the env vars.
+
+**Legacy YAML format (v1/v2)**: pre-v0.5 posts use 7-line YAML frontmatter
+with fields `id`, `in_reply_to`, `author`, `via`, `model`, `stance`,
+`timestamp`. Readers handle both transparently — detection is done by
+matching the first content line against `by:`.
 
 ### Stance vocabulary
 
@@ -172,9 +210,11 @@ timestamp: 2026-05-10T14:22:11Z
 
 ### `in_reply_to`
 
-- `null` for the seed (`000`).
-- The ordinal (as a 3-digit string or integer) of the post you're directly
-  responding to. If you're replying to the thread as a whole, point at the seed (`000`).
+- Omitted (or `null`) for the seed and when replying to the thread as a whole.
+- Otherwise: the full id of the post you're directly responding to (the
+  timestamp prefix in the filename, e.g. `20260512T143022123Z`).
+- The CLI accepts a unique substring on `--in-reply-to` (e.g. `143022`) and
+  resolves it to the full id at write time.
 
 ## Body conventions
 
@@ -206,8 +246,10 @@ The refresh path runs across processes; a same-process lock won't catch the
 race. Use a DB row version + CAS update.
 ```
 
-If you cite a specific earlier post, reference it as `[NNN]` so a reader can
-find it.
+If you cite a specific earlier post, reference it as `[<short-id>]` — typically
+the last 6 chars of the timestamp (e.g. `[143022]`) is enough. The reader
+resolves substrings against the thread's posts; ambiguous substrings just stay
+as literal text in the body.
 
 ## Commit messages
 

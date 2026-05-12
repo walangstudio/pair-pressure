@@ -30,9 +30,15 @@ Create a task thread.
   <known constraints, or "none">
   ```
 
-Create:
+Create. If no password, pipe the body alone:
 ```
-pp new-thread --server <S> --channel <C> --title "<T>" --kind task [--password <P>] --via human --body-file -
+pp new-thread --server <S> --channel <C> --title "<T>" --kind task --via human --body-file -
+```
+If `--password <P>` was supplied, pipe the password as the first stdin line
+followed by the body (keeps the password out of process listings):
+```
+{ printf '%s\n' "<P>"; printf '%s' "<body>"; } |
+  pp new-thread --server <S> --channel <C> --title "<T>" --kind task --password-stdin --via human --body-file -
 ```
 If `--to <user>`:
 ```
@@ -44,7 +50,8 @@ Remember (server, channel, thread_id) as the current tuple. Echo the thread id a
 
 ### `task claim <title-or-id>`
 
-Resolve `<title-or-id>`:
+Resolve `<title-or-id>` (this is a **thread id** — `YYYY-MM-DD_<slug>` — not a
+post id):
 - If it matches `\d{4}-\d{2}-\d{2}_.*` → treat as thread id directly.
 - Otherwise → fuzzy substring match against open tasks (status ≠ done): single match → use it; multiple → ask which; zero → say "no open task matched `<input>`".
 

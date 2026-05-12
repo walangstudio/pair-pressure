@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -21,14 +22,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SERVER_BRANCH_PREFIX = "server/"
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "2"  # servers.json registry schema; matches pp-init.py
+
+_VIA_SHORT = {"claude-code": "cc", "human": "h", "mcp": "mcp"}
+_VIA_LONG = {v: k for k, v in _VIA_SHORT.items()}
 
 # Set by _activate_server() so that all downstream code (repo_path(), git()
 # default cwd, file paths) automatically scopes to the active worktree.
 # None means "registry / main checkout", used by server-management verbs.
 _CURRENT_REPO: "Path | None" = None
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 
 def die(msg, code=2):
@@ -172,12 +176,86 @@ def author():
     return env("PAIR_PRESSURE_AUTHOR")
 
 
+def alias():
+    a = os.environ.get("PAIR_PRESSURE_ALIAS")
+    return a.strip() if a and a.strip() else None
+
+
+def effective_alias(args=None):
+    """Resolve the alias for THIS call.
+
+    Priority: explicit --alias flag (per-session/per-call override) > env var.
+    Two Claude sessions on the same machine can each pass --alias to
+    distinguish themselves even though they share PAIR_PRESSURE_ALIAS.
+    """
+    flag = getattr(args, "alias", None) if args is not None else None
+    if flag and flag.strip():
+        return flag.strip()
+    return alias()
+
+
+def by_token():
+    """Default `<author>` or `<author>/<alias>` token. Use `by_for_via` when
+    you have the `via` context — that's the rule that hides alias on human posts."""
+    a = alias()
+    return f"{author()}/{a}" if a else author()
+
+
+def by_for_via(via, args=None):
+    """The `by:` value to write into a post, honoring via and the per-call alias.
+
+    Rule: human-typed posts (via=human) carry only the author identity, never
+    the AI alias. AI-composed posts (via=claude-code / mcp) carry
+    `<author>/<alias>` when an alias is configured. The alias resolves via
+    `effective_alias(args)`, so `--alias <name>` on the command line beats
+    `PAIR_PRESSURE_ALIAS` from env — that's the per-session override.
+    """
+    if via == "human":
+        return author()
+    a = effective_alias(args)
+    return f"{author()}/{a}" if a else author()
+
+
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def post_id():
+    n = datetime.now(timezone.utc)
+    return n.strftime("%Y%m%dT%H%M%S") + f"{n.microsecond // 1000:03d}Z"
+
+
+def _id_to_iso(pid):
+    """`YYYYMMDDTHHMMSSfffZ` (19 chars) -> `YYYY-MM-DDTHH:MM:SS.fffZ`. None if the
+    input doesn't match the v3 timestamp shape (e.g. legacy `001` ordinals)."""
+    if isinstance(pid, str) and len(pid) == 19 and pid.endswith("Z") and pid[8:9] == "T":
+        return f"{pid[0:4]}-{pid[4:6]}-{pid[6:8]}T{pid[9:11]}:{pid[11:13]}:{pid[13:15]}.{pid[15:18]}Z"
+    return None
+
+
+def _short_model(m):
+    if not m:
+        return None
+    s = m
+    if s.startswith("claude-"):
+        s = s[len("claude-"):]
+    return s.replace("-", "")
+
+
+def _short_via(v):
+    if not v:
+        return "cc"
+    return _VIA_SHORT.get(v, v)
+
+
+def _long_via(v):
+    if not v:
+        return "claude-code"
+    return _VIA_LONG.get(v, v)
 
 
 def slugify(s):
@@ -243,6 +321,94 @@ def dump_fm(meta, body):
             lines.append(f"{k}: {s}")
     lines.append("---")
     return "\n".join(lines) + "\n" + body
+
+
+def parse_slim(text):
+    """Parse the v3 slim post header. Returns (fm_dict, body) or (None, None).
+
+    Layout:
+        ---
+        by: alice/Echo via=cc m=opus47
+        rt: 20260512T143022123Z s=extend r=20260512T142811007Z
+        ---
+        <body>
+    """
+    m = _FM_RE.match(text)
+    if not m:
+        return None, None
+    lines = m.group(1).splitlines()
+    if len(lines) < 2:
+        return None, None
+    by_line, rt_line = lines[0].strip(), lines[1].strip()
+    if not by_line.startswith("by:") or not rt_line.startswith("rt:"):
+        return None, None
+
+    by_parts = by_line[3:].strip().split()
+    if not by_parts:
+        return None, None
+    by_value = by_parts[0]
+    if "/" in by_value:
+        author_, _, alias_ = by_value.partition("/")
+    else:
+        author_, alias_ = by_value, None
+    via, model = "claude-code", None
+    for kv in by_parts[1:]:
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        if k == "via":
+            via = _long_via(v)
+        elif k == "m":
+            model = v
+
+    rt_parts = rt_line[3:].strip().split()
+    if not rt_parts:
+        return None, None
+    pid = rt_parts[0]
+    stance, irt = "extend", None
+    for kv in rt_parts[1:]:
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        if k == "s":
+            stance = v
+        elif k == "r":
+            irt = v
+
+    return {
+        "id": pid,
+        "in_reply_to": irt,
+        "author": author_,
+        "alias": alias_,
+        "via": via,
+        "model": model,
+        "stance": stance,
+        "timestamp": _id_to_iso(pid) or pid,
+    }, m.group(2)
+
+
+def parse_post(text):
+    """Parse either v3 slim format or v1/v2 legacy YAML. Always returns a dict
+    with keys: id, in_reply_to, author, alias, via, model, stance, timestamp."""
+    fm, body = parse_slim(text)
+    if fm is not None:
+        return fm, body
+    fm, body = parse_fm(text)
+    fm.setdefault("alias", None)
+    return fm, body
+
+
+def dump_slim(by, via, model, pid, stance, in_reply_to, body):
+    by_line = f"by: {by} via={_short_via(via)}"
+    sm = _short_model(model)
+    if sm and via != "human":
+        by_line += f" m={sm}"
+    rt_line = f"rt: {pid} s={stance}"
+    if in_reply_to:
+        rt_line += f" r={in_reply_to}"
+    if not body.endswith("\n"):
+        body = body + "\n"
+    return f"---\n{by_line}\n{rt_line}\n---\n\n{body}"
 
 
 def out(obj):
@@ -380,12 +546,40 @@ def thread_dir(channel, thread):
     return p
 
 
+def _stem_id(path):
+    """Post id from filename: '001' for legacy, '20260512T143022123Z' for v3."""
+    return path.name.split("-", 1)[0]
+
+
 def _ord(path):
-    return int(path.name[:3])
+    """Numeric prefix of a legacy `NNN-*.md` post filename, as int."""
+    return int(path.name.split("-", 1)[0])
 
 
 def _post_files(tdir):
-    return sorted(tdir.glob("[0-9][0-9][0-9]-*.md"), key=_ord)
+    """All post files sorted lexically by stem.
+
+    Legacy `NNN-*.md` (start with `0`-`9`) lex-precedes v3
+    `<timestampZ>-*.md` (start with `2`), so mixed-format threads sort
+    in chronological order by construction.
+    """
+    legacy = list(tdir.glob("[0-9][0-9][0-9]-*.md"))
+    v3 = list(tdir.glob("[12][0-9][0-9][0-9][01][0-9][0-3][0-9]T*.md"))
+    return sorted(legacy + v3, key=lambda p: p.name)
+
+
+def resolve_short_ref(tdir, short):
+    """Resolve a short body-citation like `143022` to a full post id within
+    a thread. Returns the unique full id, or None on no/ambiguous match."""
+    s = str(short)
+    hits = []
+    for p in _post_files(tdir):
+        sid = _stem_id(p)
+        if sid == s or s in sid:
+            hits.append(sid)
+    if len(hits) == 1:
+        return hits[0]
+    return None
 
 
 def cmd_list_threads(args):
@@ -399,8 +593,10 @@ def cmd_list_threads(args):
         posts = _post_files(t)
         last_author = ""
         if posts:
-            fm, _ = parse_fm(posts[-1].read_text())
-            last_author = fm.get("author", "") or ""
+            fm, _ = parse_post(posts[-1].read_text())
+            au = fm.get("author", "") or ""
+            al = fm.get("alias")
+            last_author = f"{au}/{al}" if al else au
         threads.append({
             "id": meta.get("id", t.name),
             "title": meta.get("title", t.name),
@@ -426,29 +622,103 @@ def cmd_read_thread(args):
     meta = read_json(t / "meta.json", {})
     posts = []
     for p in _post_files(t):
-        ord_ = _ord(p)
-        if args.since and ord_ < args.since:
-            continue
-        fm, body = parse_fm(p.read_text())
+        sid = _stem_id(p)
+        if args.since:
+            try:
+                if sid.isdigit() and int(sid) < args.since:
+                    continue
+            except ValueError:
+                pass
+        fm, body = parse_post(p.read_text())
         posts.append({
-            "id": fm.get("id", f"{ord_:03d}"),
-            "ordinal": ord_,
+            "id": fm.get("id", sid),
             "filename": p.name,
             "in_reply_to": fm.get("in_reply_to"),
             "author": fm.get("author"),
+            "alias": fm.get("alias"),
             "via": fm.get("via"),
             "model": fm.get("model"),
             "stance": fm.get("stance"),
             "timestamp": fm.get("timestamp"),
             "body": body.strip(),
         })
-    out({"meta": meta, "posts": posts})
+    payload = {"meta": meta, "posts": posts}
+    # Advisory: thread carries a password_hash but reads aren't actually
+    # gated by it -- the repo clone is the only confidentiality boundary.
+    # Surface this so consumers (UIs, agents) can warn the caller.
+    if meta.get("password_hash"):
+        members = read_json(t / "members.json", {"members": []}).get("members", [])
+        is_member = any(m.get("author") == author() for m in members)
+        payload["gated"] = {
+            "scheme": "join-only",
+            "is_member": is_member,
+            "note": "password gates `join`, not read. Repo clone access = read access.",
+        }
+    out(payload)
+
+
+def _attach_root():
+    """Directory whose contents we consider 'expected' for --body-file attachments.
+
+    $PAIR_PRESSURE_ATTACH_ROOT if set, else CWD. Used today only to decide
+    whether to emit a stderr warning when an attached path resolves outside
+    it; left in place so a future strict-mode (refuse, not warn) can hang
+    off the same definition.
+    """
+    return Path(os.environ.get("PAIR_PRESSURE_ATTACH_ROOT") or os.getcwd()).resolve()
+
+
+def _warn_if_outside_attach_root(path_str):
+    """Emit a stderr warning when `path_str` resolves outside the attach root.
+
+    Non-blocking by design: pp runs with the caller's own privileges, so
+    --body-file is no more powerful than `cat`. The warning exists so a
+    human watching the session can spot an agent attaching files from
+    unexpected places (a weak signal for prompt-injection misuse).
+    """
+    try:
+        root = _attach_root()
+        p = Path(path_str)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        resolved = p.resolve()
+        resolved.relative_to(root)
+    except FileNotFoundError:
+        return  # let read_text() raise the real error
+    except ValueError:
+        print(
+            f"pp: warning: --body-file '{path_str}' resolves outside the attach root "
+            f"({_attach_root()}). Set PAIR_PRESSURE_ATTACH_ROOT to silence.",
+            file=sys.stderr,
+        )
 
 
 def read_body(args):
     if args.body_file == "-":
         return sys.stdin.read()
+    _warn_if_outside_attach_root(args.body_file)
     return Path(args.body_file).read_text()
+
+
+def _resolve_password(args):
+    """Pop the password from stdin if --password-stdin is set.
+
+    The first line of stdin is the password; subsequent read_body() calls
+    (when --body-file is '-') see only the bytes after the first newline.
+    Keeps the plaintext out of argv (visible in /proc, ps, ETW, MCP logs).
+    """
+    if not getattr(args, "password_stdin", False):
+        return getattr(args, "password", None)
+    if getattr(args, "password", None):
+        die("--password and --password-stdin are mutually exclusive")
+    raw = sys.stdin.read()
+    nl = raw.find("\n")
+    if nl < 0:
+        pw, rest = raw, ""
+    else:
+        pw, rest = raw[:nl], raw[nl + 1:]
+    sys.stdin = io.StringIO(rest)
+    return pw or None
 
 
 def _current_branch():
@@ -578,6 +848,7 @@ def cmd_new_thread(args):
     _activate_server(args)
     maybe_pull()
     ch = channel_dir(args.channel)
+    args.password = _resolve_password(args)
     body = read_body(args)
 
     def write_payload():
@@ -590,16 +861,11 @@ def cmd_new_thread(args):
             i += 1
         tdir = ch / tid
         tdir.mkdir(parents=True)
-        fm = {
-            "id": "000",
-            "in_reply_to": None,
-            "author": author(),
-            "via": args.via,
-            "model": args.model,
-            "stance": "summary",
-            "timestamp": now_iso(),
-        }
-        (tdir / "000-seed.md").write_text(dump_fm(fm, body))
+        pid = post_id()
+        (tdir / f"{pid}-seed.md").write_text(dump_slim(
+            by=by_for_via(args.via, args), via=args.via, model=args.model,
+            pid=pid, stance="summary", in_reply_to=None, body=body,
+        ))
         meta = {
             "id": tid,
             "title": args.title,
@@ -621,7 +887,7 @@ def cmd_new_thread(args):
         return {"thread_id": tid, "path": str(tdir.relative_to(repo_path()))}
 
     def msg(info):
-        return f"{args.channel}/{info['thread_id']}: new-thread by {author()} [via {args.via}]"
+        return f"{args.channel}/{info['thread_id']}: new-thread by {by_for_via(args.via, args)} [via {_short_via(args.via)}]"
 
     out(push_with_retry(write_payload, msg))
 
@@ -632,31 +898,33 @@ def cmd_reply(args):
     t = thread_dir(args.channel, args.thread)
     body = read_body(args)
 
+    irt = args.in_reply_to
+    if irt:
+        # Allow short --in-reply-to (e.g. `143022`) to resolve to a full
+        # timestamp id within this thread. Legacy `--in-reply-to 001` passes
+        # through unchanged (the resolver is a no-op when it can't disambiguate).
+        resolved = resolve_short_ref(t, irt)
+        if resolved:
+            irt = resolved
+
     def write_payload():
-        # Recompute ordinal each attempt — a rebase-retry might land us at a
-        # different next ordinal than the first try.
-        posts = _post_files(t)
-        next_ord = (_ord(posts[-1]) + 1) if posts else 0
-        fname = f"{next_ord:03d}-reply.md"
-        fm = {
-            "id": f"{next_ord:03d}",
-            "in_reply_to": args.in_reply_to,
-            "author": author(),
-            "via": args.via,
-            "model": args.model,
-            "stance": args.stance,
-            "timestamp": now_iso(),
-        }
-        (t / fname).write_text(dump_fm(fm, body))
+        # Stamp a fresh post id per attempt -- a rebase-retry produces a new
+        # millisecond and so a new filename, no collision possible.
+        pid = post_id()
+        fname = f"{pid}-reply.md"
+        (t / fname).write_text(dump_slim(
+            by=by_for_via(args.via, args), via=args.via, model=args.model,
+            pid=pid, stance=args.stance, in_reply_to=irt, body=body,
+        ))
         if args.summary is not None:
             meta_p = t / "meta.json"
             meta = read_json(meta_p, {})
             meta["summary"] = args.summary
             write_json(meta_p, meta)
-        return {"reply_id": f"{next_ord:03d}", "filename": fname}
+        return {"reply_id": pid, "filename": fname}
 
     def msg(info):
-        return f"{args.channel}/{args.thread}: reply {info['reply_id']} by {author()} [via {args.via}]"
+        return f"{args.channel}/{args.thread}: reply {info['reply_id']} by {by_for_via(args.via, args)} [via {_short_via(args.via)}]"
 
     out(push_with_retry(write_payload, msg))
 
@@ -923,6 +1191,7 @@ def cmd_join(args):
     me = author()
     meta = read_json(t / "meta.json", {})
     ph = meta.get("password_hash")
+    args.password = _resolve_password(args)
     if ph:
         if not args.password:
             out({"ok": False, "reason": "password_required"})
@@ -992,23 +1261,16 @@ def cmd_resolve(args):
         meta_now["status"] = new_status
         write_json(meta_p, meta_now)
         if outcome_body:
-            posts = _post_files(t)
-            next_ord = (_ord(posts[-1]) + 1) if posts else 0
-            fname = f"{next_ord:03d}-reply.md"
-            fm = {
-                "id": f"{next_ord:03d}",
-                "in_reply_to": None,
-                "author": me,
-                "via": args.via,
-                "model": None,
-                "stance": "summary",
-                "timestamp": now_iso(),
-            }
-            (t / fname).write_text(dump_fm(fm, outcome_body))
+            pid = post_id()
+            fname = f"{pid}-reply.md"
+            (t / fname).write_text(dump_slim(
+                by=by_for_via(args.via, args), via=args.via, model=None,
+                pid=pid, stance="summary", in_reply_to=None, body=outcome_body,
+            ))
         return {"ok": True, "status": new_status, "thread": args.thread}
 
     def msg(info):
-        return f"{args.channel}/{args.thread}: resolve by {me} -> {new_status}"
+        return f"{args.channel}/{args.thread}: resolve by {by_for_via(args.via, args)} -> {new_status}"
 
     out(push_with_retry(write_payload, msg))
 
@@ -1041,7 +1303,7 @@ def _read_saved_env():
         env_block = data.get("env") or {}
         if not isinstance(env_block, dict):
             continue
-        for k in ("PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_REPO"):
+        for k in ("PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_REPO", "PAIR_PRESSURE_ALIAS"):
             if k in env_block and k not in saved:
                 saved[k] = env_block[k]
     return saved
@@ -1068,7 +1330,9 @@ def cmd_status(args):
     active = {
         "PAIR_PRESSURE_AUTHOR": os.environ.get("PAIR_PRESSURE_AUTHOR") or None,
         "PAIR_PRESSURE_REPO":   os.environ.get("PAIR_PRESSURE_REPO")   or None,
+        "PAIR_PRESSURE_ALIAS":  os.environ.get("PAIR_PRESSURE_ALIAS")  or None,
     }
+    # ALIAS is optional -- it doesn't gate readiness; only AUTHOR + REPO do.
     keys = ("PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_REPO")
     saved_full  = all(saved.get(k)  for k in keys)
     active_full = all(active.get(k) for k in keys)
@@ -1110,6 +1374,7 @@ def cmd_status(args):
         "active": active,
         "verdict": verdict,
         "message": message,
+        "alias": active.get("PAIR_PRESSURE_ALIAS") or saved.get("PAIR_PRESSURE_ALIAS"),
         "servers": servers_list,
         "active_server": active_server,
     })
@@ -1165,12 +1430,18 @@ def cmd_search(args):
             paths.update(p for p in res.stdout.splitlines() if p.endswith(".md"))
     if not paths:
         # Manual walk fallback (e.g. unborn branch with no commits).
-        for p in (repo / "channels").rglob("[0-9][0-9][0-9]-*.md"):
-            try:
-                if ql in p.read_text().lower():
-                    paths.add(str(p.relative_to(repo)))
-            except OSError:
+        for ch_dir in (repo / "channels").iterdir() if (repo / "channels").exists() else []:
+            if not ch_dir.is_dir():
                 continue
+            for tdir in ch_dir.iterdir():
+                if not tdir.is_dir():
+                    continue
+                for p in _post_files(tdir):
+                    try:
+                        if ql in p.read_text().lower():
+                            paths.add(str(p.relative_to(repo)))
+                    except OSError:
+                        continue
 
     # Also surface threads whose meta.json title/summary matches — users
     # naturally search by topic, and the topic often lives only in the title.
@@ -1212,7 +1483,7 @@ def cmd_search(args):
             continue
 
         text = p.read_text()
-        fm, _ = parse_fm(text)
+        fm, _ = parse_post(text)
         if args.author and fm.get("author") != args.author:
             continue
         if args.stance and fm.get("stance") != args.stance:
@@ -1242,9 +1513,10 @@ def cmd_search(args):
             "thread_title": title or thread,
             "thread_kind": meta.get("kind", "discussion"),
             "thread_status": meta.get("status"),
-            "post_id": fm.get("id", p.name[:3]),
+            "post_id": fm.get("id", _stem_id(p)),
             "filename": p.name,
             "author": fm.get("author"),
+            "alias": fm.get("alias"),
             "stance": fm.get("stance"),
             "timestamp": fm.get("timestamp"),
             "match": match,
@@ -1292,7 +1564,7 @@ def cmd_feed(args):
             meta = read_json(thread_dir / "meta.json", {})
             title = meta.get("title", thread_dir.name)
             for post_file in _post_files(thread_dir):
-                fm, body = parse_fm(post_file.read_text())
+                fm, body = parse_post(post_file.read_text())
                 ts = fm.get("timestamp") or ""
                 if args.since and ts < args.since:
                     continue
@@ -1305,8 +1577,9 @@ def cmd_feed(args):
                     "thread_title": title,
                     "thread_kind": meta.get("kind", "discussion"),
                     "thread_status": meta.get("status"),
-                    "ordinal": fm.get("id", post_file.name[:3]),
+                    "id": fm.get("id", _stem_id(post_file)),
                     "author": fm.get("author"),
+                    "alias": fm.get("alias"),
                     "via": fm.get("via"),
                     "stance": fm.get("stance"),
                     "timestamp": ts,
@@ -1320,13 +1593,123 @@ def cmd_feed(args):
         p.get("timestamp") or "",
         p.get("channel") or "",
         p.get("thread") or "",
-        p.get("ordinal") or "",
+        p.get("id") or "",
     ))
     if args.limit:
         # Keep the LAST `limit` (newest), but preserve chronological order
         # so the consumer reads oldest-at-top.
         posts = posts[-args.limit:]
     out(posts)
+
+
+def cmd_aliases_in_use(args):
+    """Report aliases that have posted recently on this server.
+
+    Used by `/pp-chat:alias <name>` to detect "another live session is already
+    using this nickname" — there's no central session registry, so we proxy
+    activity by scanning posts within the last N minutes (default 30). An
+    alias counts as "in use" if any AI-composed post (via != human) carrying
+    that alias appears in the window.
+
+    Output:
+        [
+          {"alias": "Echo",  "author": "alice", "last_seen": "...", "last_channel": "general",
+           "last_thread": "2026-05-12_oauth-race", "post_count": 3},
+          ...
+        ]
+    """
+    _activate_server(args)
+    if not args.no_pull:
+        maybe_pull()
+    channels_root = repo_path() / "channels"
+    if not channels_root.is_dir():
+        out([])
+        return
+
+    cutoff = datetime.now(timezone.utc).timestamp() - (args.since_minutes * 60)
+    seen = {}  # alias -> {alias, author, last_seen, last_channel, last_thread, post_count}
+    for ch_dir in channels_root.iterdir():
+        if not ch_dir.is_dir():
+            continue
+        for tdir in ch_dir.iterdir():
+            if not tdir.is_dir():
+                continue
+            for p in _post_files(tdir):
+                try:
+                    fm, _ = parse_post(p.read_text())
+                except OSError:
+                    continue
+                al = fm.get("alias")
+                if not al:
+                    continue
+                # The mtime is a reliable activity signal even if the
+                # post's frontmatter timestamp is older (e.g. amended
+                # commits, history rewrites).
+                try:
+                    ts = p.stat().st_mtime
+                except OSError:
+                    continue
+                if ts < cutoff:
+                    continue
+                iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+                hit = seen.setdefault(al, {
+                    "alias": al,
+                    "author": fm.get("author"),
+                    "last_seen": iso,
+                    "last_channel": ch_dir.name,
+                    "last_thread": tdir.name,
+                    "post_count": 0,
+                })
+                hit["post_count"] += 1
+                if iso > hit["last_seen"]:
+                    hit["last_seen"] = iso
+                    hit["last_channel"] = ch_dir.name
+                    hit["last_thread"] = tdir.name
+                    hit["author"] = fm.get("author")
+    out(sorted(seen.values(), key=lambda r: r["last_seen"], reverse=True))
+
+
+_CHANNEL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def cmd_channel_ensure(args):
+    """Idempotently create a channel if it doesn't exist.
+
+    Used by the default-fallback path in /pp-chat:send and /pp-chat:read so a
+    message can land in a sensible place even on a freshly-cloned server with
+    no channels beyond what server-new scaffolded. Cheap no-op when the
+    channel already exists.
+    """
+    _activate_server(args)
+    maybe_pull()
+    name = args.name
+    if not _CHANNEL_NAME_RE.match(name):
+        die(f"channel name must match {_CHANNEL_NAME_RE.pattern}")
+
+    ch = repo_path() / "channels" / name
+    if ch.is_dir():
+        existing = read_json(ch / "channel.json", {"name": name, "description": ""})
+        out({"ok": True, "created": False, "channel": existing.get("name", name)})
+        return
+
+    def write_payload():
+        # Re-check inside the retry: a parallel agent might have created the
+        # channel during our rebase. If so, treat as success.
+        if ch.is_dir():
+            return {"ok": True, "created": False, "channel": name}
+        ch.mkdir(parents=True)
+        write_json(ch / "channel.json", {
+            "name": name,
+            "description": args.description or "",
+        })
+        return {"ok": True, "created": True, "channel": name}
+
+    def msg(info):
+        return f"{name}: ensure-channel by {by_for_via('claude-code', args)}"
+
+    out(push_with_retry(write_payload, msg))
 
 
 def _valid_server_name(name):
@@ -1563,8 +1946,16 @@ def main():
     sp.add_argument("--summary", default="")
     sp.add_argument("--via", default="claude-code")
     sp.add_argument("--model", default=None)
+    sp.add_argument("--alias", default=None,
+                    help="per-call alias override; beats PAIR_PRESSURE_ALIAS. "
+                         "Ignored when --via=human.")
     sp.add_argument("--password", default=None,
-                    help="advisory access marker; sha256-hashed into meta.json")
+                    help="advisory access marker; sha256-hashed into meta.json. "
+                         "AVOID on the CLI -- visible in process listings. "
+                         "Prefer --password-stdin.")
+    sp.add_argument("--password-stdin", action="store_true",
+                    help="read password as the first line of stdin (before the "
+                         "body, when --body-file is '-')")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_new_thread)
 
@@ -1581,6 +1972,9 @@ def main():
     sp.add_argument("--summary", default=None)
     sp.add_argument("--via", default="claude-code")
     sp.add_argument("--model", default=None)
+    sp.add_argument("--alias", default=None,
+                    help="per-call alias override; beats PAIR_PRESSURE_ALIAS. "
+                         "Ignored when --via=human.")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_reply)
 
@@ -1624,7 +2018,11 @@ def main():
     sp.add_argument("--channel", required=True)
     sp.add_argument("--thread", required=True)
     sp.add_argument("--password", default=None,
-                    help="required if the thread was created with --password")
+                    help="required if the thread was created with --password. "
+                         "AVOID on the CLI -- visible in process listings. "
+                         "Prefer --password-stdin.")
+    sp.add_argument("--password-stdin", action="store_true",
+                    help="read password from stdin (entire stdin = password)")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_join)
 
@@ -1637,6 +2035,9 @@ def main():
                          "accepted|rejected|superseded; "
                          "for others: optional free-text summary appended as a final post")
     sp.add_argument("--via", default="claude-code")
+    sp.add_argument("--alias", default=None,
+                    help="per-call alias override; beats PAIR_PRESSURE_ALIAS. "
+                         "Ignored when --via=human.")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_resolve)
 
@@ -1675,6 +2076,24 @@ def main():
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_feed)
+
+    sp = sub.add_parser("aliases-in-use",
+                        help="report aliases active in the last N minutes; "
+                             "used to detect collisions before claiming a name")
+    sp.add_argument("--since-minutes", type=int, default=30,
+                    help="activity window in minutes (default: 30)")
+    sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_aliases_in_use)
+
+    sp_channel = sub.add_parser("channel", help="channel management")
+    sub_channel = sp_channel.add_subparsers(dest="channel_cmd", required=True)
+    sp = sub_channel.add_parser("ensure",
+                                help="create a channel if missing; no-op if it exists")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--description", default=None)
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_channel_ensure)
 
     sub.add_parser("servers", help="list servers (alias for `pp server list`)") \
         .set_defaults(func=cmd_servers)

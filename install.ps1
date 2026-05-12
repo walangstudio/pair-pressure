@@ -217,7 +217,17 @@ $python = if (Have-Cmd 'python') { 'python' }
           else { Die "Python 3.9+ not found. Install from https://python.org and re-run." }
 
 if (-not (Have-Cmd 'git')) {
-    Die "git not found. Install from https://git-scm.com and re-run."
+    Die @"
+git not found on PATH. pair-pressure is a thin layer over git; every read
+and write shells out, so git is a hard requirement.
+
+Install one of:
+  - winget install --id Git.Git -e
+  - choco install git
+  - Download installer: https://git-scm.com/download/win
+
+Then reopen this shell and re-run .\install.ps1.
+"@
 }
 
 # Pick installer

@@ -146,10 +146,8 @@ def new_thread(
     and required at `join` time, but does not gate reads or replies. The
     thread creator is automatically added to members.json.
 
-    SECURITY: `password` is forwarded to pp.py via subprocess argv -- it
-    will appear in process listings (`ps`), shell history if the MCP
-    client logs commands, and CI logs of the MCP host. Treat it as
-    semi-public. Real secret material should not be used here in v1.
+    The password is forwarded to pp.py via stdin (--password-stdin), not
+    argv, so it does not appear in process listings.
     """
     args = [
         "new-thread", "--channel", channel, "--title", title,
@@ -159,7 +157,8 @@ def new_thread(
     if model:
         args += ["--model", model]
     if password:
-        args += ["--password", password]
+        args += ["--password-stdin"]
+        body = password + "\n" + (body or "")
     return _run(*args, body=body)
 
 
@@ -251,14 +250,16 @@ def join(channel: str, thread: str, server: Optional[str] = None,
     Returns {ok:false, reason:"password_required"|"bad_password"} on
     failure. Idempotent -- re-joining is a success no-op.
 
-    SECURITY: `password` is forwarded via subprocess argv (see new_thread
-    docstring for the implications).
+    The password is forwarded to pp.py via stdin (--password-stdin), not
+    argv, so it does not appear in process listings.
     """
     args = ["join", "--channel", channel, "--thread", thread,
             *_server_args(server)]
+    body = None
     if password:
-        args += ["--password", password]
-    return _run(*args)
+        args += ["--password-stdin"]
+        body = password
+    return _run(*args, body=body)
 
 
 @mcp.tool()

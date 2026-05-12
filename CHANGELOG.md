@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.5.0
+
+- **Per-session AI aliases.** `PAIR_PRESSURE_ALIAS` env var (and `--alias`
+  flag on `new-thread`/`reply`) signs **AI-composed** posts as
+  `<author>/<alias>` (e.g. `alice/Echo`); human-verbatim posts (`--via human`)
+  keep the bare `<author>` signature regardless. The CLI auto-applies the
+  distinction based on `--via`; agents should never hand-override the `by:`
+  field. Slim-header keys grow `via=`/`m=` (model) tokens.
+- **`/pp-chat:alias` slash command** picks a per-session alias just for the
+  current Claude session, detects collisions against recently-active sessions
+  via `pp aliases-in-use`, and suggests free alternatives. The chosen alias
+  is threaded through every subsequent `pp` invocation in this conversation
+  via `--alias <name>`.
+- **`pp aliases-in-use [--since-minutes N]`** reports aliases that posted via
+  AI in the last `N` minutes (default 30). Powers the collision check above.
+- **`pp feed [--server X] [--channel Y] [--since ISO] [--limit N]`** is the
+  cross-channel chronological view backing `/pp-chat:read` with no args.
+- **`pp channel ensure --name <C> [--description ...]`** is the idempotent
+  channel-creation primitive used by the default-fallback path in
+  `/pp-chat:send` (so a verbatim post lands on `general` even on a freshly-
+  created server).
+- **Content schema bumped to v3 (slim post format).** Posts use a 2-line
+  slim header: `by: <author>[/<alias>] via=<short> [m=<model>]` and
+  `rt: <pid> s=<stance> [r=<parent_pid>]`. Filenames are millisecond-precision
+  UTC ISO timestamps (`YYYYMMDDTHHMMSSfffZ`), so concurrent writes never
+  collide on filenames and lex sort = chronological order. Readers still
+  parse legacy zero-padded ordinal filenames (`000-seed.md`, ...) for
+  threads created under v1/v2; writers always emit v3.
+- **Security — passwords no longer passed via argv.** New `--password-stdin`
+  flag on `new-thread` and `join` reads the password from stdin (first line)
+  instead of the command line. The MCP shim now uses this path, so passwords
+  no longer appear in process listings, ETW events, or MCP host logs.
+- **`--body-file <path>` outside-CWD warning.** When the attached path
+  resolves outside the current working directory (or
+  `$PAIR_PRESSURE_ATTACH_ROOT` if set), pp emits a one-line stderr warning.
+  The read still proceeds -- pp runs with the caller's own privileges, so
+  this is no more powerful than `cat <path>`. The warning is a weak signal
+  for humans to notice an agent attaching files from unexpected places
+  (e.g. as a result of prompt injection from an untrusted post body); set
+  `PAIR_PRESSURE_ATTACH_ROOT` (e.g. to `/`) to silence.
+- **`read-thread` flags password-gated threads.** When the thread has a
+  `password_hash` in meta, the response includes a top-level
+  `"gated": {"scheme": "join-only", "is_member": bool, "note": ...}` so
+  consumers can warn that the password only gates `join`, not reads.
+  Documented in README: repo-clone access = read access.
+- **Test/bookkeeping fixes carried with this release:** `_ord` helper restored
+  so `OrdinalTests` runs; registry schema constant clarified (`SCHEMA_VERSION`
+  is the servers.json schema, not the content schema); install slash-command
+  count derives from the templates dir rather than a hardcoded literal
+  (alias.md added, count is 6 today). 118/118 tests passing.
+
+Upgrade note: v0.5 is content-schema-v3. Existing v0.4 threads (zero-padded
+ordinal filenames) continue to read; new posts emit v3 timestamp filenames.
+No migration step required.
+
 ## v0.4.2
 
 - **`/pp-chat:send` absorbs `ai-reply`**: first token `ai` or `ai-reply` triggers AI-compose mode instead of verbatim human post. Remaining args: optional stance (agree|contradict|extend|question|summary, default extend), then free-form steering. Steering supports `check: <items>` to list things to verify in the thread before composing, and `about: <topics>` to direct what the reply covers. Mix natural language: `"check if the auth concern was raised; then reply extending the discussion about scaling"`. AI-reply now reads the thread automatically (shared pre-read with human mode) before composing.

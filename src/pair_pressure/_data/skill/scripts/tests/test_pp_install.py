@@ -333,10 +333,10 @@ class InstallSlashCommandsTests(unittest.TestCase):
 
     def test_copies_new_files(self):
         actions = self.mod.install_slash_commands()
-        # 5 canonical files ship in v0.4.2 (send absorbed ai-reply:
-        # send, read, server, task, status). All should be 'new' on a
-        # blank user-commands dir.
-        self.assertEqual(actions["new"], 5)
+        expected = self._template_count()
+        # Canonical files ship under templates/commands/; count is the
+        # source of truth, not a magic literal.
+        self.assertEqual(actions["new"], expected)
         self.assertEqual(actions["updated"], 0)
         self.assertEqual(actions["kept"], 0)
         self.assertEqual(actions["unchanged"], 0)
@@ -348,8 +348,14 @@ class InstallSlashCommandsTests(unittest.TestCase):
         # 'unchanged' (same checksum).
         self.mod.install_slash_commands()
         actions = self.mod.install_slash_commands()
-        self.assertEqual(actions["unchanged"], 5)
+        expected = self._template_count()
+        self.assertEqual(actions["unchanged"], expected)
         self.assertEqual(actions["new"], 0)
+
+    def _template_count(self):
+        # Source of truth is the install module's own COMMAND_SOURCES.
+        return sum(1 for p in self.mod.COMMAND_SOURCES.iterdir()
+                   if p.name.endswith(".md"))
 
     def test_bin_name_rewrite(self):
         actions = self.mod.install_slash_commands(bin_name="pair-pp")
@@ -357,6 +363,105 @@ class InstallSlashCommandsTests(unittest.TestCase):
         # 'pp' standalone should be rewritten; longer words containing
         # 'pp' should not (regex \bpp\b enforces word boundaries).
         self.assertIn("pair-pp", body)
+
+
+@unittest.skipUnless(INSTALL_PATH.exists(), f"missing {INSTALL_PATH}")
+class VerifyTests(unittest.TestCase):
+    """Lock in the JSON shapes the verify() step expects from `pp`.
+
+    Bug regression: verify() once iterated `pp servers` output as a list of
+    dicts, but the verb actually returns {"servers": [...], "active": ...},
+    so the message-builder blew up with a TypeError mid-install. These tests
+    fake the subprocess call and assert verify() handles both `pp servers`
+    (dict shape) and `pp list-channels` (list-of-dicts shape), plus all the
+    failure branches a user can land in.
+    """
+
+    def setUp(self):
+        self.mod = _load_install_module()
+
+    def _fake_proc(self, *, stdout="", stderr="", returncode=0):
+        return mock.MagicMock(stdout=stdout, stderr=stderr, returncode=returncode)
+
+    def _run_with(self, fake, server=None):
+        with mock.patch.object(self.mod.shutil, "which", return_value="/fake/pp"):
+            with mock.patch.object(self.mod.subprocess, "run", return_value=fake):
+                return self.mod.verify(Path("/fake/repo"), "alice", server=server)
+
+    # --- pp servers (no default server configured) ---
+
+    def test_servers_branch_empty_registry(self):
+        fake = self._fake_proc(stdout='{"servers": [], "active": null}')
+        status, msg = self._run_with(fake, server=None)
+        self.assertEqual(status, "ok")
+        self.assertIn("no servers yet", msg)
+
+    def test_servers_branch_lists_names(self):
+        fake = self._fake_proc(stdout=json.dumps({
+            "servers": [{"name": "alpha"}, {"name": "beta"}],
+            "active": None,
+        }))
+        status, msg = self._run_with(fake, server=None)
+        self.assertEqual(status, "ok")
+        self.assertIn("2 server(s)", msg)
+        self.assertIn("alpha", msg)
+        self.assertIn("beta", msg)
+
+    # --- pp list-channels (default server resolved) ---
+
+    def test_channels_branch_no_channels(self):
+        fake = self._fake_proc(stdout="[]")
+        status, msg = self._run_with(fake, server="alpha")
+        self.assertEqual(status, "ok")
+        self.assertIn("0 channel(s)", msg)
+        self.assertIn("alpha", msg)
+
+    def test_channels_branch_lists_names(self):
+        fake = self._fake_proc(stdout=json.dumps([
+            {"name": "general"}, {"name": "deploys"},
+        ]))
+        status, msg = self._run_with(fake, server="alpha")
+        self.assertEqual(status, "ok")
+        self.assertIn("2 channel(s)", msg)
+        self.assertIn("general", msg)
+        self.assertIn("deploys", msg)
+
+    # --- failure branches ---
+
+    def test_pp_not_on_path_returns_skip(self):
+        with mock.patch.object(self.mod.shutil, "which", return_value=None):
+            status, msg = self.mod.verify(Path("/fake/repo"), "alice")
+        self.assertEqual(status, "skip")
+
+    def test_nonzero_exit_returns_fail(self):
+        fake = self._fake_proc(stderr="boom", returncode=2)
+        status, msg = self._run_with(fake, server=None)
+        self.assertEqual(status, "fail")
+        self.assertIn("boom", msg)
+
+    def test_non_json_output_returns_fail(self):
+        fake = self._fake_proc(stdout="not json")
+        status, msg = self._run_with(fake, server=None)
+        self.assertEqual(status, "fail")
+        self.assertIn("did not return JSON", msg)
+
+    def test_server_passed_through_to_subprocess_argv_and_env(self):
+        # Belt-and-braces: list-channels needs `--server` AND the env var,
+        # so a third-party `pp` wrapper that inspects either still finds it.
+        seen = {}
+
+        def fake_run(cmd, env, capture_output, text):
+            seen["cmd"] = cmd
+            seen["env_server"] = env.get("PAIR_PRESSURE_SERVER")
+            return mock.MagicMock(stdout="[]", stderr="", returncode=0)
+
+        with mock.patch.object(self.mod.shutil, "which", return_value="/fake/pp"):
+            with mock.patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+                self.mod.verify(Path("/fake/repo"), "alice", server="alpha")
+
+        self.assertIn("--server", seen["cmd"])
+        self.assertIn("alpha", seen["cmd"])
+        self.assertEqual(seen["env_server"], "alpha")
 
 
 if __name__ == "__main__":

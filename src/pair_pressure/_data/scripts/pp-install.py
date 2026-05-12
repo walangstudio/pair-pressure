@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -35,7 +36,7 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 # `__file__` resolves to one of:
 #   - editable install: <repo>/src/pair_pressure/_data/scripts/pp-install.py
@@ -70,7 +71,25 @@ USER_COMMANDS_PATH = CLAUDE_HOME / "commands" / "pp-chat"
 # idempotently rather than appending duplicates on re-runs.
 PROFILE_BEGIN = "# >>> pair-pressure env vars (pp-install) >>>"
 PROFILE_END   = "# <<< pair-pressure env vars <<<"
-PP_ENV_KEYS = ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_SERVER")
+PP_ENV_KEYS = ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR",
+               "PAIR_PRESSURE_SERVER", "PAIR_PRESSURE_ALIAS")
+
+# Short, distinctive names used as the random default for the AI alias.
+# Single-word, capitalised, ASCII only. Add freely; the only constraint is
+# that nothing collides with `PAIR_PRESSURE_AUTHOR` defaults like git names.
+_ALIAS_POOL = (
+    "Echo", "Nova", "Iris", "Atlas", "Sage", "Vega", "Lyra", "Orion",
+    "Nyx", "Onyx", "Juno", "Halo", "Ember", "Cipher", "Pixel", "Quill",
+    "Rune", "Talon", "Vox", "Wren", "Zephyr", "Aria", "Cosmo", "Flare",
+    "Glyph", "Kairos", "Mira", "Pulse", "Solace", "Tempo", "Indigo",
+    "Kestrel", "Lumen", "Phoenix",
+)
+_ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+
+
+def random_alias():
+    """Pick a fresh random alias from the pool. Used as the install default."""
+    return random.choice(_ALIAS_POOL)
 
 
 # ---- helpers ----
@@ -78,6 +97,41 @@ PP_ENV_KEYS = ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_SERV
 def die(msg, code=2):
     print(f"pp-install: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def require_git():
+    """Hard-fail with platform-specific install pointers if git isn't on PATH.
+
+    pair-pressure is a thin layer over `git`; every read and every write
+    shells out. Failing fast here is much cleaner than the user hitting a
+    confusing `FileNotFoundError: 'git'` mid-wizard.
+    """
+    if shutil.which("git"):
+        return
+    if os.name == "nt":
+        hint = (
+            "  Windows: https://git-scm.com/download/win\n"
+            "           or:  winget install --id Git.Git -e\n"
+            "           or:  choco install git"
+        )
+    elif sys.platform == "darwin":
+        hint = (
+            "  macOS:   brew install git\n"
+            "           or install the Xcode Command Line Tools:  xcode-select --install"
+        )
+    else:
+        hint = (
+            "  Debian/Ubuntu:  sudo apt install git\n"
+            "  Fedora/RHEL:    sudo dnf install git\n"
+            "  Arch:           sudo pacman -S git\n"
+            "  Source/docs:    https://git-scm.com/download/linux"
+        )
+    die(
+        "git is required (pair-pressure is a thin layer over `git`) but was "
+        "not found on PATH.\n" + hint + "\nReopen your shell after install, "
+        "then re-run pp-install.",
+        code=3,
+    )
 
 
 def run(*args, cwd=None, check=True, capture=True):
@@ -698,22 +752,46 @@ def _scaffold_if_needed(target, url=None):
 
 # ---- verification ----
 
-def verify(chat_repo, author):
-    """Sanity-check that `pp list-channels` works with the new env."""
+def verify(chat_repo, author, server=None):
+    """Sanity-check via pp.
+
+    If `server` is given, run `pp list-channels --server <name>`. Otherwise
+    run `pp servers` -- a registry-level verb that does not require a
+    server context, so the verification still works when the registry is
+    empty or has many servers and no default was configured.
+    """
     env = os.environ.copy()
     env["PAIR_PRESSURE_REPO"] = str(chat_repo)
     env["PAIR_PRESSURE_AUTHOR"] = author
     pp = shutil.which("pp")
     if not pp:
         return ("skip", "pp not on PATH yet — restart your shell and re-run pp-install to verify")
-    r = subprocess.run([pp, "list-channels"], env=env, capture_output=True, text=True)
+    if server:
+        env["PAIR_PRESSURE_SERVER"] = server
+        cmd = [pp, "list-channels", "--server", server]
+        label = f"pp list-channels --server {server}"
+    else:
+        cmd = [pp, "servers"]
+        label = "pp servers"
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0:
         return ("fail", (r.stderr or r.stdout).strip())
     try:
-        channels = json.loads(r.stdout)
-        return ("ok", f"{len(channels)} channel(s) visible: {', '.join(c['name'] for c in channels)}")
+        data = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return ("fail", "pp list-channels did not return JSON")
+        return ("fail", f"{label} did not return JSON")
+    if server:
+        # pp list-channels returns a list of {name, ...} dicts.
+        channels = data if isinstance(data, list) else []
+        names = ", ".join(c["name"] for c in channels) or "(no channels yet)"
+        return ("ok", f"{len(channels)} channel(s) on '{server}': {names}")
+    # pp servers returns {"servers": [...], "active": ...}.
+    servers = data.get("servers", []) if isinstance(data, dict) else []
+    if not servers:
+        return ("ok", "registry reachable; no servers yet -- create one with "
+                      "`pp server new <name>`")
+    names = ", ".join(s["name"] for s in servers)
+    return ("ok", f"{len(servers)} server(s) registered: {names}")
 
 
 # ---- first-server bootstrap ----
@@ -838,8 +916,9 @@ def upgrade_flow(existing_version, install_method, args):
     print("[4/4] Running verification...")
     repo = existing.get("PAIR_PRESSURE_REPO")
     author = existing.get("PAIR_PRESSURE_AUTHOR")
+    server = existing.get("PAIR_PRESSURE_SERVER")
     if repo and author:
-        status, msg = verify(Path(repo), author)
+        status, msg = verify(Path(repo), author, server=server)
         print(f"   {status}: {msg}")
     else:
         print("   skipped (env vars incomplete) -- run `pp-install` without --yes to fix")
@@ -857,14 +936,26 @@ def fresh_install_flow(args):
     default_author = git_default("user.name") or os.environ.get("USER") or os.environ.get("USERNAME")
     default_email  = git_default("user.email")
     author = args.author or prompt(
-        "Author identity (used in post frontmatter)",
+        "Author username",
         default=default_author,
         validate=lambda s: None if s else "must not be blank",
     )
     email = args.email or prompt(
-        "Author email (used to configure git on the chat repo)",
+        "Author email",
         default=default_email or "",
     )
+
+    # AI alias: random default per install. Distinguishes AI-composed posts
+    # (signed `<author>/<alias>`) from human verbatim posts (signed `<author>`).
+    # --no-alias skips the prompt and writes no PAIR_PRESSURE_ALIAS at all.
+    alias = None
+    if not args.no_alias:
+        alias = args.alias or prompt(
+            "AI nickname",
+            default=random_alias(),
+            validate=lambda s: None if _ALIAS_RE.match(s)
+                                    else "must match ^[A-Za-z][A-Za-z0-9_-]{0,31}$",
+        )
 
     # Chat repo
     chat_repo, _ = resolve_chat_repo(args)
@@ -915,6 +1006,8 @@ def fresh_install_flow(args):
         "PAIR_PRESSURE_REPO": str(chat_repo),
         "PAIR_PRESSURE_AUTHOR": author,
     }
+    if alias:
+        env_updates["PAIR_PRESSURE_ALIAS"] = alias
     if set_default and first_server:
         env_updates["PAIR_PRESSURE_SERVER"] = first_server
     print(f"\nMerging env vars into:")
@@ -922,6 +1015,8 @@ def fresh_install_flow(args):
     print(f"  {SETTINGS_GLOBAL_PATH}")
     print(f"  + PAIR_PRESSURE_REPO   = {chat_repo}")
     print(f"  + PAIR_PRESSURE_AUTHOR = {author}")
+    if alias:
+        print(f"  + PAIR_PRESSURE_ALIAS  = {alias}")
     if "PAIR_PRESSURE_SERVER" in env_updates:
         print(f"  + PAIR_PRESSURE_SERVER = {env_updates['PAIR_PRESSURE_SERVER']}")
     merge_settings(env_updates)
@@ -931,8 +1026,11 @@ def fresh_install_flow(args):
         print(f"  shell profile: {action} {path}")
 
     # Verify
-    print("\nRunning verification (pp list-channels)...")
-    status, msg = verify(chat_repo, author)
+    resolved_server = env_updates.get("PAIR_PRESSURE_SERVER")
+    label = (f"pp list-channels --server {resolved_server}"
+             if resolved_server else "pp servers")
+    print(f"\nRunning verification ({label})...")
+    status, msg = verify(chat_repo, author, server=resolved_server)
     print(f"  {status}: {msg}")
 
     print()
@@ -958,6 +1056,11 @@ def main():
 
     # Non-interactive overrides
     ap.add_argument("--author", default=None, help="PAIR_PRESSURE_AUTHOR value")
+    ap.add_argument("--alias",  default=None,
+                    help="PAIR_PRESSURE_ALIAS value (AI nickname; defaults to "
+                         "a random pick from the bundled pool when not given)")
+    ap.add_argument("--no-alias", action="store_true",
+                    help="skip the alias prompt entirely (no PAIR_PRESSURE_ALIAS written)")
     ap.add_argument("--email",  default=None, help="git user.email on the chat repo clone")
     ap.add_argument("--repo",   default=None, help="path to chat repo (skips repo prompt)")
     ap.add_argument("--remote", default=None, help="remote URL when initialising a fresh chat repo")
@@ -985,6 +1088,8 @@ def main():
     if args.yes:
         PromptCtx.non_interactive = True
 
+    require_git()
+
     # Upgrade vs fresh
     if not args.reinstall:
         existing = detect_existing_install()
@@ -994,7 +1099,7 @@ def main():
         if existing and existing[0] == __version__:
             print(f"pair-pressure {__version__} already installed.")
             if PromptCtx.non_interactive or not yes_no(
-                "Run the wizard anyway to update config?", default_yes=False
+                "Update config?", default_yes=True
             ):
                 return
 
