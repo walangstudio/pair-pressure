@@ -825,6 +825,7 @@ class SmartVerbsE2ETests(unittest.TestCase):
             alias=None,
             password=None,
             password_stdin=False,
+            attachments=flags.get("attachments"),
         )
         return pp._capture(pp.cmd_send, ns)
 
@@ -868,6 +869,211 @@ class SmartVerbsE2ETests(unittest.TestCase):
         self.assertTrue((wt / "channels" / "alpha" / r1["thread_id"]).is_dir())
         self.assertTrue((wt / "channels" / "beta" / r2["thread_id"]).is_dir())
         self.assertNotEqual(r1["channel"], r2["channel"])
+
+    def _read_thread(self, channel, thread):
+        import argparse
+        ns = argparse.Namespace(
+            server=None, channel=channel, thread=thread,
+            since=0, no_pull=True,
+        )
+        return pp._capture(pp.cmd_read_thread, ns)
+
+    def _stage_file(self, name, content):
+        """Stage a file in a temp scratch dir and return its absolute path."""
+        f = Path(self._td.name) / name
+        f.write_text(content)
+        return f
+
+    def test_send_with_at_at_token_attaches_and_links(self):
+        src = self._stage_file("notes.md", "## notes body\n")
+        r = self._send(f"see @@{src} for context")
+        wt = self.repo / ".pp-worktrees" / "main"
+        tdir = wt / "channels" / r["channel"] / r["thread_id"]
+        # One post (the seed) created; find its post-id from the attachments dir.
+        att_root = tdir / "attachments"
+        self.assertTrue(att_root.is_dir(), "attachments/ dir missing")
+        pids = list(att_root.iterdir())
+        self.assertEqual(len(pids), 1)
+        pid = pids[0].name
+        # File copied with the original basename.
+        self.assertTrue((att_root / pid / "notes.md").is_file())
+        # Seed post body contains the rewritten markdown link.
+        seed = next(tdir.glob("*-seed.md")).read_text()
+        self.assertIn(f"[notes.md](attachments/{pid}/notes.md)", seed)
+        # read-thread surfaces the attachment.
+        payload = self._read_thread(r["channel"], r["thread_id"])
+        posts = payload["posts"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(len(posts[0]["attachments"]), 1)
+        self.assertEqual(posts[0]["attachments"][0]["name"], "notes.md")
+        self.assertEqual(
+            posts[0]["attachments"][0]["path"],
+            f"attachments/{pid}/notes.md",
+        )
+
+    def test_send_with_attach_flag_appends_section(self):
+        a = self._stage_file("a.png", "fakepng")
+        b = self._stage_file("b.csv", "x,y\n1,2\n")
+        r = self._send("payload", attachments=[str(a), str(b)])
+        wt = self.repo / ".pp-worktrees" / "main"
+        tdir = wt / "channels" / r["channel"] / r["thread_id"]
+        pids = list((tdir / "attachments").iterdir())
+        self.assertEqual(len(pids), 1)
+        pid = pids[0].name
+        self.assertTrue((tdir / "attachments" / pid / "a.png").is_file())
+        self.assertTrue((tdir / "attachments" / pid / "b.csv").is_file())
+        seed = next(tdir.glob("*-seed.md")).read_text()
+        self.assertIn("## Attachments", seed)
+        self.assertIn(f"[a.png](attachments/{pid}/a.png)", seed)
+        self.assertIn(f"[b.csv](attachments/{pid}/b.csv)", seed)
+        payload = self._read_thread(r["channel"], r["thread_id"])
+        names = sorted(a["name"] for a in payload["posts"][0]["attachments"])
+        self.assertEqual(names, ["a.png", "b.csv"])
+
+    def test_attachments_isolated_per_post(self):
+        # Same filename in a seed AND a reply must coexist under different
+        # post-id subdirs without collision.
+        src = self._stage_file("shared.md", "v1")
+        r1 = self._send(f"first @@{src}")
+        # Mutate the source so we can verify the reply's copy is independent.
+        src.write_text("v2")
+        pp._CURRENT_REPO = None
+        r2 = self._send(f"second @@{src}")
+        self.assertEqual(r2["thread_id"], r1["thread_id"])
+        wt = self.repo / ".pp-worktrees" / "main"
+        tdir = wt / "channels" / r1["channel"] / r1["thread_id"]
+        att_root = tdir / "attachments"
+        pids = sorted(p.name for p in att_root.iterdir())
+        self.assertEqual(len(pids), 2)
+        copies = sorted((att_root / pid / "shared.md").read_text() for pid in pids)
+        self.assertEqual(copies, ["v1", "v2"])
+
+
+class ProcessAttachmentsTests(unittest.TestCase):
+    """Unit tests for the pure body-rewrite helper. No git, no env."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.scratch = Path(self._td.name)
+        self.tdir = self.scratch / "thread"
+        self.tdir.mkdir()
+        self.pid = "20260514T010101000Z"
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _file(self, name, content="x"):
+        p = self.scratch / name
+        p.write_text(content)
+        return p
+
+    def test_inline_token_replaced_with_link(self):
+        f = self._file("notes.md", "hello")
+        body = pp._process_attachments(f"see @@{f}", self.tdir, self.pid, [])
+        self.assertIn(f"[notes.md](attachments/{self.pid}/notes.md)", body)
+        self.assertTrue((self.tdir / "attachments" / self.pid / "notes.md").is_file())
+
+    def test_nonexistent_inline_token_left_untouched(self):
+        body = pp._process_attachments(
+            "see @@/does/not/exist and email a@b.c",
+            self.tdir, self.pid, [],
+        )
+        self.assertIn("@@/does/not/exist", body)
+        self.assertIn("a@b.c", body)
+        self.assertFalse((self.tdir / "attachments").exists())
+
+    def test_inline_collision_within_post_suffixes(self):
+        f = self._file("notes.md")
+        body = pp._process_attachments(
+            f"first @@{f} and second @@{f}", self.tdir, self.pid, [],
+        )
+        self.assertIn(f"[notes.md](attachments/{self.pid}/notes.md)", body)
+        self.assertIn(f"[notes-2.md](attachments/{self.pid}/notes-2.md)", body)
+        att = self.tdir / "attachments" / self.pid
+        self.assertTrue((att / "notes.md").is_file())
+        self.assertTrue((att / "notes-2.md").is_file())
+
+    def test_trailing_punctuation_preserved_outside_link(self):
+        f = self._file("notes.md")
+        body = pp._process_attachments(
+            f"see @@{f}. Some prose.", self.tdir, self.pid, [],
+        )
+        # The period sits OUTSIDE the markdown link, not inside the URL.
+        self.assertIn(
+            f"[notes.md](attachments/{self.pid}/notes.md). Some prose.",
+            body,
+        )
+
+    def test_attach_flag_appends_section(self):
+        a = self._file("a.txt", "A")
+        b = self._file("b.txt", "B")
+        body = pp._process_attachments("body", self.tdir, self.pid, [str(a), str(b)])
+        self.assertIn("## Attachments", body)
+        self.assertIn(f"- [a.txt](attachments/{self.pid}/a.txt)", body)
+        self.assertIn(f"- [b.txt](attachments/{self.pid}/b.txt)", body)
+
+    def test_attach_flag_missing_path_dies(self):
+        with self.assertRaises(SystemExit):
+            pp._process_attachments(
+                "body", self.tdir, self.pid, ["/does/not/exist"],
+            )
+
+    def test_no_attachments_is_passthrough(self):
+        body = pp._process_attachments(
+            "plain body with no tokens", self.tdir, self.pid, [],
+        )
+        self.assertEqual(body, "plain body with no tokens")
+        self.assertFalse((self.tdir / "attachments").exists())
+
+
+class TaskSafetyBannerTests(unittest.TestCase):
+    """The trust banner short-circuits when stderr isn't a TTY, and when it
+    DOES fire it names the seed_author so the operator can verify trust."""
+
+    def test_banner_skipped_when_stderr_not_tty(self):
+        import io
+        buf = io.StringIO()  # no isatty -> defaults to False
+        with unittest.mock.patch.object(sys, "stderr", buf):
+            pp._print_task_safety_banner(
+                {"seed_author": "mallory", "title": "evil", "kind": "task"},
+                action="claim",
+            )
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_banner_includes_giver_and_title_when_tty(self):
+        import io
+
+        class FakeTTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        buf = FakeTTY()
+        with unittest.mock.patch.object(sys, "stderr", buf):
+            pp._print_task_safety_banner(
+                {"seed_author": "mallory", "title": "deploy prod",
+                 "kind": "task"},
+                action="claim",
+            )
+        out = buf.getvalue()
+        self.assertIn("TRUST CHECK", out)
+        self.assertIn("CLAIM", out)
+        self.assertIn("mallory", out)
+        self.assertIn("deploy prod", out)
+
+    def test_banner_defaults_when_meta_empty(self):
+        import io
+
+        class FakeTTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        buf = FakeTTY()
+        with unittest.mock.patch.object(sys, "stderr", buf):
+            pp._print_task_safety_banner({}, action="start")
+        out = buf.getvalue()
+        self.assertIn("<unknown>", out)
+        self.assertIn("<no title>", out)
+        self.assertIn("START", out)
 
 
 class StatusCurrentBlockTests(unittest.TestCase):

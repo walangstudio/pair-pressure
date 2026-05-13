@@ -43,6 +43,27 @@ If `$ARGUMENTS` contains `@<path>` tokens, replace each with the file's
 verbatim contents (text first, blank line, then file body if mixed). Resolve
 relative paths against the user's cwd.
 
+If `$ARGUMENTS` contains `@@<path>` tokens (double-at), do NOT inline. Leave
+them in the body verbatim — `pp send` itself copies each referenced file
+into `channels/<C>/<thread>/attachments/<post-id>/` and rewrites the token
+to a relative markdown link. Use `@@<path>` for binaries, large files, or
+anything you want preserved as a standalone artifact alongside the post.
+
+If `$ARGUMENTS` contains one or more `--attach <path>` tokens, strip them
+out before piping the remainder as the body, and forward each as a real
+flag to `pp send`:
+
+```
+pp send --via human --attach <path1> [--attach <path2> …] --body-file -
+```
+
+The stripped body (everything except the `--attach <path>` pairs) becomes
+the post body on stdin. `--attach` appends an `## Attachments` section to
+the post; `@@<path>` attaches inline. The two can be combined freely.
+
+If the user explicitly says "attach <file>" (vs. "include" or "paste"),
+prefer `--attach <path>` over inlining.
+
 After `pp send` returns, remember `(server, channel, thread_id)` for any
 follow-up tool calls this turn. `pp send` itself persists this — but other
 verbs (`pp read`, `pp claim`, etc.) read state on entry, so you don't have to

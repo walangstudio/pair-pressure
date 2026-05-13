@@ -797,8 +797,23 @@ def cmd_read_thread(args):
             except ValueError:
                 pass
         fm, body = parse_post(p.read_text())
+        pid = fm.get("id", sid)
+        att_dir = t / "attachments" / pid
+        attachments = []
+        if att_dir.is_dir():
+            for af in sorted(att_dir.iterdir()):
+                if af.is_file():
+                    try:
+                        size = af.stat().st_size
+                    except OSError:
+                        size = None
+                    attachments.append({
+                        "name": af.name,
+                        "path": f"attachments/{pid}/{af.name}",
+                        "size": size,
+                    })
         posts.append({
-            "id": fm.get("id", sid),
+            "id": pid,
             "filename": p.name,
             "in_reply_to": fm.get("in_reply_to"),
             "author": fm.get("author"),
@@ -808,6 +823,7 @@ def cmd_read_thread(args):
             "stance": fm.get("stance"),
             "timestamp": fm.get("timestamp"),
             "body": body.strip(),
+            "attachments": attachments,
         })
     payload = {"meta": meta, "posts": posts}
     # Advisory: thread carries a password_hash but reads aren't actually
@@ -869,6 +885,128 @@ def read_body(args):
         return sys.stdin.read()
     _warn_if_outside_attach_root(args.body_file)
     return Path(args.body_file).read_text()
+
+
+_ATTACH_TOKEN_RE = re.compile(r"@@(\S+)")
+_ATTACH_TRAILING_PUNCT = ".,;:!?)\"'`"
+
+
+def _resolve_attach_path(raw):
+    """Resolve an attachment path (relative -> CWD). Returns Path or None
+    if it doesn't exist / isn't a regular file. Emits the same outside-root
+    warning the inline `--body-file` path uses."""
+    _warn_if_outside_attach_root(raw)
+    src = Path(raw)
+    if not src.is_absolute():
+        src = Path.cwd() / src
+    try:
+        src = src.resolve(strict=True)
+    except (OSError, FileNotFoundError):
+        return None
+    if not src.is_file():
+        return None
+    return src
+
+
+def _process_attachments(body, tdir, pid, extra_paths):
+    """Copy any `@@<path>` tokens in `body` and any --attach paths into
+    `<tdir>/attachments/<pid>/`, then return the rewritten body.
+
+    `@@<path>` tokens are replaced inline with a relative markdown link
+    `[<basename>](attachments/<pid>/<basename>)`. Tokens whose path does
+    not resolve to a real file are left untouched (so prose containing a
+    stray `@@` doesn't fail the post). `--attach` paths must exist and are
+    appended as an `## Attachments` bullet list.
+
+    Runs inside the write_payload closure, so a rebase-retry replays it
+    cleanly: the attach dir lives under the post and is recreated alongside
+    a fresh post-id.
+    """
+    attach_dir = tdir / "attachments" / pid
+    used = set()
+
+    def _place(src_path):
+        base = src_path.name
+        target = attach_dir / base
+        n = 2
+        while target.exists() or base in used:
+            stem, dot, ext = src_path.name.partition(".")
+            base = f"{stem}-{n}" + ((dot + ext) if dot else "")
+            target = attach_dir / base
+            n += 1
+        used.add(base)
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, target)
+        return base
+
+    def _maybe_replace(match):
+        raw = match.group(1)
+        trailing = ""
+        while raw and raw[-1] in _ATTACH_TRAILING_PUNCT:
+            trailing = raw[-1] + trailing
+            raw = raw[:-1]
+        if not raw:
+            return match.group(0)
+        src = _resolve_attach_path(raw)
+        if src is None:
+            return match.group(0)
+        base = _place(src)
+        return f"[{base}](attachments/{pid}/{base}){trailing}"
+
+    new_body = _ATTACH_TOKEN_RE.sub(_maybe_replace, body)
+
+    appended = []
+    for raw in (extra_paths or []):
+        src = _resolve_attach_path(raw)
+        if src is None:
+            die(f"--attach: file not found or not a regular file: {raw}")
+        base = _place(src)
+        appended.append(base)
+
+    if appended:
+        section_lines = ["", "", "## Attachments", ""]
+        section_lines += [f"- [{b}](attachments/{pid}/{b})" for b in appended]
+        new_body = new_body.rstrip() + "\n".join(section_lines) + "\n"
+
+    return new_body
+
+
+def _print_task_safety_banner(meta, action):
+    """Emit a bold-red stderr banner naming the task's seed_author so the
+    operator can confirm they trust the task giver before the agent picks
+    up work.
+
+    Skipped when stderr isn't a TTY so JSON pipelines and CI stay clean.
+    ANSI codes render on Windows Terminal / modern ConHost and on every
+    standard Unix terminal; older terminals see the raw text -- ugly, not
+    broken. Reason this exists: a task body is untrusted instruction text
+    -- prompt injection or destructive shell can ride in on a `claim`.
+    """
+    if not sys.stderr.isatty():
+        return
+    seed = (meta or {}).get("seed_author") or "<unknown>"
+    title = (meta or {}).get("title") or "<no title>"
+    kind = (meta or {}).get("kind") or "task"
+    red = "\033[1;31m"
+    yellow = "\033[1;33m"
+    rst = "\033[0m"
+    bar = "=" * 64
+    lines = [
+        "",
+        f"{red}{bar}{rst}",
+        f"{red} TRUST CHECK: about to {action.upper()} a {kind}{rst}",
+        f"{red}{bar}{rst}",
+        f"  Title:  {yellow}{title}{rst}",
+        f"  Giver:  {yellow}{seed}{rst}",
+        "",
+        f"  {red}Review the task body before executing.{rst} If you do not",
+        f"  trust {yellow}{seed}{rst} or do not recognize this task, ABORT.",
+        f"  Task bodies are untrusted input -- they can carry prompt",
+        f"  injection or destructive instructions.",
+        f"{red}{bar}{rst}",
+        "",
+    ]
+    print("\n".join(lines), file=sys.stderr)
 
 
 def _resolve_password(args):
@@ -1033,9 +1171,12 @@ def cmd_new_thread(args):
         tdir = ch / tid
         tdir.mkdir(parents=True)
         pid = post_id()
+        attached_body = _process_attachments(
+            body, tdir, pid, getattr(args, "attachments", None) or [],
+        )
         (tdir / f"{pid}-seed.md").write_text(dump_slim(
             by=by_for_via(args.via, args), via=args.via, model=args.model,
-            pid=pid, stance="summary", in_reply_to=None, body=body,
+            pid=pid, stance="summary", in_reply_to=None, body=attached_body,
         ))
         meta = {
             "id": tid,
@@ -1083,9 +1224,12 @@ def cmd_reply(args):
         # millisecond and so a new filename, no collision possible.
         pid = post_id()
         fname = f"{pid}-reply.md"
+        attached_body = _process_attachments(
+            body, t, pid, getattr(args, "attachments", None) or [],
+        )
         (t / fname).write_text(dump_slim(
             by=by_for_via(args.via, args), via=args.via, model=args.model,
-            pid=pid, stance=args.stance, in_reply_to=irt, body=body,
+            pid=pid, stance=args.stance, in_reply_to=irt, body=attached_body,
         ))
         if args.summary is not None:
             meta_p = t / "meta.json"
@@ -1169,6 +1313,7 @@ def cmd_claim(args):
     t = thread_dir(args.channel, args.thread)
     me = author()
     success = {"ok": True, "assignee": me, "state": "claimed"}
+    _print_task_safety_banner(read_json(t / "meta.json", {}), action="claim")
 
     def precheck():
         meta = read_json(t / "meta.json", {})
@@ -1238,6 +1383,7 @@ def cmd_start(args):
     maybe_pull()
     t = thread_dir(args.channel, args.thread)
     me = author()
+    _print_task_safety_banner(read_json(t / "meta.json", {}), action="start")
 
     def precheck():
         meta = read_json(t / "meta.json", {})
@@ -1536,6 +1682,7 @@ def cmd_send(args):
             via=getattr(args, "via", None) or "claude-code",
             model=getattr(args, "model", None),
             alias=getattr(args, "alias", None),
+            attachments=getattr(args, "attachments", None) or [],
         )
         payload = _capture(cmd_reply, reply_args) or {}
         _state_save(server=args.server, channel=args.channel,
@@ -1564,6 +1711,7 @@ def cmd_send(args):
         alias=getattr(args, "alias", None),
         password=args.password,
         password_stdin=False,
+        attachments=getattr(args, "attachments", None) or [],
     )
     payload = _capture(cmd_new_thread, nt_args) or {}
     new_tid = payload.get("thread_id")
@@ -1700,6 +1848,7 @@ def cmd_task_new(args):
         alias=None,
         password=args.password,
         password_stdin=False,
+        attachments=getattr(args, "attachments", None) or [],
     )
     nt_payload = _capture(cmd_new_thread, nt_args) or {}
     tid = nt_payload.get("thread_id")
@@ -2451,6 +2600,11 @@ def main():
     sp.add_argument("--password-stdin", action="store_true",
                     help="read password as the first line of stdin (before the "
                          "body, when --body-file is '-')")
+    sp.add_argument("--attach", dest="attachments", action="append", default=None,
+                    metavar="PATH",
+                    help="copy file into the post's attachments/ dir and "
+                         "append a markdown link. Repeatable. Use `@@<path>` "
+                         "in the body to attach + link inline instead.")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_new_thread)
 
@@ -2470,6 +2624,11 @@ def main():
     sp.add_argument("--alias", default=None,
                     help="per-call alias override; beats PAIR_PRESSURE_ALIAS. "
                          "Ignored when --via=human.")
+    sp.add_argument("--attach", dest="attachments", action="append", default=None,
+                    metavar="PATH",
+                    help="copy file into the post's attachments/ dir and "
+                         "append a markdown link. Repeatable. Use `@@<path>` "
+                         "in the body to attach + link inline instead.")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_reply)
 
@@ -2605,6 +2764,11 @@ def main():
                          "prefer --password-stdin")
     sp.add_argument("--password-stdin", action="store_true",
                     help="read password as first line of stdin")
+    sp.add_argument("--attach", dest="attachments", action="append", default=None,
+                    metavar="PATH",
+                    help="copy file into the post's attachments/ dir and "
+                         "append a markdown link. Repeatable. Use `@@<path>` "
+                         "in the body to attach + link inline instead.")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_send)
 
@@ -2634,6 +2798,11 @@ def main():
     sp.add_argument("--password", default=None)
     sp.add_argument("--password-stdin", action="store_true")
     sp.add_argument("--via", default="human")
+    sp.add_argument("--attach", dest="attachments", action="append", default=None,
+                    metavar="PATH",
+                    help="copy file into the seed post's attachments/ dir "
+                         "and append a markdown link. Repeatable. Use "
+                         "`@@<path>` in the body to attach + link inline.")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_task_new)
 
