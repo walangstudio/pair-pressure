@@ -310,43 +310,48 @@ switch ($picked) {
 }
 
 # ---- Phase 2.5: locate the pp-setup wizard ----
-# Refresh PATH for this process — uv tool update-shell / pipx ensurepath
-# write into the user PATH but don't propagate to the current session.
-$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + `
-            [System.Environment]::GetEnvironmentVariable("PATH","User")
-
-# Prefer the freshly-installed console script; otherwise fall back to
-# `python -m pair_pressure._setup`. This handles "package installed but
-# bin not yet on PATH" on brand-new uv/pipx installs.
-$wizardExe = $null
-$wizardArgsPrefix = @()
-if (Have-Cmd 'pp-setup') {
-    $wizardExe = 'pp-setup'
-} elseif (Have-Cmd 'pp-install') {
-    $wizardExe = 'pp-install'
-} else {
-    $importable = $false
-    try { & $python -c 'import pair_pressure._setup' 2>$null; $importable = ($LASTEXITCODE -eq 0) } catch {}
-    if ($importable) {
-        $wizardExe = $python
-        $wizardArgsPrefix = @('-m', 'pair_pressure._setup')
+# uv/pipx put the new console script in a bin dir that isn't necessarily
+# on PATH yet. Probe known locations directly rather than relying on the
+# shell to have rehashed.
+$wizardBin = $null
+switch ($picked) {
+    'uv' {
+        $uvBinDir = $null
+        $uvToolDir = $null
+        try { $uvBinDir = (& uv tool dir --bin 2>$null).Trim() } catch {}
+        try { $uvToolDir = (& uv tool dir 2>$null).Trim() } catch {}
+        foreach ($cand in @(
+            (Join-Path $uvBinDir 'pp-setup.exe'),
+            (Join-Path $uvToolDir 'pair-pressure\Scripts\pp-setup.exe'),
+            "$env:USERPROFILE\.local\bin\pp-setup.exe"
+        )) {
+            if ($cand -and (Test-Path $cand)) { $wizardBin = $cand; break }
+        }
+    }
+    'pipx' {
+        foreach ($cand in @(
+            "$env:USERPROFILE\.local\bin\pp-setup.exe"
+        )) {
+            if (Test-Path $cand) { $wizardBin = $cand; break }
+        }
+    }
+    'pip' {
+        $userBase = (& $python -m site --user-base 2>$null).Trim()
+        foreach ($cand in @(
+            (Join-Path $userBase 'Scripts\pp-setup.exe'),
+            "$env:USERPROFILE\.local\bin\pp-setup.exe"
+        )) {
+            if ($cand -and (Test-Path $cand)) { $wizardBin = $cand; break }
+        }
     }
 }
 
-if (-not $wizardExe) {
-    Write-Host ""
-    Write-Host "pp / pp-setup not on PATH and the package isn't importable." -ForegroundColor Yellow
-    Write-Host "Fix and re-run the wizard:" -ForegroundColor Yellow
-    switch ($picked) {
-        'uv'   { Write-Host "  uv tool update-shell   # then close + reopen this shell" }
-        'pipx' { Write-Host "  pipx ensurepath        # then close + reopen this shell" }
-        'pip'  {
-            $userBase = & $python -m site --user-base
-            Write-Host "  Add $userBase\Scripts to your PATH (System Properties -> Environment Variables)"
-        }
-    }
-    Write-Host "  pp-setup               # to run the wizard"
-    exit 0
+# Fallback: refresh PATH for this process and try lookup.
+if (-not $wizardBin) {
+    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + `
+                [System.Environment]::GetEnvironmentVariable("PATH","User")
+    if (Have-Cmd 'pp-setup')   { $wizardBin = (Get-Command 'pp-setup').Source }
+    elseif (Have-Cmd 'pp-install') { $wizardBin = (Get-Command 'pp-install').Source }
 }
 
 # ---- Phase 3: wizard ----
@@ -357,11 +362,18 @@ if ($NoConfig) {
     exit 0
 }
 
+if (-not $wizardBin) {
+    Write-Host ""
+    Write-Host "Package installed but pp-setup couldn't be located." -ForegroundColor Yellow
+    Write-Host "Restart your shell and run ``pp-setup`` manually." -ForegroundColor Yellow
+    exit 0
+}
+
 Write-Host ""
-Write-Host "==> launching pp-setup wizard ($wizardExe $($wizardArgsPrefix -join ' '))" -ForegroundColor Cyan
-$wizardArgs = @($wizardArgsPrefix)
+$wizardArgs = @()
 if ($Reinstall) { $wizardArgs += '--reinstall' }
 if ($BinName -and $BinName -ne 'pp') { $wizardArgs += '--bin-name', $BinName }
 
-& $wizardExe @wizardArgs
+Write-Host "==> launching pp-setup wizard ($wizardBin $($wizardArgs -join ' '))" -ForegroundColor Cyan
+& $wizardBin @wizardArgs
 exit $LASTEXITCODE

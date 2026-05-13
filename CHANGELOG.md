@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.2
+
+- **install.sh / install.ps1 now probe the installer's bin directory
+  directly** (`uv tool dir --bin`, `~/.local/bin`, `python -m site
+  --user-base`/bin) and invoke `pp-setup` by absolute path. The v0.6.1
+  attempt at fixing the silent-skip ("`python -m pair_pressure._setup`
+  fallback") didn't help for `uv tool install`, which puts the package
+  in an isolated venv that the system Python can't import. After this
+  change `./install.sh` correctly auto-launches the wizard on a brand-
+  new uv install where the bin dir isn't on the current shell's PATH.
+- **`install.sh` ships with the execute bit set** (`100755` in git).
+  Fresh clones can `./install.sh` directly; older clones still need
+  `bash install.sh`.
+- README adds a `bash install.sh` / `chmod +x` fallback note for clones
+  pre-dating the executable-bit commit.
+
 ## v0.6.1
 
 - **Rename `pp-install` → `pp-setup`.** The wizard is for both initial
@@ -11,10 +27,8 @@
   (pp-install) >>>`) is intentionally unchanged so idempotent re-runs
   match blocks written by older versions.
 - **install.sh / install.ps1 fall back to `python -m pair_pressure._setup`**
-  when neither `pp-setup` nor `pp-install` are on PATH yet. This fixes the
-  "package installed but wizard didn't auto-launch" silent skip seen on
-  brand-new `uv tool install` runs (the bin dir was on PATH only in the
-  new shell, not the one running the bootstrap).
+  when neither `pp-setup` nor `pp-install` are on PATH yet. (Note: this
+  did not actually fix the uv silent-skip case — see v0.6.2.)
 - **Fix `re.error: bad escape \U`** in `pp-setup` (formerly `pp-install`)
   on Windows. `re.sub`'s replacement arg interprets backslash sequences;
   Windows paths like `C:\Users\...` contain `\U` and crashed the

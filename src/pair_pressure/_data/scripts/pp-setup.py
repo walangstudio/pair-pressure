@@ -39,7 +39,7 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 # `__file__` resolves to one of:
 #   - editable install: <repo>/src/pair_pressure/_data/scripts/pp-setup.py

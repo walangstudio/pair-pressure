@@ -277,40 +277,43 @@ case "$PICKED" in
 esac
 
 # ---- Phase 2.5: locate the pp-setup wizard ----
-# Source common shell configs so $PATH picks up uv/pipx updates without
-# requiring a shell restart.
-for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
-  # shellcheck disable=SC1090
-  [[ -f "$rc" ]] && source "$rc" 2>/dev/null || true
-done
+# uv/pipx put the new console script in a bin dir that isn't necessarily on
+# the current shell's PATH yet. Probe the known locations directly instead
+# of relying on the shell to have rehashed.
+WIZARD_BIN=""
+case "$PICKED" in
+  uv)
+    # `uv tool dir` is the parent of all uv tool installs; the bin lives at
+    # <dir>/pair-pressure/bin/pp-setup. Newer uv also symlinks into
+    # `uv tool dir --bin` (typically ~/.local/bin).
+    UV_TOOL_DIR="$(uv tool dir 2>/dev/null || true)"
+    UV_BIN_DIR="$(uv tool dir --bin 2>/dev/null || true)"
+    for cand in \
+        "${UV_BIN_DIR%/}/pp-setup" \
+        "${UV_TOOL_DIR%/}/pair-pressure/bin/pp-setup" \
+        "$HOME/.local/bin/pp-setup"; do
+      [[ -n "$cand" && -x "$cand" ]] && { WIZARD_BIN="$cand"; break; }
+    done
+    ;;
+  pipx)
+    for cand in "$HOME/.local/bin/pp-setup"; do
+      [[ -x "$cand" ]] && { WIZARD_BIN="$cand"; break; }
+    done
+    ;;
+  pip)
+    USERBASE="$("$PYTHON" -m site --user-base 2>/dev/null || true)"
+    for cand in "${USERBASE%/}/bin/pp-setup" "$HOME/.local/bin/pp-setup"; do
+      [[ -n "$cand" && -x "$cand" ]] && { WIZARD_BIN="$cand"; break; }
+    done
+    ;;
+esac
 
-# Prefer the freshly-installed console script; otherwise fall back to
-# `python -m pair_pressure._setup`, which works as long as the package is
-# importable. This avoids the "package installed but bin not yet on PATH"
-# trap on a brand-new uv/pipx install where the shell hasn't rehashed yet.
-WIZARD_CMD=()
-if have pp-setup; then
-  WIZARD_CMD=(pp-setup)
-elif have pp-install; then
-  WIZARD_CMD=(pp-install)
-elif "$PYTHON" -c 'import pair_pressure._setup' 2>/dev/null; then
-  WIZARD_CMD=("$PYTHON" -m pair_pressure._setup)
+# If we couldn't find an absolute path, fall back to whatever's on PATH.
+if [[ -z "$WIZARD_BIN" ]] && have pp-setup; then
+  WIZARD_BIN="$(command -v pp-setup)"
 fi
-
-if [[ ${#WIZARD_CMD[@]} -eq 0 ]]; then
-  echo ""
-  echo "pp / pp-setup not on PATH and the package isn't importable."
-  echo "Fix and re-run the wizard:"
-  case "$PICKED" in
-    uv)   echo "  uv tool update-shell    # then exec \$SHELL -l" ;;
-    pipx) echo "  pipx ensurepath         # then exec \$SHELL -l" ;;
-    pip)
-      USERBASE="$("$PYTHON" -m site --user-base)"
-      echo "  Add $USERBASE/bin to your PATH (e.g. via ~/.profile)"
-      ;;
-  esac
-  echo "  pp-setup                # to run the wizard"
-  exit 0
+if [[ -z "$WIZARD_BIN" ]] && have pp-install; then
+  WIZARD_BIN="$(command -v pp-install)"
 fi
 
 # ---- Phase 3: wizard ----
@@ -321,10 +324,17 @@ if [[ "$NO_CONFIG" -eq 1 ]]; then
   exit 0
 fi
 
+if [[ -z "$WIZARD_BIN" ]]; then
+  echo ""
+  echo "Package installed but pp-setup isn't on PATH and couldn't be located."
+  echo "Restart your shell and run \`pp-setup\` manually."
+  exit 0
+fi
+
 echo ""
-echo "==> launching pp-setup wizard (${WIZARD_CMD[*]})"
 WIZARD_ARGS=()
 [[ "$REINSTALL" -eq 1 ]] && WIZARD_ARGS+=('--reinstall')
 if [[ "$BIN_NAME" != "pp" ]]; then WIZARD_ARGS+=('--bin-name' "$BIN_NAME"); fi
 
-exec "${WIZARD_CMD[@]}" "${WIZARD_ARGS[@]}"
+echo "==> launching pp-setup wizard ($WIZARD_BIN${WIZARD_ARGS[*]:+ }${WIZARD_ARGS[*]})"
+exec "$WIZARD_BIN" "${WIZARD_ARGS[@]}"
