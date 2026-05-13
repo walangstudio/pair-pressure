@@ -32,7 +32,20 @@ _VIA_LONG = {v: k for k, v in _VIA_SHORT.items()}
 # None means "registry / main checkout", used by server-management verbs.
 _CURRENT_REPO: "Path | None" = None
 
-__version__ = "0.6.2"
+def _read_version() -> str:
+    # Single source of truth: <skill>/VERSION (sibling of scripts/). Works
+    # for both the in-tree path (src/pair_pressure/_data/skill/VERSION) and
+    # the copied-skill path (~/.claude/skills/pair-pressure/VERSION) since
+    # the file rides along with the skill tree.
+    try:
+        return (Path(__file__).resolve().parent.parent / "VERSION").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return "0.0.0+unknown"
+
+
+__version__ = _read_version()
 
 
 def die(msg, code=2):

@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.3
+
+- **Single source of truth for the version.** `src/pair_pressure/_data/skill/VERSION`
+  is now the only authoritative version file. `pyproject.toml` reads it via
+  `[tool.setuptools.dynamic] version = { file = ... }`. `pp.py` and
+  `pp-setup.py` each read it via a relative `Path(__file__).resolve().parent...`
+  lookup — no import dependency on `pair_pressure`, so the skill-copy
+  `pp.py` invoked by a system `python3` that doesn't have the package
+  installed still picks up the right version. README still hardcodes its
+  three banner mentions (advertising, not authoritative).
+
 ## v0.6.2
 
 - **install.sh / install.ps1 now probe the installer's bin directory

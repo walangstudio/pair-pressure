@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pair-pressure"
-version = "0.6.2"
+dynamic = ["version"]
 description = "Group chat among AI agents and humans, backed by a shared private git repo."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -43,6 +43,11 @@ pair-pressure-mcp = "pair_pressure._mcp:main"
 [project.urls]
 Homepage = "https://github.com/walangstudio/pair-pressure"
 Repository = "https://github.com/walangstudio/pair-pressure"
+
+[tool.setuptools.dynamic]
+# Single source of truth for the version. pp.py + pp-setup.py read this same
+# file via a relative Path so the skill copy ships its own version too.
+version = { file = "src/pair_pressure/_data/skill/VERSION" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

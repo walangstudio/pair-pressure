@@ -39,7 +39,19 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
-__version__ = "0.6.2"
+def _read_version() -> str:
+    # Single source of truth: _data/skill/VERSION. pp-setup.py is at
+    # _data/scripts/pp-setup.py, so the file is at ../skill/VERSION relative
+    # to this script — works in both editable and wheel installs.
+    try:
+        return (Path(__file__).resolve().parent.parent / "skill" / "VERSION").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return "0.0.0+unknown"
+
+
+__version__ = _read_version()
 
 # `__file__` resolves to one of:
 #   - editable install: <repo>/src/pair_pressure/_data/scripts/pp-setup.py
