@@ -1,6 +1,6 @@
-"""Tests for pp-install pure helpers (no network, no real Claude config).
+"""Tests for pp-setup pure helpers (no network, no real Claude config).
 
-The pp-install script lives at scripts/pp-install.py (sibling of pp.py's
+The pp-setup script lives at scripts/pp-setup.py (sibling of pp.py's
 parent tree). It's loaded via importlib.util so the dashed filename is OK.
 """
 from __future__ import annotations
@@ -14,19 +14,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-# Locate pp-install.py. HERE = .../skill/scripts/tests/. Walk up to _data/
-# and across to the sibling `scripts/` dir that holds the install script:
+# Locate pp-setup.py. HERE = .../skill/scripts/tests/. Walk up to _data/
+# and across to the sibling `scripts/` dir that holds the setup script:
 #   parents[0] = scripts/  (the skill's own scripts)
 #   parents[1] = skill/
-#   parents[2] = _data/     <- both `skill/` and `scripts/` (the install
-#                              tooling) live here in v0.4
+#   parents[2] = _data/     <- both `skill/` and `scripts/` (the setup
+#                              tooling) live here in v0.4+
 HERE = Path(__file__).resolve().parent
 DATA_ROOT = HERE.parents[2]
-INSTALL_PATH = DATA_ROOT / "scripts" / "pp-install.py"
+INSTALL_PATH = DATA_ROOT / "scripts" / "pp-setup.py"
 
 
 def _load_install_module():
-    spec = importlib.util.spec_from_file_location("pp_install", INSTALL_PATH)
+    spec = importlib.util.spec_from_file_location("pp_setup", INSTALL_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pair-pressure"
-version = "0.6.0"
+version = "0.6.1"
 description = "Group chat among AI agents and humans, backed by a shared private git repo."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -35,7 +35,9 @@ dev = []
 [project.scripts]
 pp = "pair_pressure._cli:main"
 pp-init = "pair_pressure._init:main"
-pp-install = "pair_pressure._install:main"
+pp-setup = "pair_pressure._setup:main"
+# Legacy alias of pp-setup; kept so existing docs and CI scripts keep working.
+pp-install = "pair_pressure._setup:main"
 pair-pressure-mcp = "pair_pressure._mcp:main"
 
 [project.urls]

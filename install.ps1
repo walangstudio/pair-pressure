@@ -5,14 +5,14 @@
 .DESCRIPTION
   Detects Python and a package installer (uv preferred, pipx fallback, pip
   last resort), sources the pair-pressure code (uses an existing clone or
-  clones from GitHub), installs the package, then runs the pp-install
+  clones from GitHub), installs the package, then runs the pp-setup
   wizard for per-dev config (env vars, skill, slash commands).
 
   Safe to re-run: if pair-pressure is already installed, routes to the
-  upgrade flow in pp-install.
+  upgrade flow in pp-setup.
 
 .PARAMETER NoConfig
-  Skip the pp-install wizard at the end. Useful for CI / unattended use
+  Skip the pp-setup wizard at the end. Useful for CI / unattended use
   when you just want the package installed.
 
 .PARAMETER CloneTo
@@ -28,7 +28,7 @@
   another `pp` is already on your PATH and you don't want the shadow.
 
 .PARAMETER Reinstall
-  Pass through to pp-install: skip upgrade detection, force full fresh
+  Pass through to pp-setup: skip upgrade detection, force full fresh
   wizard.
 
 .PARAMETER Uninstall
@@ -104,7 +104,7 @@ function Remove-EnvVarsFromSettingsFile {
     if ($changed) {
         Copy-Item $settings "$settings.bak" -Force
         # Write without BOM. PowerShell 5.1's `Set-Content -Encoding utf8`
-        # adds one which would make Python's json.loads (used by pp-install)
+        # adds one which would make Python's json.loads (used by pp-setup)
         # choke on a future read.
         $json = $data | ConvertTo-Json -Depth 10
         [System.IO.File]::WriteAllText($settings, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -309,15 +309,33 @@ switch ($picked) {
     }
 }
 
-# ---- Phase 2.5: verify pp on PATH ----
+# ---- Phase 2.5: locate the pp-setup wizard ----
 # Refresh PATH for this process — uv tool update-shell / pipx ensurepath
 # write into the user PATH but don't propagate to the current session.
 $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + `
             [System.Environment]::GetEnvironmentVariable("PATH","User")
 
-if (-not (Have-Cmd 'pp-install')) {
+# Prefer the freshly-installed console script; otherwise fall back to
+# `python -m pair_pressure._setup`. This handles "package installed but
+# bin not yet on PATH" on brand-new uv/pipx installs.
+$wizardExe = $null
+$wizardArgsPrefix = @()
+if (Have-Cmd 'pp-setup') {
+    $wizardExe = 'pp-setup'
+} elseif (Have-Cmd 'pp-install') {
+    $wizardExe = 'pp-install'
+} else {
+    $importable = $false
+    try { & $python -c 'import pair_pressure._setup' 2>$null; $importable = ($LASTEXITCODE -eq 0) } catch {}
+    if ($importable) {
+        $wizardExe = $python
+        $wizardArgsPrefix = @('-m', 'pair_pressure._setup')
+    }
+}
+
+if (-not $wizardExe) {
     Write-Host ""
-    Write-Host "pp / pp-install not on PATH in this shell." -ForegroundColor Yellow
+    Write-Host "pp / pp-setup not on PATH and the package isn't importable." -ForegroundColor Yellow
     Write-Host "Fix and re-run the wizard:" -ForegroundColor Yellow
     switch ($picked) {
         'uv'   { Write-Host "  uv tool update-shell   # then close + reopen this shell" }
@@ -327,7 +345,7 @@ if (-not (Have-Cmd 'pp-install')) {
             Write-Host "  Add $userBase\Scripts to your PATH (System Properties -> Environment Variables)"
         }
     }
-    Write-Host "  pp-install             # to run the wizard"
+    Write-Host "  pp-setup               # to run the wizard"
     exit 0
 }
 
@@ -335,15 +353,15 @@ if (-not (Have-Cmd 'pp-install')) {
 if ($NoConfig) {
     Write-Host ""
     Write-Host "Package installed. -NoConfig set; skipping wizard." -ForegroundColor Green
-    Write-Host "Run ``pp-install`` later to configure env vars + skill + slash commands."
+    Write-Host "Run ``pp-setup`` later to configure env vars + skill + slash commands."
     exit 0
 }
 
 Write-Host ""
-Write-Host "==> launching pp-install wizard" -ForegroundColor Cyan
-$wizardArgs = @()
+Write-Host "==> launching pp-setup wizard ($wizardExe $($wizardArgsPrefix -join ' '))" -ForegroundColor Cyan
+$wizardArgs = @($wizardArgsPrefix)
 if ($Reinstall) { $wizardArgs += '--reinstall' }
 if ($BinName -and $BinName -ne 'pp') { $wizardArgs += '--bin-name', $BinName }
 
-& pp-install @wizardArgs
+& $wizardExe @wizardArgs
 exit $LASTEXITCODE

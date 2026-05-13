@@ -27,8 +27,14 @@ def pp_init_script() -> Path:
     return _resource("_data", "scripts", "pp-init.py")
 
 
+def pp_setup_script() -> Path:
+    return _resource("_data", "scripts", "pp-setup.py")
+
+
+# Legacy alias kept so any external script importing pp_install_script still
+# works after the pp-install → pp-setup rename.
 def pp_install_script() -> Path:
-    return _resource("_data", "scripts", "pp-install.py")
+    return pp_setup_script()
 
 
 def mcp_server_script() -> Path:

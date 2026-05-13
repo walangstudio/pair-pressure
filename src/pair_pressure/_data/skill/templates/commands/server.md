@@ -23,7 +23,7 @@ On success, **update conversation context**: `<name>` is now the active server. 
 Tell the user briefly: "Now on server `<name>` for this conversation." Mention that to persist across other terminals, they can:
 - POSIX: `eval $(pp server switch <name>)`
 - PowerShell: run the `$env:` line printed in the JSON
-- Or re-run `pp-install` and pick `<name>` as the default.
+- Or re-run `pp-setup` and pick `<name>` as the default.
 
 **Step 2b** — server does NOT exist → confirm before creating:
 1. **Check for typos**. If any registered server's name is within Levenshtein distance 2 of `<name>`, ask: "Did you mean `<suggestion>`, or create `<name>` as a new server?"

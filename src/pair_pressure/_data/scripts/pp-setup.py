@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""pp-install: interactive onboarding wizard for pair-pressure.
+"""pp-setup: interactive onboarding wizard for pair-pressure.
+
+(Also reachable as the legacy name `pp-install`; both console scripts
+dispatch here.)
 
 After the bootstrap installer (install.ps1 / install.sh) has placed `pp` on
 PATH, this wizard:
@@ -17,10 +20,10 @@ preserves existing env vars and only overwrites slash commands whose
 checksum has changed since the previous canonical version.
 
 Usage:
-    pp-install                          fully interactive
-    pp-install --yes                    use defaults; fail if no default
-    pp-install --author X --repo /path  partial non-interactive
-    pp-install --reinstall              skip upgrade detection
+    pp-setup                            fully interactive
+    pp-setup --yes                      use defaults; fail if no default
+    pp-setup --author X --repo /path    partial non-interactive
+    pp-setup --reinstall                skip upgrade detection
 """
 from __future__ import annotations
 
@@ -36,11 +39,11 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 # `__file__` resolves to one of:
-#   - editable install: <repo>/src/pair_pressure/_data/scripts/pp-install.py
-#   - wheel install:    <venv>/Lib/site-packages/pair_pressure/_data/scripts/pp-install.py
+#   - editable install: <repo>/src/pair_pressure/_data/scripts/pp-setup.py
+#   - wheel install:    <venv>/Lib/site-packages/pair_pressure/_data/scripts/pp-setup.py
 # parents[1] = .../_data ; parents[2] = .../pair_pressure ; parents[3] = .../src or site-packages
 DATA_ROOT = Path(__file__).resolve().parent.parent  # _data/
 PP_INIT_SCRIPT = DATA_ROOT / "scripts" / "pp-init.py"
@@ -68,7 +71,10 @@ USER_SKILL_PATH = CLAUDE_HOME / "skills" / "pair-pressure"
 USER_COMMANDS_PATH = CLAUDE_HOME / "commands" / "pp-chat"
 
 # Markers for the shell-profile env-var block. Used to find + replace
-# idempotently rather than appending duplicates on re-runs.
+# idempotently rather than appending duplicates on re-runs. The marker text
+# stays `(pp-install)` even after the pp-install → pp-setup rename so existing
+# profile blocks written by older versions are still matched and replaced
+# rather than duplicated.
 PROFILE_BEGIN = "# >>> pair-pressure env vars (pp-install) >>>"
 PROFILE_END   = "# <<< pair-pressure env vars <<<"
 PP_ENV_KEYS = ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR",
@@ -95,7 +101,7 @@ def random_alias():
 # ---- helpers ----
 
 def die(msg, code=2):
-    print(f"pp-install: {msg}", file=sys.stderr)
+    print(f"pp-setup: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -129,7 +135,7 @@ def require_git():
     die(
         "git is required (pair-pressure is a thin layer over `git`) but was "
         "not found on PATH.\n" + hint + "\nReopen your shell after install, "
-        "then re-run pp-install.",
+        "then re-run pp-setup.",
         code=3,
     )
 
@@ -298,6 +304,8 @@ def merge_permissions(bin_name="pp"):
         f"Bash({bin_name})",
         f"Bash({bin_name} *)",
         "Bash(pp-init *)",
+        "Bash(pp-setup *)",
+        # Legacy alias name; still on PATH, still callable.
         "Bash(pp-install *)",
         "Bash(pair-pressure-mcp *)",
     ]
@@ -409,7 +417,10 @@ def write_shell_profile(env_updates):
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8-sig") if path.exists() else ""
         if pattern.search(existing):
-            new_text = pattern.sub(block, existing)
+            # Use a lambda so re.sub treats `block` as a literal string. Direct
+            # substitution interprets backslash sequences in the replacement
+            # (Windows paths like `C:\Users\...` -> `bad escape \U`).
+            new_text = pattern.sub(lambda _m: block, existing)
             action = "updated"
         else:
             sep = "" if not existing or existing.endswith("\n") else "\n"
@@ -468,7 +479,7 @@ def install_skill():
                     dst.unlink()
             except OSError:
                 die(f"cannot remove existing junction/symlink at {dst} -- "
-                    "delete it manually and re-run pp-install")
+                    "delete it manually and re-run pp-setup")
             action = "replaced-junction"
         else:
             shutil.rmtree(dst)
@@ -727,7 +738,7 @@ def _scaffold_if_needed(target, url=None):
     if not yes_no("  Scaffold it now? (registry + .gitignore + initial commit)",
                   default_yes=True):
         die("Aborting -- chat repo is not scaffolded. "
-            "Run pp-init on it manually, or rerun pp-install and pick option 3.")
+            "Run pp-init on it manually, or rerun pp-setup and pick option 3.")
     # Don't pass --remote: the clone already set origin. pp-init's --remote
     # would try to `git remote add origin` and fail with "already exists".
     _pp_init(target, channels="", remote=None, force=True)
@@ -765,7 +776,7 @@ def verify(chat_repo, author, server=None):
     env["PAIR_PRESSURE_AUTHOR"] = author
     pp = shutil.which("pp")
     if not pp:
-        return ("skip", "pp not on PATH yet — restart your shell and re-run pp-install to verify")
+        return ("skip", "pp not on PATH yet — restart your shell and re-run pp-setup to verify")
     if server:
         env["PAIR_PRESSURE_SERVER"] = server
         cmd = [pp, "list-channels", "--server", server]
@@ -870,16 +881,16 @@ def upgrade_flow(existing_version, install_method, args):
 
     v0.4 wheel-based install means the package itself is upgraded via
     `./install.ps1` (or `uv tool upgrade pair-pressure`), NOT inside
-    pp-install. This flow refreshes the user-visible artifacts that
+    pp-setup. This flow refreshes the user-visible artifacts that
     don't live in the wheel (skill copy in ~/.claude, slash commands)
     and validates the existing config.
     """
     print(f"\nFound existing pair-pressure {existing_version} "
           f"(installed via: {install_method})")
     if existing_version != __version__:
-        print(f"pp-install bundled with {__version__}; pp on PATH is {existing_version}.")
+        print(f"pp-setup bundled with {__version__}; pp on PATH is {existing_version}.")
         print("Run `./install.ps1` (or `uv tool upgrade pair-pressure`) to update "
-              "the package first, then re-run pp-install.")
+              "the package first, then re-run pp-setup.")
         if not yes_no("Refresh skill + slash commands anyway?", default_yes=False):
             sys.exit(0)
     elif not yes_no("Refresh skill + slash commands (preserves your env vars)?",
@@ -921,7 +932,7 @@ def upgrade_flow(existing_version, install_method, args):
         status, msg = verify(Path(repo), author, server=server)
         print(f"   {status}: {msg}")
     else:
-        print("   skipped (env vars incomplete) -- run `pp-install` without --yes to fix")
+        print("   skipped (env vars incomplete) -- run `pp-setup` without --yes to fix")
 
     print(f"\nRefreshed for {__version__}. Restart Claude Code if env vars changed.")
 
@@ -1021,7 +1032,7 @@ def fresh_install_flow(args):
         print(f"  + PAIR_PRESSURE_SERVER = {env_updates['PAIR_PRESSURE_SERVER']}")
     merge_settings(env_updates)
     merge_permissions(bin_name=args.bin_name or "pp")
-    print(f"  + permissions.allow: pp / pp-init / pp-install / pair-pressure-mcp (no-confirm)")
+    print(f"  + permissions.allow: pp / pp-init / pp-setup / pp-install / pair-pressure-mcp (no-confirm)")
     for path, action in write_shell_profile(env_updates):
         print(f"  shell profile: {action} {path}")
 
@@ -1040,11 +1051,16 @@ def fresh_install_flow(args):
 # ---- main ----
 
 def main():
+    # `prog` follows argv[0]: when invoked as `pp-install` the help text
+    # still shows that name, which keeps muscle-memory working.
+    prog = Path(sys.argv[0]).stem if sys.argv and sys.argv[0] else "pp-setup"
+    if prog not in ("pp-setup", "pp-install"):
+        prog = "pp-setup"
     ap = argparse.ArgumentParser(
-        prog="pp-install",
+        prog=prog,
         description="pair-pressure setup wizard",
     )
-    ap.add_argument("--version", action="version", version=f"pp-install {__version__}")
+    ap.add_argument("--version", action="version", version=f"{prog} {__version__}")
     ap.add_argument("--yes", action="store_true",
                     help="non-interactive; use defaults; fail if no default")
     ap.add_argument("--reinstall", action="store_true",

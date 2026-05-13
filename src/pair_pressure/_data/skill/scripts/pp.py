@@ -32,7 +32,7 @@ _VIA_LONG = {v: k for k, v in _VIA_SHORT.items()}
 # None means "registry / main checkout", used by server-management verbs.
 _CURRENT_REPO: "Path | None" = None
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 
 def die(msg, code=2):
@@ -1780,7 +1780,7 @@ def cmd_status(args):
     """Print pair-pressure identity status (saved vs active env vars).
 
     Works even when env vars aren't loaded yet -- that's the main use case
-    (diagnosing "saved but not active" right after pp-install, before a
+    (diagnosing "saved but not active" right after pp-setup, before a
     Claude Code restart). Does NOT call env() / repo_path() / author(),
     all of which die() if PAIR_PRESSURE_REPO / _AUTHOR are unset.
 
@@ -1806,7 +1806,7 @@ def cmd_status(args):
 
     if not saved_full and not active_full:
         verdict = "not_configured"
-        message = "Not configured. Run `pp-install` or `./install.ps1` to set up."
+        message = "Not configured. Run `pp-setup` or `./install.ps1` to set up."
     elif saved_full and not active_full:
         verdict = "needs_restart"
         message = ("Saved but not yet loaded -- fully quit and reopen Claude Code "
@@ -1822,7 +1822,7 @@ def cmd_status(args):
     else:
         verdict = "active_only"
         message = ("Env vars set in shell but not in settings.local.json. "
-                   "Run `pp-install` to persist them.")
+                   "Run `pp-setup` to persist them.")
     # Server info: tolerant of missing repo/registry. The status verb is the
     # main thing users run before they have anything set up, so failures
     # here become null fields rather than die().

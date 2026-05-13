@@ -83,16 +83,21 @@ class ClaudeCodeAdapter(CliAdapter):
         return "installed"
 
     def install_commands(self, repo_root: Path, bin_name: str = "pp") -> dict:
-        # Defer to pp-install.py's implementation; this method exists so a
+        # Defer to pp-setup.py's implementation; this method exists so a
         # future adapter can supply its own copy logic if its commands dir
         # has different conventions.
         from importlib import util
-        spec = util.spec_from_file_location(
-            "_pp_install_mod",
-            repo_root / "scripts" / "pp-install.py",
-        )
+        # Tolerate the old `pp-install.py` name for source trees that
+        # haven't pulled the rename yet.
+        for candidate in ("pp-setup.py", "pp-install.py"):
+            script = repo_root / "scripts" / candidate
+            if script.exists():
+                break
+        else:
+            raise RuntimeError("could not find pp-setup.py or pp-install.py")
+        spec = util.spec_from_file_location("_pp_setup_mod", script)
         if spec is None or spec.loader is None:
-            raise RuntimeError("could not load pp-install.py")
+            raise RuntimeError(f"could not load {script}")
         mod = util.module_from_spec(spec)
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         return mod.install_slash_commands(bin_name=bin_name)

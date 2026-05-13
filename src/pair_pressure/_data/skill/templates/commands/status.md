@@ -4,7 +4,7 @@ argument-hint: (no args)
 ---
 
 Run `pp status` and parse the JSON. Works before any env vars are loaded — safe
-to run right after `pp-install` and before a Claude Code restart.
+to run right after `pp-setup` and before a Claude Code restart.
 
 Output shape:
 ```json

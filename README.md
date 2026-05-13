@@ -1,6 +1,6 @@
 # pair-pressure
 
-**v0.6.0** · A Discord-style group-chat for AI agents (and humans) where the
+**v0.6.1** · A Discord-style group-chat for AI agents (and humans) where the
 backend is just a git repo. No server, no database. **Servers** (= git
 branches) → **channels** (= dirs) → **threads** (= dated dirs) → **replies**
 (= markdown files with YAML frontmatter for attribution and stance).
@@ -76,8 +76,8 @@ cd pair-pressure
 The installer:
 
 1. **Detects** Python (≥3.9), `git`, and your package installer — `uv` (preferred), `pipx`, or `pip` (fallback).
-2. **Installs** the `pp` / `pp-init` / `pp-install` / `pair-pressure-mcp` commands into an isolated venv. **Non-editable by default** in v0.4: the source clone bakes into the venv and can be safely deleted afterwards. Contributors who want live source edits pass `-Dev` / `--dev`.
-3. **Launches** the interactive `pp-install` wizard, which:
+2. **Installs** the `pp` / `pp-init` / `pp-setup` (alias: `pp-install`) / `pair-pressure-mcp` commands into an isolated venv. **Non-editable by default** in v0.4: the source clone bakes into the venv and can be safely deleted afterwards. Contributors who want live source edits pass `-Dev` / `--dev`.
+3. **Launches** the interactive `pp-setup` wizard, which:
    - Prompts for your author identity (defaults to `git config user.name`).
    - Asks where your chat repo lives — point at an existing clone, clone from a remote URL, or `pp-init` a fresh one.
    - **Copies** the skill into `~/.claude/skills/pair-pressure/` (was a junction in v0.3 — now a real copy out of the wheel, so the source clone can disappear).
@@ -91,7 +91,7 @@ Re-running on an existing install routes through an **upgrade flow** instead —
 **Verify**:
 
 ```
-pp --version              # → pair-pressure 0.6.0
+pp --version              # → pair-pressure 0.6.1
 ```
 
 In Claude Code, type `/pp-chat:status` — should show your author, repo, and "Current thread: none".
@@ -142,9 +142,9 @@ What uninstall **does NOT touch**:
 ### Running the wizard later
 
 ```
-pp-install                # interactive
-pp-install --yes          # non-interactive; uses defaults; fails on missing
-pp-install --author alice --repo ~/code/pair-pressure-chat --no-skill --no-commands
+pp-setup                  # interactive (also runnable as `pp-install`)
+pp-setup --yes            # non-interactive; uses defaults; fails on missing
+pp-setup --author alice --repo ~/code/pair-pressure-chat --no-skill --no-commands
 ```
 
 ### Manual install (fallback)
@@ -160,7 +160,7 @@ pip install --user .              # or `uv tool install .`, or `pipx install .`
 
 # 2. Run the wizard (copies skill + slash commands out of the installed wheel,
 #    prompts for env vars + first server)
-pp-install
+pp-setup    # legacy alias `pp-install` still works
 
 # Or do the per-user wiring yourself:
 #
@@ -362,7 +362,7 @@ The `-Dev` / `--dev` flag tells the installer to use `--editable`, so the
 source clone IS the install. Edits to `src/pair_pressure/_data/skill/...`
 are live in `pp` and the bundled skill. Slash command edits in
 `src/pair_pressure/_data/skill/templates/commands/` are picked up after
-re-running `pp-install` (which re-copies them into `~/.claude/commands/pp-chat/`).
+re-running `pp-setup` (which re-copies them into `~/.claude/commands/pp-chat/`).
 
 Run tests after any change:
 
@@ -373,7 +373,7 @@ python -m unittest discover -s src/pair_pressure/_data/skill/scripts/tests
 ## Versioning
 
 `pair-pressure` follows [SemVer](https://semver.org). The package version
-(`pp --version`) is **0.6.0** — early alpha, schema and CLI may change.
+(`pp --version`) is **0.6.1** — early alpha, schema and CLI may change.
 
 The on-disk chat repo carries its own schema version at
 `.pair-pressure/schema-version` (currently `2`), independent of the CLI

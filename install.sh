@@ -3,10 +3,10 @@
 #
 # Detects Python + a package installer (uv > pipx > pip), sources the
 # pair-pressure code (uses an existing clone or clones from GitHub),
-# installs the package, then runs the pp-install wizard.
+# installs the package, then runs the pp-setup wizard.
 #
 # Safe to re-run: if pair-pressure is already installed, routes to the
-# upgrade flow in pp-install.
+# upgrade flow in pp-setup.
 #
 # Flags:
 #   --no-config           skip the wizard
@@ -276,7 +276,7 @@ case "$PICKED" in
     ;;
 esac
 
-# ---- Phase 2.5: verify pp-install on PATH ----
+# ---- Phase 2.5: locate the pp-setup wizard ----
 # Source common shell configs so $PATH picks up uv/pipx updates without
 # requiring a shell restart.
 for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
@@ -284,9 +284,22 @@ for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
   [[ -f "$rc" ]] && source "$rc" 2>/dev/null || true
 done
 
-if ! have pp-install; then
+# Prefer the freshly-installed console script; otherwise fall back to
+# `python -m pair_pressure._setup`, which works as long as the package is
+# importable. This avoids the "package installed but bin not yet on PATH"
+# trap on a brand-new uv/pipx install where the shell hasn't rehashed yet.
+WIZARD_CMD=()
+if have pp-setup; then
+  WIZARD_CMD=(pp-setup)
+elif have pp-install; then
+  WIZARD_CMD=(pp-install)
+elif "$PYTHON" -c 'import pair_pressure._setup' 2>/dev/null; then
+  WIZARD_CMD=("$PYTHON" -m pair_pressure._setup)
+fi
+
+if [[ ${#WIZARD_CMD[@]} -eq 0 ]]; then
   echo ""
-  echo "pp / pp-install not on PATH in this shell."
+  echo "pp / pp-setup not on PATH and the package isn't importable."
   echo "Fix and re-run the wizard:"
   case "$PICKED" in
     uv)   echo "  uv tool update-shell    # then exec \$SHELL -l" ;;
@@ -296,7 +309,7 @@ if ! have pp-install; then
       echo "  Add $USERBASE/bin to your PATH (e.g. via ~/.profile)"
       ;;
   esac
-  echo "  pp-install              # to run the wizard"
+  echo "  pp-setup                # to run the wizard"
   exit 0
 fi
 
@@ -304,14 +317,14 @@ fi
 if [[ "$NO_CONFIG" -eq 1 ]]; then
   echo ""
   echo "Package installed. --no-config set; skipping wizard."
-  echo "Run \`pp-install\` later to configure env vars + skill + slash commands."
+  echo "Run \`pp-setup\` later to configure env vars + skill + slash commands."
   exit 0
 fi
 
 echo ""
-echo "==> launching pp-install wizard"
+echo "==> launching pp-setup wizard (${WIZARD_CMD[*]})"
 WIZARD_ARGS=()
 [[ "$REINSTALL" -eq 1 ]] && WIZARD_ARGS+=('--reinstall')
 if [[ "$BIN_NAME" != "pp" ]]; then WIZARD_ARGS+=('--bin-name' "$BIN_NAME"); fi
 
-exec pp-install "${WIZARD_ARGS[@]}"
+exec "${WIZARD_CMD[@]}" "${WIZARD_ARGS[@]}"

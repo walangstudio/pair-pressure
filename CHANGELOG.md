@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.1
+
+- **Rename `pp-install` → `pp-setup`.** The wizard is for both initial
+  config and re-config, so "setup" reads more naturally than "install"
+  (which was easy to confuse with the package install done by
+  `install.sh` / `install.ps1`). `pp-install` is kept as a working alias
+  console-script so existing docs, CI scripts, and muscle memory don't
+  break. Shell-profile marker (`# >>> pair-pressure env vars
+  (pp-install) >>>`) is intentionally unchanged so idempotent re-runs
+  match blocks written by older versions.
+- **install.sh / install.ps1 fall back to `python -m pair_pressure._setup`**
+  when neither `pp-setup` nor `pp-install` are on PATH yet. This fixes the
+  "package installed but wizard didn't auto-launch" silent skip seen on
+  brand-new `uv tool install` runs (the bin dir was on PATH only in the
+  new shell, not the one running the bootstrap).
+- **Fix `re.error: bad escape \U`** in `pp-setup` (formerly `pp-install`)
+  on Windows. `re.sub`'s replacement arg interprets backslash sequences;
+  Windows paths like `C:\Users\...` contain `\U` and crashed the
+  shell-profile-rewrite step on re-run. Now uses a lambda so the block
+  is substituted literally.
+
 ## v0.6.0
 
 - **Smart verbs collapse the slash-command call graph.** `/pp-chat:send`,

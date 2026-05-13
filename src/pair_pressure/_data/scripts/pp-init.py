@@ -199,7 +199,7 @@ def main() -> None:
     print()
     print("Then on each dev machine:")
     print(f"  git clone <url> ~/code/{target.name}")
-    print("  pp-install  # sets PAIR_PRESSURE_REPO/AUTHOR/SERVER")
+    print("  pp-setup    # sets PAIR_PRESSURE_REPO/AUTHOR/SERVER")
 
 
 if __name__ == "__main__":
