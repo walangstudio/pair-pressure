@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -118,6 +119,11 @@ def _registry_save(data):
 
 STATE_SCHEMA_VERSION = 1
 
+# Machine-global, NON-git-tracked home for local config + watcher state.
+# (active.json deliberately lives inside the chat repo for cross-session
+# sharing; offline toggle / watcher state must NOT — they are per-machine.)
+_PP_HOME = Path.home() / ".pair-pressure"
+
 
 def _session_id():
     sid = os.environ.get("PAIR_PRESSURE_SESSION_ID")
@@ -170,9 +176,57 @@ def _state_save(server=None, channel=None, thread_id=None, source=None):
             continue
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            merged = dict(payload)
+            existing = _state_load_one(path) or {}
+            if "task_index" in existing:  # survive routine state writes
+                merged["task_index"] = existing["task_index"]
+            path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
         except OSError:
             continue
+
+
+# ---- machine-global config (offline toggle, watcher prefs) ----
+
+def _config_path():
+    return _PP_HOME / "config.json"
+
+
+def _config_load():
+    """Tolerant read of ~/.pair-pressure/config.json. Never raises; a missing
+    or malformed file just yields {}. Mirrors _state_load_one's contract so
+    pre-configuration callers (status, offline) stay safe."""
+    p = _config_path()
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _config_save(patch):
+    """Best-effort merge-write of config.json. Never raises -- callers must
+    not die on a config-write failure (same contract as _state_save)."""
+    data = _config_load()
+    data.update(patch)
+    data.setdefault("schema_version", 1)
+    try:
+        p = _config_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return data
+
+
+def _offline():
+    """True when offline mode is on. PAIR_PRESSURE_OFFLINE env (1/true/yes/on)
+    overrides the saved config; default is online."""
+    ev = os.environ.get("PAIR_PRESSURE_OFFLINE")
+    if ev is not None and ev.strip() != "":
+        return ev.strip().lower() in ("1", "true", "yes", "on")
+    return bool(_config_load().get("offline", False))
 
 
 def _default_channel():
@@ -257,6 +311,9 @@ def worktree_path(server):
     if wt.exists() and (wt / ".git").exists():
         return wt
     branch = _server_branch(server)
+    if _offline():
+        die(f"server '{server}' worktree is not materialized and offline "
+            f"mode is on. Run `pp offline false`, then retry.")
     git("fetch", "origin", branch, cwd=main, check=False)
     wt.parent.mkdir(parents=True, exist_ok=True)
     if _origin_branch_exists(branch, cwd=main):
@@ -416,6 +473,11 @@ def git(*args, cwd=None, check=True):
 
 
 def has_remote():
+    # Offline mode is the single lever: with no "remote", maybe_pull() and
+    # push_with_retry() degrade to local-only by construction, while
+    # _commit_all() (remote-independent) keeps committing.
+    if _offline():
+        return False
     res = git("remote", check=False)
     return bool(res.stdout.strip())
 
@@ -611,6 +673,11 @@ def _maybe_activate_server(args):
 
 def cmd_pull(args):
     _maybe_activate_server(args)
+    if _offline():
+        out({"updated": False, "offline": True,
+             "head": git("rev-parse", "HEAD", check=False).stdout.strip(),
+             "note": "offline mode on; skipped fetch/pull"})
+        return
     if not has_remote():
         out({"updated": False, "head": git("rev-parse", "HEAD", check=False).stdout.strip(), "note": "no remote configured"})
         return
@@ -639,6 +706,11 @@ def cmd_pull(args):
 
 def cmd_push(args):
     _maybe_activate_server(args)
+    if _offline():
+        out({"pushed": False, "offline": True,
+             "note": "offline mode on; commit(s) kept locally, will sync "
+                     "when online"})
+        return
     if not has_remote():
         out({"pushed": False, "note": "no remote configured"})
         return
@@ -1904,6 +1976,224 @@ def cmd_task_done(args):
          "thread_id": args.thread})
 
 
+# ---- indexed task verbs (#n resolves against the last `pp task list`) ----
+
+def _task_index_save(server, items):
+    """Persist the #n -> (channel, thread_id) map into both state files,
+    preserving the routine server/channel/thread fields. Best-effort."""
+    block = {"server": server, "built_at": now_iso(), "items": items}
+    for path in (_state_path_session(), _state_path_global()):
+        if path is None:
+            continue
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = _state_load_one(path) or {}
+            data["task_index"] = block
+            path.write_text(json.dumps(data, indent=2) + "\n",
+                            encoding="utf-8")
+        except OSError:
+            continue
+
+
+def _task_index_load():
+    """Session-first, then global (mirrors _state_load precedence)."""
+    if _session_id():
+        sess = _state_load_one(_state_path_session())
+        if sess and isinstance(sess.get("task_index"), dict):
+            return sess["task_index"]
+    glob = _state_load_one(_state_path_global())
+    if glob and isinstance(glob.get("task_index"), dict):
+        return glob["task_index"]
+    return {}
+
+
+def _find_thread_channel(tid):
+    """Channel dir containing thread id `tid`, or None."""
+    ch_root = repo_path() / "channels"
+    if not ch_root.is_dir():
+        return None
+    for ch_dir in sorted(p for p in ch_root.iterdir() if p.is_dir()):
+        if (ch_dir / tid).is_dir():
+            return ch_dir.name
+    return None
+
+
+def _resolve_task_ref(args, ref):
+    """Resolve `#n` / thread-id / fuzzy-title to (channel, thread_id).
+
+    Returns the tuple, or None after emitting an ambiguous/no-match payload
+    (caller must `return`). Hard index errors die() with remediation."""
+    ref = (ref or "").strip()
+    if re.match(r"^#?\d+$", ref):
+        n = ref.lstrip("#")
+        idx = _task_index_load()
+        if not idx:
+            die("no task index yet; run `pp task list` first")
+        if idx.get("server") != args.server:
+            die(f"task index is for server '{idx.get('server')}', not "
+                f"'{args.server}'; run `pp task list` again")
+        it = (idx.get("items") or {}).get(str(n))
+        if not it:
+            die(f"no task #{n} in the current index; run `pp task list`")
+        return it["channel"], it["thread_id"]
+    if re.match(r"\d{4}-\d{2}-\d{2}_.*", ref):
+        ch = _find_thread_channel(ref)
+        if not ch:
+            out({"ok": False, "error": f"thread id '{ref}' not found"})
+            return None
+        return ch, ref
+    # Fuzzy substring over kind=task threads.
+    q = ref.lower()
+    ch_root = repo_path() / "channels"
+    hits = []
+    if ch_root.is_dir():
+        for ch_dir in sorted(p for p in ch_root.iterdir() if p.is_dir()):
+            for tdir in ch_dir.iterdir():
+                if not tdir.is_dir():
+                    continue
+                meta = read_json(tdir / "meta.json", {})
+                if meta.get("kind") != "task":
+                    continue
+                title = (meta.get("title") or "").lower()
+                if q in tdir.name.lower() or q in title:
+                    hits.append((ch_dir.name, tdir.name,
+                                 meta.get("title", tdir.name)))
+    if len(hits) == 1:
+        return hits[0][0], hits[0][1]
+    if len(hits) > 1:
+        out({"ok": False, "ambiguous": [
+            {"channel": c, "thread_id": t, "title": ti} for c, t, ti in hits[:20]
+        ]})
+        return None
+    out({"ok": False, "error": f"no task matched '{ref}'"})
+    return None
+
+
+def cmd_task_list(args):
+    resolve_active(args)
+    _activate_server(args)
+    if not getattr(args, "no_pull", False):
+        maybe_pull()
+    ch_root = repo_path() / "channels"
+    rows = []
+    if ch_root.is_dir():
+        for ch_dir in sorted(p for p in ch_root.iterdir() if p.is_dir()):
+            for tdir in ch_dir.iterdir():
+                if not tdir.is_dir():
+                    continue
+                meta = read_json(tdir / "meta.json", {})
+                if meta.get("kind") != "task":
+                    continue
+                posts = _post_files(tdir)
+                rows.append({
+                    "channel": ch_dir.name,
+                    "thread_id": tdir.name,
+                    "title": meta.get("title", tdir.name),
+                    "status": meta.get("status", "unclaimed"),
+                    "assignee": meta.get("assignee"),
+                    "last_id": _stem_id(posts[-1]) if posts else "",
+                    "updated": datetime.fromtimestamp(
+                        tdir.stat().st_mtime, tz=timezone.utc
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                })
+    rows.sort(key=lambda r: r["last_id"], reverse=True)
+    items, tasks = {}, []
+    for i, r in enumerate(rows, 1):
+        items[str(i)] = {"channel": r["channel"], "thread_id": r["thread_id"],
+                         "title": r["title"], "status": r["status"]}
+        tasks.append({"n": i, **r})
+    _task_index_save(args.server, items)
+    out({"ok": True, "server": args.server, "count": len(tasks),
+         "tasks": tasks})
+
+
+def cmd_task_claim(args):
+    resolve_active(args)
+    _activate_server(args)
+    res = _resolve_task_ref(args, args.ref)
+    if res is None:
+        return
+    ch, tid = res
+    cl = argparse.Namespace(server=args.server, channel=ch, thread=tid,
+                            via=getattr(args, "via", "claude-code"))
+    payload = _capture(cmd_claim, cl) or {}
+    _state_save(server=args.server, channel=ch, thread_id=tid,
+                source="task_claim")
+    out({**payload, "server": args.server, "channel": ch, "thread_id": tid})
+
+
+def cmd_task_update(args):
+    resolve_active(args)
+    _activate_server(args)
+    res = _resolve_task_ref(args, args.ref)
+    if res is None:
+        return
+    ch, tid = res
+    st = args.status
+    if st == "claimed":
+        ns = argparse.Namespace(server=args.server, channel=ch, thread=tid,
+                                via=getattr(args, "via", "claude-code"))
+        payload = _capture(cmd_claim, ns) or {}
+    elif st == "in_progress":
+        ns = argparse.Namespace(server=args.server, channel=ch, thread=tid)
+        payload = _capture(cmd_start, ns) or {}
+    elif st == "done":
+        ns = argparse.Namespace(server=args.server, channel=ch, thread=tid,
+                                summary=getattr(args, "summary", None))
+        payload = _capture(cmd_complete, ns) or {}
+    else:  # abandoned
+        ns = argparse.Namespace(server=args.server, channel=ch, thread=tid,
+                                reason=getattr(args, "reason", None),
+                                force=False)
+        payload = _capture(cmd_abandon, ns) or {}
+    _state_save(server=args.server, channel=ch, thread_id=tid,
+                source="task_update")
+    out({**payload, "server": args.server, "channel": ch, "thread_id": tid})
+
+
+def cmd_task_show(args):
+    resolve_active(args)
+    _activate_server(args)
+    res = _resolve_task_ref(args, args.ref)
+    if res is None:
+        return
+    ch, tid = res
+    ns = argparse.Namespace(server=args.server, channel=ch, thread=tid,
+                            since=0, no_pull=True)
+    payload = _capture(cmd_read_thread, ns) or {}
+    _state_save(server=args.server, channel=ch, thread_id=tid,
+                source="task_show")
+    out({"view": "thread", "server": args.server, "channel": ch,
+         "thread_id": tid, **payload})
+
+
+def cmd_task_handoff(args):
+    resolve_active(args)
+    _activate_server(args)
+    res = _resolve_task_ref(args, args.ref)
+    if res is None:
+        return
+    ch, tid = res
+    ns = argparse.Namespace(server=args.server, channel=ch, thread=tid,
+                            to=args.to)
+    payload = _capture(cmd_handoff, ns) or {}
+    out({**payload, "server": args.server, "channel": ch, "thread_id": tid})
+
+
+def cmd_task_abandon(args):
+    resolve_active(args)
+    _activate_server(args)
+    res = _resolve_task_ref(args, args.ref)
+    if res is None:
+        return
+    ch, tid = res
+    ns = argparse.Namespace(server=args.server, channel=ch, thread=tid,
+                            reason=getattr(args, "reason", None),
+                            force=getattr(args, "force", False))
+    payload = _capture(cmd_abandon, ns) or {}
+    out({**payload, "server": args.server, "channel": ch, "thread_id": tid})
+
+
 def _read_saved_env():
     """Walk both Claude Code settings files for saved PAIR_PRESSURE_* values.
 
@@ -1936,6 +2226,35 @@ def _read_saved_env():
             if k in env_block and k not in saved:
                 saved[k] = env_block[k]
     return saved
+
+
+def cmd_offline(args):
+    """Show or set offline mode. Offline = skip fetch/pull/push; commits stay
+    local and sync on the next online verb. Persisted machine-globally in
+    ~/.pair-pressure/config.json; PAIR_PRESSURE_OFFLINE env overrides it."""
+    ev = os.environ.get("PAIR_PRESSURE_OFFLINE")
+    cfg = _config_load().get("offline", None)
+    state = getattr(args, "state", None)
+    if state is None:
+        if ev is not None and ev.strip() != "":
+            source = "env"
+        elif cfg is not None:
+            source = "config"
+        else:
+            source = "default"
+        out({"offline": _offline(), "source": source,
+             "env": ev, "config": cfg})
+        return
+    want = state == "true"
+    _config_save({"offline": want})
+    payload = {"offline": want, "saved": True,
+               "note": ("offline: commits stay local, no fetch/pull/push"
+                        if want else
+                        "online: verbs sync normally again")}
+    if ev is not None and ev.strip() != "":
+        payload["warning"] = ("PAIR_PRESSURE_OFFLINE env override is set and "
+                              "still wins until you unset it")
+    out(payload)
 
 
 def cmd_status(args):
@@ -2021,6 +2340,11 @@ def cmd_status(args):
         "servers": servers_list,
         "active_server": active_server,
         "current": current,
+        "offline": {
+            "active": _offline(),
+            "config": _config_load().get("offline", False),
+            "env": os.environ.get("PAIR_PRESSURE_OFFLINE"),
+        },
     })
 
 
@@ -2545,6 +2869,451 @@ def cmd_server_remove(args):
     out(push_with_retry(write_payload, msg))
 
 
+# ---- watcher daemon (zero-token background new-message notifier) ----
+
+def _watch_pid_path():       return _PP_HOME / "watch.pid"
+def _watch_lock_path():      return _PP_HOME / "watch.lock"
+def _watch_state_path():     return _PP_HOME / "watch-state.json"
+def _watch_log_path():       return _PP_HOME / "watch.log"
+def _watch_notify_path():    return _PP_HOME / "watch-last-notify.json"
+
+_WATCH_LOG_CAP = 256 * 1024
+
+
+def _watch_log(line):
+    try:
+        _PP_HOME.mkdir(parents=True, exist_ok=True)
+        lp = _watch_log_path()
+        if lp.exists() and lp.stat().st_size > _WATCH_LOG_CAP:
+            tail = lp.read_text(encoding="utf-8", errors="replace")[-_WATCH_LOG_CAP // 2:]
+            lp.write_text(tail, encoding="utf-8")
+        with lp.open("a", encoding="utf-8") as fh:
+            fh.write(f"{now_iso()} {line}\n")
+    except OSError:
+        pass
+
+
+def _pid_alive(pid):
+    """True iff `pid` is a running process. Windows-safe: never uses
+    os.kill(pid,0) (which TerminateProcess-es on Windows)."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not h:
+                return False
+            try:
+                code = wintypes.DWORD()
+                if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return False
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                k.CloseHandle(h)
+        except Exception:
+            try:
+                r = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, timeout=10)
+                return str(pid) in r.stdout
+            except Exception:
+                return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _read_watch_pid():
+    try:
+        d = json.loads(_watch_pid_path().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _watch_running():
+    d = _read_watch_pid()
+    if not d:
+        return None
+    return d if _pid_alive(d.get("pid")) else None
+
+
+def _watch_interp():
+    """pythonw.exe (no console flash) if present, else the current python."""
+    exe = Path(sys.executable)
+    if os.name == "nt":
+        cand = exe.with_name("pythonw.exe")
+        if cand.exists():
+            return str(cand)
+    return str(exe)
+
+
+def _spawn_watch_daemon():
+    _PP_HOME.mkdir(parents=True, exist_ok=True)
+    script = str(Path(__file__).resolve())
+    cmd = [_watch_interp(), script, "_watch-daemon"]
+    flags = 0
+    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+        flags |= getattr(subprocess, name, 0)
+    env = dict(os.environ)
+    env["PAIR_PRESSURE_IS_WATCH_DAEMON"] = "1"
+    logf = open(_watch_log_path(), "a", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+            close_fds=True, creationflags=flags, env=env,
+            cwd=str(_PP_HOME))
+    finally:
+        logf.close()
+    try:
+        _watch_pid_path().write_text(json.dumps({
+            "pid": proc.pid, "started_at": now_iso(),
+            "python": _watch_interp(),
+        }), encoding="utf-8")
+    except OSError:
+        pass
+    _watch_log(f"daemon spawned pid={proc.pid}")
+    return proc.pid
+
+
+def _ensure_watcher(args):
+    """Auto-start hook. Called once per `pp` invocation. Hot path is two tiny
+    file reads + one liveness check -- no git, no network, no subprocess.
+    Wrapped by the caller so a watcher bug can never break a normal `pp`."""
+    cmd = getattr(args, "cmd", None)
+    if cmd in ("_watch-daemon", "watch", "offline"):
+        return
+    if os.environ.get("PAIR_PRESSURE_IS_WATCH_DAEMON") == "1":
+        return
+    if not os.environ.get("PAIR_PRESSURE_REPO"):
+        return
+    cfg = _config_load()
+    wcfg = cfg.get("watch") if isinstance(cfg.get("watch"), dict) else {}
+    if wcfg.get("enabled", True) is False:
+        return
+    if _watch_running():
+        return
+    lock = _watch_lock_path()
+    try:
+        if lock.exists() and (time.time() - lock.stat().st_mtime) > 30:
+            lock.unlink(missing_ok=True)  # stale lock, ignore
+    except OSError:
+        pass
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return  # another pp is mid-spawn
+    except OSError:
+        return
+    try:
+        if _watch_running():
+            return
+        _spawn_watch_daemon()
+    finally:
+        os.close(fd)
+        try:
+            lock.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _notify(title, message):
+    """Native Windows toast (in-box WinRT via PowerShell, no module install)
+    + durable fallback (watch.log line + sentinel json). Returns True if the
+    toast call exited 0."""
+    payload = {"at": now_iso(), "title": title, "message": message}
+    try:
+        _watch_notify_path().write_text(json.dumps(payload, indent=2),
+                                        encoding="utf-8")
+    except OSError:
+        pass
+    _watch_log(f"notify: {title} | {message}")
+    if os.name != "nt":
+        return False
+    aumid = (r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}"
+             r"\WindowsPowerShell\v1.0\powershell.exe")
+
+    def _esc(s):
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "[Windows.UI.Notifications.ToastNotificationManager,"
+        "Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;"
+        "[Windows.UI.Notifications.ToastNotification,"
+        "Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;"
+        "[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,"
+        "ContentType=WindowsRuntime]>$null;"
+        "$t=[Windows.UI.Notifications.ToastNotificationManager]::"
+        "GetTemplateContent("
+        "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+        "$x=$t.GetElementsByTagName('text');"
+        f"$x.Item(0).AppendChild($t.CreateTextNode('{_esc(title)}'))>$null;"
+        f"$x.Item(1).AppendChild($t.CreateTextNode('{_esc(message)}'))>$null;"
+        "$n=[Windows.UI.Notifications.ToastNotification]::new($t);"
+        "[Windows.UI.Notifications.ToastNotificationManager]::"
+        f"CreateToastNotifier('{aumid}').Show($n);"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            _watch_log(f"toast_failed rc={r.returncode} {r.stderr.strip()[:200]}")
+            return False
+        return True
+    except Exception as e:
+        _watch_log(f"toast_failed {e!r}")
+        return False
+
+
+def _watch_state_load():
+    try:
+        d = json.loads(_watch_state_path().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _watch_state_save(state):
+    try:
+        _PP_HOME.mkdir(parents=True, exist_ok=True)
+        _watch_state_path().write_text(json.dumps(state, indent=2),
+                                       encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _scan_server_new(server, state):
+    """Return list of {channel,thread,post_id,author} for posts newer than the
+    per-key marker, not authored by us. Advances `state` markers in place.
+    Online: fetch + diff origin/<branch> (working tree untouched). Offline:
+    scan working-tree files."""
+    global _CURRENT_REPO
+    me = os.environ.get("PAIR_PRESSURE_AUTHOR")
+    main = _main_repo_path()
+    wt = main / ".pp-worktrees" / server
+    if not (wt.exists() and (wt / ".git").exists()):
+        return []  # never materialize from the daemon (would block on net)
+    _CURRENT_REPO = wt
+    branch = _server_branch(server)
+    posts = []  # (channel, thread, post_id, reader)
+    ref = None
+    if not _offline():
+        git("fetch", "origin", branch, check=False)
+        if _origin_branch_exists(branch):
+            ref = f"origin/{branch}"
+    if ref:
+        r = git("ls-tree", "-r", "--name-only", ref, check=False)
+        names = r.stdout.splitlines() if r.returncode == 0 else []
+        for path in names:
+            m = re.match(r"channels/([^/]+)/([^/]+)/([^/]+)-(seed|reply)\.md$",
+                         path)
+            if not m:
+                continue
+            ch, thr, stem = m.group(1), m.group(2), m.group(3)
+            posts.append((ch, thr, stem, ("git", ref, path)))
+    else:
+        ch_root = wt / "channels"
+        if ch_root.is_dir():
+            for ch_dir in ch_root.iterdir():
+                if not ch_dir.is_dir():
+                    continue
+                for tdir in ch_dir.iterdir():
+                    if not tdir.is_dir():
+                        continue
+                    for pf in _post_files(tdir):
+                        posts.append((ch_dir.name, tdir.name, _stem_id(pf),
+                                      ("file", pf)))
+    by_key = {}
+    for ch, thr, stem, reader in posts:
+        by_key.setdefault((ch, thr), []).append((stem, reader))
+    new = []
+    for (ch, thr), items in by_key.items():
+        items.sort(key=lambda x: x[0])
+        key = f"{server}/{ch}/{thr}"
+        marker = state.get(key)
+        cur_max = items[-1][0]
+        if marker is None:
+            state[key] = cur_max  # baseline on first sight, no backlog flood
+            continue
+        for stem, reader in items:
+            if stem <= marker:
+                continue
+            try:
+                if reader[0] == "git":
+                    _, rref, rpath = reader
+                    sr = git("show", f"{rref}:{rpath}", check=False)
+                    text = sr.stdout if sr.returncode == 0 else ""
+                else:
+                    text = reader[1].read_text(encoding="utf-8",
+                                               errors="replace")
+                fm, _ = parse_post(text)
+                au = fm.get("author")
+            except Exception:
+                au = None
+            if au and au != me:
+                new.append({"server": server, "channel": ch, "thread": thr,
+                            "post_id": stem, "author": au})
+        state[key] = max(cur_max, marker)
+    _CURRENT_REPO = None
+    return new
+
+
+def cmd_watch_daemon(args):
+    os.environ["PAIR_PRESSURE_IS_WATCH_DAEMON"] = "1"
+    pid_path = _watch_pid_path()
+
+    def _cleanup(*_a):
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        sys.exit(0)
+
+    import atexit
+    import signal as _sig
+    atexit.register(lambda: pid_path.unlink(missing_ok=True))
+    for sn in ("SIGTERM", "SIGBREAK", "SIGINT"):
+        s = getattr(_sig, sn, None)
+        if s is not None:
+            try:
+                _sig.signal(s, _cleanup)
+            except (ValueError, OSError):
+                pass
+    try:
+        interval = int(os.environ.get("PAIR_PRESSURE_WATCH_INTERVAL", "20"))
+    except ValueError:
+        interval = 20
+    interval = max(5, interval)
+    _watch_log(f"daemon loop start interval={interval}s offline={_offline()}")
+    while True:
+        try:
+            cfg = _config_load()
+            wcfg = cfg.get("watch") if isinstance(cfg.get("watch"), dict) else {}
+            if wcfg.get("enabled", True) is False:
+                _watch_log("watch disabled in config; exiting")
+                _cleanup()
+            state = _watch_state_load()
+            fresh = []
+            try:
+                servers = [s.get("name")
+                           for s in _registry_load().get("servers", [])]
+            except SystemExit:
+                servers = []
+            for srv in servers:
+                if not srv:
+                    continue
+                try:
+                    fresh.extend(_scan_server_new(srv, state))
+                except Exception as e:
+                    _watch_log(f"scan error server={srv}: {e!r}")
+            _watch_state_save(state)
+            if fresh:
+                n = len(fresh)
+                last = fresh[-1]
+                where = f"#{last['channel']}"
+                if n == 1:
+                    title = f"pair-pressure: new message in {where}"
+                    msg = f"{last['author']} posted in {last['thread']}"
+                else:
+                    title = f"pair-pressure: {n} new messages"
+                    msg = (f"latest: {last['author']} in {where} "
+                           f"({last['thread']})")
+                _notify(title, msg)
+        except Exception as e:
+            _watch_log(f"loop error: {e!r}")
+        time.sleep(interval)
+
+
+def cmd_watch(args):
+    sub = getattr(args, "watch_cmd", None)
+    if sub == "start":
+        running = _watch_running()
+        if running:
+            out({"running": True, "pid": running.get("pid"),
+                 "note": "already running"})
+            return
+        if getattr(args, "foreground", False):
+            cmd_watch_daemon(args)
+            return
+        pid = _spawn_watch_daemon()
+        out({"running": True, "pid": pid, "started": True})
+        return
+    if sub == "stop":
+        d = _read_watch_pid()
+        pid = d.get("pid") if d else None
+        if not pid or not _pid_alive(pid):
+            try:
+                _watch_pid_path().unlink(missing_ok=True)
+            except OSError:
+                pass
+            out({"stopped": False, "note": "not running"})
+            return
+        killed = False
+        try:
+            if os.name == "nt":
+                r = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F", "/T"],
+                    capture_output=True, text=True, timeout=10)
+                killed = r.returncode == 0
+            else:
+                import signal as _sig
+                os.kill(int(pid), _sig.SIGTERM)
+                killed = True
+        except Exception as e:
+            _watch_log(f"stop error: {e!r}")
+        for f in (_watch_pid_path(), _watch_lock_path()):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        out({"stopped": killed, "pid": pid})
+        return
+    # status (default)
+    d = _read_watch_pid() or {}
+    running = bool(_watch_running())
+    log_tail = ""
+    try:
+        lp = _watch_log_path()
+        if lp.exists():
+            log_tail = "\n".join(
+                lp.read_text(encoding="utf-8", errors="replace")
+                .splitlines()[-10:])
+    except OSError:
+        pass
+    last_notify = None
+    try:
+        last_notify = json.loads(
+            _watch_notify_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        interval = int(os.environ.get("PAIR_PRESSURE_WATCH_INTERVAL", "20"))
+    except ValueError:
+        interval = 20
+    out({
+        "running": running,
+        "pid": d.get("pid"),
+        "started_at": d.get("started_at"),
+        "interval": interval,
+        "offline": _offline(),
+        "last_notify": last_notify,
+        "watch_state_keys": len(_watch_state_load()),
+        "log_tail": log_tail,
+    })
+
+
 def main():
     p = argparse.ArgumentParser(prog="pp", description="pair-pressure CLI")
     p.add_argument("--version", action="version", version=f"pair-pressure {__version__}")
@@ -2699,6 +3468,13 @@ def main():
                         help="show saved vs active env vars; works without configuration")
     sp.set_defaults(func=cmd_status)
 
+    sp = sub.add_parser("offline",
+                        help="show or set offline mode (skip fetch/pull/push; "
+                             "commits stay local)")
+    sp.add_argument("state", nargs="?", default=None,
+                    choices=["true", "false"])
+    sp.set_defaults(func=cmd_offline)
+
     sp = sub.add_parser("search", help="grep posts; filter by channel/kind/status/assignee/author/stance")
     sp.add_argument("--query", required=True)
     sp.add_argument("--channel", default=None)
@@ -2782,8 +3558,55 @@ def main():
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_read)
 
-    sp_task = sub.add_parser("task", help="task lifecycle (smart)")
+    sp_task = sub.add_parser("task", help="task lifecycle (smart, indexed)")
     sub_task = sp_task.add_subparsers(dest="task_cmd", required=True)
+
+    sp = sub_task.add_parser("list",
+                             help="number all task threads on the active "
+                                  "server (newest first; incl. done)")
+    sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_task_list)
+
+    sp = sub_task.add_parser("claim",
+                             help="claim a task by #n / id / title")
+    sp.add_argument("ref")
+    sp.add_argument("--via", default="claude-code")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_task_claim)
+
+    sp = sub_task.add_parser("update",
+                             help="set task state by #n / id / title")
+    sp.add_argument("ref")
+    sp.add_argument("status",
+                    choices=["claimed", "in_progress", "done", "abandoned"])
+    sp.add_argument("--summary", default=None)
+    sp.add_argument("--reason", default=None)
+    sp.add_argument("--via", default="claude-code")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_task_update)
+
+    sp = sub_task.add_parser("show",
+                             help="open a task by #n / id / title")
+    sp.add_argument("ref")
+    sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_task_show)
+
+    sp = sub_task.add_parser("handoff",
+                             help="reassign a task by #n / id / title")
+    sp.add_argument("ref")
+    sp.add_argument("to")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_task_handoff)
+
+    sp = sub_task.add_parser("abandon",
+                             help="release a task claim by #n / id / title")
+    sp.add_argument("ref")
+    sp.add_argument("--reason", default=None)
+    sp.add_argument("--force", action="store_true")
+    _add_server_arg(sp)
+    sp.set_defaults(func=cmd_task_abandon)
 
     sp = sub_task.add_parser("new",
                              help="create a task thread (auto-resolves channel; "
@@ -2816,6 +3639,23 @@ def main():
                     help="override resolved thread id")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_task_done)
+
+    sp_watch = sub.add_parser("watch",
+                              help="background new-message notifier "
+                                   "(auto-starts; manual control here)")
+    sub_watch = sp_watch.add_subparsers(dest="watch_cmd", required=False)
+    sp = sub_watch.add_parser("start", help="spawn the daemon if not running")
+    sp.add_argument("--foreground", action="store_true",
+                    help="run the poll loop inline (debug)")
+    sp.set_defaults(func=cmd_watch)
+    sub_watch.add_parser("stop", help="stop the daemon") \
+        .set_defaults(func=cmd_watch)
+    sub_watch.add_parser("status", help="show daemon status (default)") \
+        .set_defaults(func=cmd_watch)
+    sp_watch.set_defaults(func=cmd_watch, watch_cmd=None)
+
+    sp = sub.add_parser("_watch-daemon")  # hidden: the poll loop entrypoint
+    sp.set_defaults(func=cmd_watch_daemon)
 
     sp_channel = sub.add_parser("channel", help="channel management")
     sub_channel = sp_channel.add_subparsers(dest="channel_cmd", required=True)
@@ -2857,6 +3697,10 @@ def main():
     sp.set_defaults(func=cmd_server_remove)
 
     args = p.parse_args()
+    try:
+        _ensure_watcher(args)
+    except Exception:
+        pass  # a watcher bug must never break a normal pp call
     try:
         args.func(args)
     except subprocess.CalledProcessError as e:
