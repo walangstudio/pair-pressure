@@ -312,15 +312,24 @@ def worktree_path(server):
         return wt
     branch = _server_branch(server)
     if _offline():
-        # Offline never touches the remote: no fetch, no origin/<branch>
-        # probe. Materialize straight from the LOCAL server branch.
+        # Offline does no network: skip the fetch only. Materialize from
+        # whatever is ALREADY in the local object store -- the local
+        # branch, else the cached origin/<branch> ref left by the clone /
+        # prior fetch during setup. _origin_branch_exists is a local
+        # rev-parse, NOT a network call. This makes a repo cloned from a
+        # remote at setup fully usable offline, and the reverse (toggling
+        # offline off) just restores the fetch path below unchanged.
         wt.parent.mkdir(parents=True, exist_ok=True)
         if _local_branch_exists(branch, cwd=main):
             git("worktree", "add", str(wt), branch, cwd=main)
             return wt
-        die(f"server '{server}' has no local branch {branch} and offline "
-            f"mode is on. Run `pp offline false` to fetch it, or "
-            f"`pp server new {server}` while online.")
+        if _origin_branch_exists(branch, cwd=main):
+            git("worktree", "add", str(wt), f"origin/{branch}", cwd=main)
+            git("checkout", "-B", branch, f"origin/{branch}", cwd=wt)
+            return wt
+        die(f"server '{server}' has no local branch {branch} and no cached "
+            f"origin/{branch}; offline mode is on. Run `pp offline false` "
+            f"to fetch it, or `pp server new {server}` while online.")
     git("fetch", "origin", branch, cwd=main, check=False)
     wt.parent.mkdir(parents=True, exist_ok=True)
     if _origin_branch_exists(branch, cwd=main):
@@ -861,6 +870,7 @@ def cmd_list_threads(args):
 
 
 def cmd_read_thread(args):
+    _watch_ack()  # reading clears the unread badge (additive, best-effort)
     _activate_server(args)
     if not args.no_pull:
         maybe_pull()
@@ -1818,6 +1828,7 @@ def cmd_read(args):
     """Smart read: no target → feed; exact channel name → channel feed;
     otherwise fuzzy thread match → read-thread + update state. Ambiguous
     matches surface for caller-side disambiguation rather than guessing."""
+    _watch_ack()  # reading clears the unread badge (additive, best-effort)
     # We only need server resolution here; channel comes from target or state.
     sess, glob = _state_load()
     server_arg = getattr(args, "server", None)
@@ -2524,6 +2535,7 @@ def cmd_feed(args):
     after the given ISO timestamp. Body is truncated to 240 chars per post
     for feed scanability.
     """
+    _watch_ack()  # reading clears the unread badge (additive, best-effort)
     _activate_server(args)
     if not args.no_pull:
         maybe_pull()
@@ -2891,8 +2903,86 @@ def _watch_lock_path():      return _PP_HOME / "watch.lock"
 def _watch_state_path():     return _PP_HOME / "watch-state.json"
 def _watch_log_path():       return _PP_HOME / "watch.log"
 def _watch_notify_path():    return _PP_HOME / "watch-last-notify.json"
+def _watch_unread_path():    return _PP_HOME / "unread.json"
 
 _WATCH_LOG_CAP = 256 * 1024
+
+
+def _watch_unread_load():
+    try:
+        d = json.loads(_watch_unread_path().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _watch_unread_bump(fresh):
+    """Accumulate unread across ticks. `fresh` is the per-tick list of new
+    posts by others. Best-effort; never raises."""
+    if not fresh:
+        return
+    try:
+        d = _watch_unread_load()
+        last = fresh[-1]
+        d = {
+            "count": int(d.get("count", 0) or 0) + len(fresh),
+            "latest": {"author": last["author"], "channel": last["channel"],
+                       "thread": last["thread"], "at": now_iso()},
+            "updated_at": now_iso(),
+        }
+        _PP_HOME.mkdir(parents=True, exist_ok=True)
+        _watch_unread_path().write_text(json.dumps(d, indent=2),
+                                        encoding="utf-8")
+    except (OSError, KeyError, TypeError):
+        pass
+
+
+def _watch_ack():
+    """Clear the unread counter. Best-effort; never raises. Called by the
+    read verbs and the prompt-nudge hook so the badge auto-clears."""
+    try:
+        _PP_HOME.mkdir(parents=True, exist_ok=True)
+        _watch_unread_path().write_text(
+            json.dumps({"count": 0, "latest": None,
+                        "updated_at": now_iso()}, indent=2),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+_WATCH_INTERVAL_MIN = 5
+_WATCH_INTERVAL_DEFAULT = 300  # 5 minutes
+
+
+def _parse_interval(v):
+    """Accept '90', '90s', '5m', '5min', '1h' -> seconds int, or None."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d+)\s*(s|sec|secs|m|min|mins|h|hr|hrs)?", s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2) or "s"
+    mult = 3600 if unit.startswith("h") else 60 if unit.startswith("m") else 1
+    return n * mult
+
+
+def _resolve_interval():
+    """Poll interval in seconds. Precedence (mirrors _offline): env
+    PAIR_PRESSURE_WATCH_INTERVAL > config watch.interval > default 300.
+    Clamped to >= 5s."""
+    source = "default"
+    secs = _WATCH_INTERVAL_DEFAULT
+    cfg = _config_load().get("watch")
+    if isinstance(cfg, dict) and _parse_interval(cfg.get("interval")) is not None:
+        secs, source = _parse_interval(cfg.get("interval")), "config"
+    ev = _parse_interval(os.environ.get("PAIR_PRESSURE_WATCH_INTERVAL"))
+    if ev is not None:
+        secs, source = ev, "env"
+    return max(_WATCH_INTERVAL_MIN, secs), source
 
 
 def _watch_log(line):
@@ -3206,16 +3296,14 @@ def cmd_watch_daemon(args):
                 _sig.signal(s, _cleanup)
             except (ValueError, OSError):
                 pass
-    try:
-        interval = int(os.environ.get("PAIR_PRESSURE_WATCH_INTERVAL", "20"))
-    except ValueError:
-        interval = 20
-    interval = max(5, interval)
+    interval, _isrc = _resolve_interval()
     _watch_log(f"daemon loop start interval={interval}s offline={_offline()}")
     while True:
         try:
             cfg = _config_load()
             wcfg = cfg.get("watch") if isinstance(cfg.get("watch"), dict) else {}
+            # Re-resolve each tick so `pp watch interval` takes effect live.
+            interval, _ = _resolve_interval()
             if wcfg.get("enabled", True) is False:
                 _watch_log("watch disabled in config; exiting")
                 _cleanup()
@@ -3246,9 +3334,150 @@ def cmd_watch_daemon(args):
                     msg = (f"latest: {last['author']} in {where} "
                            f"({last['thread']})")
                 _notify(title, msg)
+                _watch_unread_bump(fresh)
         except Exception as e:
             _watch_log(f"loop error: {e!r}")
         time.sleep(interval)
+
+
+def _skill_scripts_dir():
+    return Path(__file__).resolve().parent
+
+
+def _claude_settings_path():
+    return Path.home() / ".claude" / "settings.json"
+
+
+def _ps_invoke(ps1):
+    return (f'powershell -NoProfile -ExecutionPolicy Bypass -File '
+            f'"{ps1}"')
+
+
+def _watch_wire(undo=False, with_nudge=False):
+    """Idempotently wire (or --undo) the 0-token statusline badge and the
+    opt-in token-costing prompt nudge into ~/.claude/settings.json.
+
+    Backs up the file once (.pp.bak), preserves any existing statusLine
+    command and existing UserPromptSubmit hooks (e.g. mememo). The previous
+    statusLine command is stored so the wrapper can chain to it and --undo
+    can restore it exactly."""
+    sp = _claude_settings_path()
+    if not sp.exists():
+        die(f"{sp} not found")
+    try:
+        data = json.loads(sp.read_text(encoding="utf-8-sig") or "{}")
+    except json.JSONDecodeError as e:
+        die(f"settings.json is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        die("settings.json top level is not an object")
+
+    scripts = _skill_scripts_dir()
+    sl_ps1 = scripts / "pp-statusline.ps1"
+    nudge_ps1 = scripts / "pp-prompt-nudge.ps1"
+    sl_cmd = _ps_invoke(sl_ps1)
+    nudge_cmd = _ps_invoke(nudge_ps1)
+    prev_file = _PP_HOME / "statusline-prev.txt"
+
+    bak = sp.with_suffix(".json.pp.bak")
+    if not bak.exists():
+        try:
+            bak.write_text(sp.read_text(encoding="utf-8-sig"),
+                            encoding="utf-8")
+        except OSError:
+            pass
+
+    changed = []
+
+    def _strip_nudge(hooks_list):
+        out_l = []
+        for grp in hooks_list:
+            inner = grp.get("hooks", []) if isinstance(grp, dict) else []
+            inner2 = [h for h in inner
+                      if "pp-prompt-nudge" not in str(h.get("command", ""))]
+            if inner2:
+                out_l.append({**grp, "hooks": inner2}
+                             if isinstance(grp, dict) else grp)
+        return out_l
+
+    if undo:
+        sl = data.get("statusLine")
+        prev = data.pop("_pp_prev_statusline", None)
+        if isinstance(sl, dict) and "pp-statusline.ps1" in str(
+                sl.get("command", "")):
+            if prev is not None:
+                data["statusLine"] = {"type": "command", "command": prev}
+            else:
+                data.pop("statusLine", None)
+            changed.append("statusLine restored")
+        hk = data.get("hooks", {})
+        ups = hk.get("UserPromptSubmit")
+        if isinstance(ups, list):
+            new_ups = _strip_nudge(ups)
+            if new_ups != ups:
+                if new_ups:
+                    hk["UserPromptSubmit"] = new_ups
+                else:
+                    hk.pop("UserPromptSubmit", None)
+                changed.append("nudge hook removed")
+        try:
+            prev_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        sp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        out({"undone": True, "changed": changed, "backup": str(bak)})
+        return
+
+    # ---- wire (idempotent) ----
+    sl = data.get("statusLine")
+    already = isinstance(sl, dict) and "pp-statusline.ps1" in str(
+        sl.get("command", ""))
+    if not already:
+        prev = ""
+        if isinstance(sl, dict) and sl.get("command"):
+            prev = str(sl["command"])
+        data["_pp_prev_statusline"] = prev
+        try:
+            _PP_HOME.mkdir(parents=True, exist_ok=True)
+            prev_file.write_text(prev, encoding="utf-8")
+        except OSError:
+            pass
+        data["statusLine"] = {"type": "command", "command": sl_cmd}
+        changed.append("statusLine wrapped (badge, 0 tokens)")
+    else:
+        changed.append("statusLine already wired")
+
+    warning = None
+    if with_nudge:
+        hk = data.setdefault("hooks", {})
+        ups = hk.get("UserPromptSubmit")
+        if not isinstance(ups, list):
+            ups = []
+        has = any("pp-prompt-nudge" in str(h.get("command", ""))
+                  for grp in ups if isinstance(grp, dict)
+                  for h in grp.get("hooks", []))
+        if not has:
+            ups.append({"hooks": [{"type": "command",
+                                   "command": nudge_cmd}]})
+            hk["UserPromptSubmit"] = ups
+            changed.append("nudge hook appended (TOKEN COST)")
+        else:
+            changed.append("nudge hook already present")
+        warning = ("The prompt nudge injects ~15-25 tokens into the model "
+                   "on prompts where there are unread messages (once per "
+                   "batch, then auto-cleared). This DOES incur API/usage "
+                   "cost. The statusline badge alone is 0 tokens. Use "
+                   "`pp watch wire --undo` to remove, and `pp watch "
+                   "interval <Nm>` to slow polling.")
+
+    sp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    payload = {"wired": True, "changed": changed,
+               "statusline_cmd": sl_cmd, "backup": str(bak),
+               "nudge_enabled": bool(with_nudge),
+               "note": "restart Claude Code (or new session) to load the "
+                       "statusline/hook changes"}
+    if warning:
+        payload["cost_warning"] = warning
+    out(payload)
 
 
 def cmd_watch(args):
@@ -3295,6 +3524,48 @@ def cmd_watch(args):
                 pass
         out({"stopped": killed, "pid": pid})
         return
+    if sub == "unread":
+        d = _watch_unread_load()
+        count = int(d.get("count", 0) or 0)
+        if getattr(args, "format", "json") == "line":
+            # ASCII-only token for the statusline wrapper.
+            print(f"[pp:{count}]" if count > 0 else "")
+            return
+        out({"count": count, "latest": d.get("latest"),
+             "updated_at": d.get("updated_at")})
+        return
+    if sub == "ack":
+        _watch_ack()
+        out({"acked": True})
+        return
+    if sub == "interval":
+        val = getattr(args, "value", None)
+        if val is None:
+            secs, src = _resolve_interval()
+            out({"interval_seconds": secs, "source": src,
+                 "human": f"{secs // 60}m{secs % 60:02d}s"})
+            return
+        secs = _parse_interval(val)
+        if secs is None:
+            die("interval must be like 90, 90s, 5m, or 1h")
+        secs = max(_WATCH_INTERVAL_MIN, secs)
+        wcfg = _config_load().get("watch")
+        wcfg = wcfg if isinstance(wcfg, dict) else {}
+        wcfg["interval"] = secs
+        _config_save({"watch": wcfg})
+        note = ("takes effect within one poll cycle (daemon re-reads each "
+                "tick)")
+        ev = os.environ.get("PAIR_PRESSURE_WATCH_INTERVAL")
+        payload = {"interval_seconds": secs, "saved": True, "note": note}
+        if ev is not None and ev.strip() != "":
+            payload["warning"] = ("PAIR_PRESSURE_WATCH_INTERVAL env override "
+                                  "is set and still wins until unset")
+        out(payload)
+        return
+    if sub == "wire":
+        _watch_wire(undo=getattr(args, "undo", False),
+                    with_nudge=getattr(args, "nudge", False))
+        return
     # status (default)
     d = _read_watch_pid() or {}
     running = bool(_watch_running())
@@ -3313,17 +3584,17 @@ def cmd_watch(args):
             _watch_notify_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         pass
-    try:
-        interval = int(os.environ.get("PAIR_PRESSURE_WATCH_INTERVAL", "20"))
-    except ValueError:
-        interval = 20
+    interval, isrc = _resolve_interval()
+    unread = _watch_unread_load()
     out({
         "running": running,
         "pid": d.get("pid"),
         "started_at": d.get("started_at"),
         "interval": interval,
+        "interval_source": isrc,
         "offline": _offline(),
         "last_notify": last_notify,
+        "unread": int(unread.get("count", 0) or 0),
         "watch_state_keys": len(_watch_state_load()),
         "log_tail": log_tail,
     })
@@ -3667,6 +3938,26 @@ def main():
         .set_defaults(func=cmd_watch)
     sub_watch.add_parser("status", help="show daemon status (default)") \
         .set_defaults(func=cmd_watch)
+    sp = sub_watch.add_parser("unread",
+                              help="unread-message count (for statusline)")
+    sp.add_argument("--format", choices=["json", "line"], default="json")
+    sp.set_defaults(func=cmd_watch)
+    sub_watch.add_parser("ack", help="clear the unread counter") \
+        .set_defaults(func=cmd_watch)
+    sp = sub_watch.add_parser("interval",
+                              help="show or set poll interval "
+                                   "(e.g. 90, 90s, 5m, 1h)")
+    sp.add_argument("value", nargs="?", default=None)
+    sp.set_defaults(func=cmd_watch)
+    sp = sub_watch.add_parser("wire",
+                              help="integrate statusline badge (0 tokens) + "
+                                   "optional --nudge prompt hook into "
+                                   "~/.claude/settings.json (idempotent)")
+    sp.add_argument("--nudge", action="store_true",
+                    help="also add the in-prompt nudge (INCURS TOKEN COST)")
+    sp.add_argument("--undo", action="store_true",
+                    help="restore the original statusLine + remove the hook")
+    sp.set_defaults(func=cmd_watch)
     sp_watch.set_defaults(func=cmd_watch, watch_cmd=None)
 
     sp = sub.add_parser("_watch-daemon")  # hidden: the poll loop entrypoint
