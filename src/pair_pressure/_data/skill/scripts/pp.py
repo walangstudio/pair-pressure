@@ -312,8 +312,15 @@ def worktree_path(server):
         return wt
     branch = _server_branch(server)
     if _offline():
-        die(f"server '{server}' worktree is not materialized and offline "
-            f"mode is on. Run `pp offline false`, then retry.")
+        # Offline never touches the remote: no fetch, no origin/<branch>
+        # probe. Materialize straight from the LOCAL server branch.
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        if _local_branch_exists(branch, cwd=main):
+            git("worktree", "add", str(wt), branch, cwd=main)
+            return wt
+        die(f"server '{server}' has no local branch {branch} and offline "
+            f"mode is on. Run `pp offline false` to fetch it, or "
+            f"`pp server new {server}` while online.")
     git("fetch", "origin", branch, cwd=main, check=False)
     wt.parent.mkdir(parents=True, exist_ok=True)
     if _origin_branch_exists(branch, cwd=main):
@@ -1116,6 +1123,14 @@ def _commit_all(message):
     if not res.stdout.strip():
         return
     git("commit", "-m", message)
+
+
+def _local_branch_exists(branch, cwd=None):
+    """True iff refs/heads/<branch> exists locally. Used by offline worktree
+    materialization -- never consults the remote."""
+    res = git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+              cwd=cwd, check=False)
+    return res.returncode == 0
 
 
 def _origin_branch_exists(branch, cwd=None):
