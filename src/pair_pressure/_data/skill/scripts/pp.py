@@ -2957,44 +2957,89 @@ def _watch_unread_path():    return _PP_HOME / "unread.json"
 _WATCH_LOG_CAP = 256 * 1024
 
 
-def _watch_unread_load():
+_SHARED_BUCKET = "__shared__"
+
+
+def _watch_unread_key():
+    """Bucket key for the CURRENT session: PAIR_PRESSURE_SESSION_ID if set,
+    else `__shared__`. Lets two Claude Code instances have independent
+    inboxes when each sets its own session id; single-instance users keep
+    the historical shared behavior with no opt-in."""
+    return _session_id() or _SHARED_BUCKET
+
+
+def _watch_unread_load_all():
+    """Load the full bucket dict. Auto-migrates the v0.8.1-initial flat
+    shape ({count,latest,updated_at}) into {__shared__: {...}} so old
+    state still works without manual reset."""
+    p = _watch_unread_path()
     try:
-        d = json.loads(_watch_unread_path().read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
+        d = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    if not isinstance(d, dict):
+        return {}
+    # Legacy flat shape -> wrap in __shared__.
+    if "count" in d and _SHARED_BUCKET not in d:
+        return {_SHARED_BUCKET: {
+            "count": int(d.get("count", 0) or 0),
+            "latest": d.get("latest"),
+            "updated_at": d.get("updated_at"),
+        }}
+    return d
+
+
+def _watch_unread_save_all(buckets):
+    try:
+        _PP_HOME.mkdir(parents=True, exist_ok=True)
+        _watch_unread_path().write_text(json.dumps(buckets, indent=2),
+                                        encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _watch_unread_load(key=None):
+    """Bucket for `key` (default = current session). Empty default."""
+    key = key or _watch_unread_key()
+    return _watch_unread_load_all().get(key) or {}
 
 
 def _watch_unread_bump(fresh):
-    """Accumulate unread across ticks. `fresh` is the per-tick list of new
-    posts by others. Best-effort; never raises."""
+    """Increment EVERY existing bucket (each session sees the news once).
+    First-time daemons with no buckets seed __shared__. Best-effort."""
     if not fresh:
         return
     try:
-        d = _watch_unread_load()
+        buckets = _watch_unread_load_all()
+        if not buckets:
+            buckets = {_SHARED_BUCKET: {"count": 0, "latest": None,
+                                        "updated_at": None}}
         last = fresh[-1]
-        d = {
-            "count": int(d.get("count", 0) or 0) + len(fresh),
-            "latest": {"author": last["author"], "channel": last["channel"],
-                       "thread": last["thread"], "at": now_iso()},
-            "updated_at": now_iso(),
-        }
-        _PP_HOME.mkdir(parents=True, exist_ok=True)
-        _watch_unread_path().write_text(json.dumps(d, indent=2),
-                                        encoding="utf-8")
+        latest = {"author": last["author"], "channel": last["channel"],
+                  "thread": last["thread"], "at": now_iso()}
+        now = now_iso()
+        for k, b in list(buckets.items()):
+            if not isinstance(b, dict):
+                b = {}
+            buckets[k] = {
+                "count": int(b.get("count", 0) or 0) + len(fresh),
+                "latest": latest,
+                "updated_at": now,
+            }
+        _watch_unread_save_all(buckets)
     except (OSError, KeyError, TypeError):
         pass
 
 
-def _watch_ack():
-    """Clear the unread counter. Best-effort; never raises. Called by the
-    read verbs and the prompt-nudge hook so the badge auto-clears."""
+def _watch_ack(key=None):
+    """Clear ONE bucket (current session by default). Best-effort. Other
+    sessions' counters are untouched -- reading in instance A does not
+    clear instance B's badge when each has its own session id."""
+    key = key or _watch_unread_key()
     try:
-        _PP_HOME.mkdir(parents=True, exist_ok=True)
-        _watch_unread_path().write_text(
-            json.dumps({"count": 0, "latest": None,
-                        "updated_at": now_iso()}, indent=2),
-            encoding="utf-8")
+        buckets = _watch_unread_load_all()
+        buckets[key] = {"count": 0, "latest": None, "updated_at": now_iso()}
+        _watch_unread_save_all(buckets)
     except OSError:
         pass
 
@@ -3397,6 +3442,31 @@ def _claude_settings_path():
     return Path.home() / ".claude" / "settings.json"
 
 
+def _other_recent_sessions(window_seconds=3600):
+    """Session ids that touched pp in the last `window_seconds`, excluding
+    the current session. Used to warn after `pp watch wire` that other
+    Claude Code instances need to restart for the statusLine change."""
+    sessions_dir = _PP_HOME / "sessions"
+    if not sessions_dir.is_dir():
+        return []
+    me = _session_id()
+    cutoff = time.time() - window_seconds
+    found = []
+    for p in sessions_dir.iterdir():
+        if not p.is_file() or p.suffix != ".json":
+            continue
+        sid = p.stem
+        if sid == me:
+            continue
+        try:
+            if p.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        found.append(sid)
+    return sorted(found)
+
+
 def _ps_invoke(ps1):
     return (f'powershell -NoProfile -ExecutionPolicy Bypass -File '
             f'"{ps1}"')
@@ -3530,6 +3600,18 @@ def _watch_wire(undo=False, with_nudge=False):
                        "statusline/hook changes"}
     if warning:
         payload["cost_warning"] = warning
+    # Multi-instance restart awareness: settings.json is global, but each
+    # already-running Claude Code instance cached the OLD statusLine at
+    # startup and won't load the new one until restart.
+    others = _other_recent_sessions()
+    if others:
+        payload["other_instances_need_restart"] = others
+        payload["restart_warning"] = (
+            f"{len(others)} other Claude Code session(s) appear active "
+            f"(touched pp in the last hour). The new statusLine/hook is "
+            f"only loaded at session start -- restart EACH instance to "
+            f"see the change there too."
+        )
     out(payload)
 
 

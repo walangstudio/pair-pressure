@@ -20,16 +20,30 @@ if (Test-Path $cfg) {
     try { $offline = [bool](Get-Content -Raw -LiteralPath $cfg | ConvertFrom-Json).offline } catch {}
 }
 
-# unread badge (read counter directly; no pp/python spawn)
+# unread badge (read this session's bucket; no pp/python spawn).
+# Bucket key = $env:PAIR_PRESSURE_SESSION_ID or '__shared__'. Tolerates the
+# legacy flat shape ({count,latest,updated_at}) by treating it as __shared__.
 $count = 0; $who = $null; $where = $null
 $uf = Join-Path $ppHome 'unread.json'
 if (Test-Path $uf) {
     try {
-        $u = Get-Content -Raw -LiteralPath $uf | ConvertFrom-Json
-        $count = [int]$u.count
-        if ($u.latest) {
-            if ($u.latest.author)  { $who = $u.latest.author }
-            if ($u.latest.channel) { $where = "#$($u.latest.channel)" }
+        $root = Get-Content -Raw -LiteralPath $uf | ConvertFrom-Json
+        $key = $env:PAIR_PRESSURE_SESSION_ID
+        if (-not $key) { $key = '__shared__' }
+        $u = $null
+        if ($root.PSObject.Properties.Match('count').Count -gt 0 -and
+            $root.PSObject.Properties.Match('__shared__').Count -eq 0) {
+            # legacy flat
+            if ($key -eq '__shared__') { $u = $root }
+        } elseif ($root.PSObject.Properties.Match($key).Count -gt 0) {
+            $u = $root.$key
+        }
+        if ($u) {
+            $count = [int]$u.count
+            if ($u.latest) {
+                if ($u.latest.author)  { $who = $u.latest.author }
+                if ($u.latest.channel) { $where = "#$($u.latest.channel)" }
+            }
         }
     } catch {}
 }

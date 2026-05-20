@@ -12,7 +12,20 @@ if (-not $base) { $base = $HOME }
 $uf = Join-Path (Join-Path $base '.pair-pressure') 'unread.json'
 if (-not (Test-Path $uf)) { return }
 
-try { $u = Get-Content -Raw -LiteralPath $uf | ConvertFrom-Json } catch { return }
+try { $root = Get-Content -Raw -LiteralPath $uf | ConvertFrom-Json } catch { return }
+$key = $env:PAIR_PRESSURE_SESSION_ID
+if (-not $key) { $key = '__shared__' }
+$u = $null
+$legacyFlat = $false
+if ($root.PSObject.Properties.Match('count').Count -gt 0 -and
+    $root.PSObject.Properties.Match('__shared__').Count -eq 0) {
+    $legacyFlat = $true
+    if ($key -eq '__shared__') { $u = $root }
+} elseif ($root.PSObject.Properties.Match($key).Count -gt 0) {
+    $u = $root.$key
+}
+if (-not $u) { return }
+
 $c = 0
 try { $c = [int]$u.count } catch {}
 if ($c -le 0) { return }
@@ -28,8 +41,19 @@ if ($c -eq 1) {
     Write-Output "[pair-pressure] $c new messages (latest from $who$where) - run /pp-chat:read to view"
 }
 
-# Ack so the nudge fires once per batch (auto-clears, like reading does).
+# Ack THIS bucket only so other sessions keep their badges.
 try {
     $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    Set-Content -LiteralPath $uf -Encoding utf8 -Value ('{"count":0,"latest":null,"updated_at":"' + $now + '"}')
+    if ($legacyFlat) {
+        # migrate-in-place: wrap legacy as __shared__ and reset it
+        $obj = @{ '__shared__' = @{ count = 0; latest = $null; updated_at = $now } }
+    } else {
+        # rewrite full root with this bucket zeroed, others preserved
+        $obj = @{}
+        foreach ($p in $root.PSObject.Properties) {
+            $obj[$p.Name] = $p.Value
+        }
+        $obj[$key] = @{ count = 0; latest = $null; updated_at = $now }
+    }
+    Set-Content -LiteralPath $uf -Encoding utf8 -Value ($obj | ConvertTo-Json -Depth 6 -Compress)
 } catch {}
