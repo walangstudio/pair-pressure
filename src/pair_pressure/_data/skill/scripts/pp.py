@@ -3376,6 +3376,9 @@ def _watch_wire(undo=False, with_nudge=False):
     nudge_ps1 = scripts / "pp-prompt-nudge.ps1"
     sl_cmd = _ps_invoke(sl_ps1)
     nudge_cmd = _ps_invoke(nudge_ps1)
+    # Legacy sidecar from the chaining design (v0.8.1 initial); no longer
+    # used now that the statusline is standalone. Keep the path to clean
+    # it up on undo for installs that ran the old wire.
     prev_file = _PP_HOME / "statusline-prev.txt"
 
     bak = sp.with_suffix(".json.pp.bak")
@@ -3436,13 +3439,14 @@ def _watch_wire(undo=False, with_nudge=False):
         if isinstance(sl, dict) and sl.get("command"):
             prev = str(sl["command"])
         data["_pp_prev_statusline"] = prev
+        # Standalone statusline: no chaining, no sidecar needed. Remove any
+        # leftover sidecar from a prior wire (chaining era).
         try:
-            _PP_HOME.mkdir(parents=True, exist_ok=True)
-            prev_file.write_text(prev, encoding="utf-8")
+            prev_file.unlink(missing_ok=True)
         except OSError:
             pass
         data["statusLine"] = {"type": "command", "command": sl_cmd}
-        changed.append("statusLine wrapped (badge, 0 tokens)")
+        changed.append("statusLine replaced (badge, 0 tokens)")
     else:
         changed.append("statusLine already wired")
 

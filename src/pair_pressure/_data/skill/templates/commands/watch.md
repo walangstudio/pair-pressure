@@ -15,10 +15,13 @@ toast, appends to `~/.pair-pressure/watch.log`, and bumps an unread counter
 
 ### How the alert reaches the console
 
-- **Statusline badge — 0 tokens (recommended).** `pp watch wire` makes your
-  statusline show ` [pp:N]` while there are unread messages. The model never
-  sees it, so it costs nothing. Wraps your existing statusline, doesn't
-  replace it.
+- **Statusline badge — 0 tokens (recommended).** `pp watch wire` sets a
+  standalone pair-pressure statusline. The model never sees it, so it costs
+  nothing. When idle it renders empty; on unread it shows
+  `[pp 3 new alice #general]`; when offline mode is on it shows
+  `[pp (offline)]` (or `[pp (offline) 3 new alice #general]`). It
+  **replaces** any previous statusline; the prior command is saved so
+  `pp watch wire --undo` restores it exactly.
 - **In-prompt nudge — INCURS TOKEN COST (opt-in).** `pp watch wire --nudge`
   also adds a `UserPromptSubmit` hook that injects one short line
   (`[pair-pressure] N new messages ... /pp-chat:read`) into your next prompt

@@ -314,9 +314,11 @@ The "current thread" lives in conversation context — remember `(server, channe
 A zero-token background watcher auto-starts on the first `pp` call and
 notifies on new posts by others — **online and offline alike** — via Windows
 toast + `~/.pair-pressure/watch.log` + an unread counter. Surface it in the
-console with `pp watch wire`: a 0-token statusline badge ` [pp:N]` (wraps,
-doesn't replace, the existing statusline) and, opt-in, a token-costing
-`--nudge` prompt line. The badge auto-clears on `/pp-chat:read`. Poll period
+console with `pp watch wire`: a 0-token standalone statusline that's empty
+when idle and shows `[pp N new <author> #<channel>]` on unread (and
+`[pp (offline)]` when offline). It replaces the prior statusline; the
+original is saved for `pp watch wire --undo`. Opt-in `--nudge` adds a
+token-costing in-prompt alert. The badge auto-clears on `/pp-chat:read`. Poll period
 is `pp watch interval <Nm>` (default 5m, min 5s, live-reloaded). Offline mode
 is the single `has_remote()` lever: writes still commit locally, only
 fetch/pull/push are skipped; offline materializes worktrees from the local
