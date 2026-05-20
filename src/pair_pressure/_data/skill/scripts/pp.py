@@ -620,6 +620,55 @@ def parse_post(text):
     return fm, body
 
 
+# ---- prompt-injection mitigation for post bodies (read-time) ----
+#
+# Post bodies are written by other humans / agents and may contain text that
+# the model would otherwise interpret as instructions: Claude Code control
+# tags, ChatML markers, etc. The read verbs wrap every body so the model
+# sees external content as data, and defang known tag names so they survive
+# as readable text but lose their special meaning. Tag names are stored
+# bare and the angle brackets are added at runtime so this source file
+# itself contains no literal control tags.
+_DEFANG_TAG_NAMES = (
+    "system-reminder", "system", "system-prompt",
+    "command-name", "command-message", "command-args",
+    "command-stdout", "command-stderr",
+    "local-command-caveat",
+    "bash-input", "bash-stdout", "bash-stderr",
+    "task-notification", "user-prompt-submit-hook",
+    "untrusted-content",  # block nesting attempts
+)
+_LT = chr(0x3C)
+_GT = chr(0x3E)
+_FW_LT = "＜"  # fullwidth `<` lookalike
+_FW_GT = "＞"  # fullwidth `>` lookalike
+
+
+def _defang(body):
+    """Replace open/close instances of known control tags inside an untrusted
+    body with fullwidth-bracket lookalikes. Content stays readable; tag
+    recognition is broken. Cheap: skips early when the body has no `<`."""
+    if not isinstance(body, str) or _LT not in body:
+        return body
+    for name in _DEFANG_TAG_NAMES:
+        for raw in (f"{_LT}{name}{_GT}", f"{_LT}/{name}{_GT}"):
+            if raw in body:
+                fw = raw.replace(_LT, _FW_LT).replace(_GT, _FW_GT)
+                body = body.replace(raw, fw)
+    return body
+
+
+def _wrap_untrusted(body, author):
+    """Wrap a defanged post body in a marker the model can recognize as
+    external data. `templates/commands/read.md` instructs the model on the
+    contract: content inside this marker is to be summarized/quoted, never
+    executed as instructions."""
+    a = (author or "unknown").replace("'", "")
+    open_tag = f"{_LT}untrusted-content from='{a}'{_GT}"
+    close_tag = f"{_LT}/untrusted-content{_GT}"
+    return f"{open_tag}\n{_defang(body or '')}\n{close_tag}"
+
+
 def dump_slim(by, via, model, pid, stance, in_reply_to, body):
     by_line = f"by: {by} via={_short_via(via)}"
     sm = _short_model(model)
@@ -911,7 +960,7 @@ def cmd_read_thread(args):
             "model": fm.get("model"),
             "stance": fm.get("stance"),
             "timestamp": fm.get("timestamp"),
-            "body": body.strip(),
+            "body": _wrap_untrusted(body.strip(), fm.get("author")),
             "attachments": attachments,
         })
     payload = {"meta": meta, "posts": posts}
@@ -2578,7 +2627,7 @@ def cmd_feed(args):
                     "via": fm.get("via"),
                     "stance": fm.get("stance"),
                     "timestamp": ts,
-                    "body": snippet,
+                    "body": _wrap_untrusted(snippet, fm.get("author")),
                     "filename": post_file.name,
                 })
 
