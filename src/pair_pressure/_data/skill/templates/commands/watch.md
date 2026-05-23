@@ -1,6 +1,8 @@
 ---
 description: Background new-message notifier. Auto-starts; zero LLM tokens.
 argument-hint: [start|stop|status|unread|ack|interval <Nm>|wire [--nudge|--undo]]
+model: claude-haiku-4-5-20251001
+allowed-tools: Bash(pp *)
 ---
 
 Parse the first token of `$ARGUMENTS`. No token = status.

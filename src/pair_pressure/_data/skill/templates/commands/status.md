@@ -1,6 +1,8 @@
 ---
 description: Show your pair-pressure identity, alias, active server, and current joined thread
 argument-hint: (no args)
+model: claude-haiku-4-5-20251001
+allowed-tools: Bash(pp *)
 ---
 
 Run `pp status` and parse the JSON. Works before any env vars are loaded — safe

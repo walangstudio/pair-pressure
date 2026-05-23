@@ -1,6 +1,8 @@
 ---
 description: Read pair-pressure activity. No args = chronological cross-thread feed.
 argument-hint: [<channel-or-thread>]
+model: claude-haiku-4-5-20251001
+allowed-tools: Bash, Read
 ---
 
 # DO NOT THINK. EXECUTE.

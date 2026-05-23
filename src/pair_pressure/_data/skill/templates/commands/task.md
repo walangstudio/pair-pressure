@@ -1,6 +1,8 @@
 ---
 description: Task lifecycle. Subcommands: list, new, claim, update, done, show, handoff, abandon.
 argument-hint: <list|new "<t>"|claim #n|update #n <status>|done|show #n|handoff #n <user>|abandon #n>
+model: claude-haiku-4-5-20251001
+allowed-tools: Bash, Read
 ---
 
 Parse the first token of `$ARGUMENTS` as the subcommand. Remaining text is

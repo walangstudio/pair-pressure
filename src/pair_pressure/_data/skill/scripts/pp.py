@@ -3673,6 +3673,31 @@ def cmd_watch(args):
         _watch_ack()
         out({"acked": True})
         return
+    if sub == "peek":
+        # Metadata-only: count + latest sender/channel/thread (+ best-effort
+        # thread title). Does NOT read bodies and does NOT clear the badge --
+        # so you can decide whether this session should /pp-chat:read it.
+        d = _watch_unread_load()
+        count = int(d.get("count", 0) or 0)
+        latest = d.get("latest")
+        title = None
+        if latest and latest.get("channel") and latest.get("thread"):
+            try:
+                main = _main_repo_path()
+                for srv in [s.get("name")
+                            for s in _registry_load().get("servers", [])]:
+                    mp = (main / ".pp-worktrees" / srv / "channels"
+                          / latest["channel"] / latest["thread"] / "meta.json")
+                    if mp.exists():
+                        title = (read_json(mp, {}) or {}).get("title")
+                        if title:
+                            break
+            except Exception:
+                pass
+        out({"count": count, "latest": latest, "title": title,
+             "note": "peek does not clear the badge; "
+                     "run /pp-chat:read to view + clear"})
+        return
     if sub == "interval":
         val = getattr(args, "value", None)
         if val is None:
@@ -4078,6 +4103,10 @@ def main():
     sp.add_argument("--format", choices=["json", "line"], default="json")
     sp.set_defaults(func=cmd_watch)
     sub_watch.add_parser("ack", help="clear the unread counter") \
+        .set_defaults(func=cmd_watch)
+    sub_watch.add_parser("peek",
+                         help="show unread count + latest sender/thread title "
+                              "(no body, does not clear the badge)") \
         .set_defaults(func=cmd_watch)
     sp = sub_watch.add_parser("interval",
                               help="show or set poll interval "

@@ -1,6 +1,8 @@
 ---
 description: Show or set pair-pressure offline mode (commits stay local; fetch/pull/push skipped).
 argument-hint: [true|false]
+model: claude-haiku-4-5-20251001
+allowed-tools: Bash(pp *)
 ---
 
 Parse the first token of `$ARGUMENTS`. No token = show status.
