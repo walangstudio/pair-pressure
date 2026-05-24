@@ -462,6 +462,57 @@ class PrettyRenderTests(unittest.TestCase):
             pp._emit_read(args, {"view": "feed", "posts": []})
         self.assertIn('"view"', buf.getvalue())   # JSON contract intact
 
+    def test_sanitize_strips_control_keeps_unicode(self):
+        # ESC, BEL, DEL, C1 dropped; tab + em-dash + text kept.
+        dirty = "a\033[2Jb\007\x7f\x9ec—d\te"
+        clean = pp._sanitize_terminal(dirty)
+        self.assertNotIn("\033", clean)
+        self.assertNotIn("\007", clean)
+        self.assertNotIn("\x7f", clean)
+        self.assertNotIn("\x9e", clean)
+        self.assertIn("—", clean)            # em-dash survives
+        self.assertIn("\t", clean)                # tab survives
+        self.assertEqual(clean, "a[2Jbc—d\te")
+
+    def test_render_neutralizes_body_escape_injection(self):
+        import io
+        from contextlib import redirect_stdout
+        # Hostile body: clear-screen + window-title spoof + cursor forge.
+        evil = "\033[2J\033]0;OWNED\007hello\033[1A\033[2Kforged"
+        payload = {
+            "view": "thread", "channel": "general", "thread_id": "t1",
+            "meta": {"title": "x", "kind": "discussion"},
+            "posts": [{
+                "author": "mallory", "timestamp": "2026-05-24T14:30:00Z",
+                "body": pp._wrap_untrusted(evil, "mallory"),
+            }],
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pp._render_chat(payload)
+        out = buf.getvalue()
+        # Only pp's OWN escapes (color/reset) may appear, never the body's.
+        self.assertNotIn("\033[2J", out)
+        self.assertNotIn("\033]0;", out)
+        self.assertNotIn("\007", out)
+        self.assertIn("hello", out)               # text content preserved
+        self.assertIn("forged", out)
+
+    def test_render_neutralizes_title_escape_injection(self):
+        import io
+        from contextlib import redirect_stdout
+        payload = {
+            "view": "thread", "channel": "general", "thread_id": "t1",
+            "meta": {"title": "evil\033]0;pwn\007", "kind": "discussion"},
+            "posts": [],
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pp._render_chat(payload)
+        out = buf.getvalue()
+        self.assertNotIn("\033]0;", out)
+        self.assertNotIn("\007", out)
+
 
 class ServerBranchTests(unittest.TestCase):
     def test_prefix(self):

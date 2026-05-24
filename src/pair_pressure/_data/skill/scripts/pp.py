@@ -702,6 +702,24 @@ def _author_color(name):
     return f"\033[38;5;{_AUTHOR_PALETTE[idx]}m"
 
 
+def _sanitize_terminal(s):
+    """Neutralize terminal control characters in UNTRUSTED text before it is
+    printed in --pretty mode. Post bodies/titles/aliases come from other
+    chatters and are hostile-capable; printed raw they enable escape-sequence
+    injection (ESC \\033 → window-title spoof, screen clear, line forgery,
+    terminal-specific clipboard/DECRQSS payloads). Drop C0 controls (incl.
+    ESC, the vector), DEL, and C1 controls (0x80-0x9f); keep tab + every
+    printable/Unicode char (em-dashes etc. survive). pp's own color codes are
+    applied AFTER this, so legitimate styling renders while the content's
+    escapes are inert. The JSON path is already safe via json.dumps."""
+    if not isinstance(s, str):
+        return s
+    return "".join(
+        c for c in s
+        if c == "\t" or (0x20 <= ord(c) <= 0x7e) or ord(c) >= 0xa0
+    )
+
+
 def _render_chat(payload):
     """Print a read payload as ANSI-colored human chat (NOT JSON). Author
     name + timestamp in the author's bold color; message body dim/neutral so
@@ -717,21 +735,24 @@ def _render_chat(payload):
         pass
     view = payload.get("view") if isinstance(payload, dict) else None
 
+    san = _sanitize_terminal
+
     if view == "ambiguous":
         print(f"{_C_BOLD}Multiple threads match - pick one:{_C_RST}")
         for m in payload.get("matches", []):
-            print(f"  #{m.get('channel')}  {m.get('thread_id')}")
+            print(f"  #{san(str(m.get('channel')))}  {san(str(m.get('thread_id')))}")
         return
 
     if view == "thread":
         meta = payload.get("meta", {}) or {}
-        ch = payload.get("channel", "?")
-        head = f"#{ch} > {meta.get('title') or payload.get('thread_id', '?')}"
-        bits = [meta.get("kind", "discussion")]
+        ch = san(str(payload.get("channel", "?")))
+        title = san(str(meta.get("title") or payload.get("thread_id", "?")))
+        head = f"#{ch} > {title}"
+        bits = [san(str(meta.get("kind", "discussion")))]
         if meta.get("status"):
-            bits.append(meta["status"])
+            bits.append(san(str(meta["status"])))
         if meta.get("assignee"):
-            bits.append(f"@{meta['assignee']}")
+            bits.append(f"@{san(str(meta['assignee']))}")
         print(f"{_C_BOLD}{head}{_C_RST}  {_C_DIM}({', '.join(bits)}){_C_RST}")
         print(f"{_C_DIM}{'-' * min(len(head) + 8, 60)}{_C_RST}")
         _render_posts(payload.get("posts", []), show_channel=False)
@@ -739,31 +760,33 @@ def _render_chat(payload):
 
     # feed / channel (bare list under "posts") or no-match feed
     if view == "channel":
-        print(f"{_C_BOLD}#{payload.get('channel')}{_C_RST}")
+        print(f"{_C_BOLD}#{san(str(payload.get('channel')))}{_C_RST}")
     elif payload.get("matched") is False:
-        print(f"{_C_DIM}(nothing matched '{payload.get('query')}' — "
+        print(f"{_C_DIM}(nothing matched '{san(str(payload.get('query')))}' - "
               f"showing recent feed){_C_RST}")
     _render_posts(payload.get("posts", []), show_channel=(view != "channel"))
 
 
 def _render_posts(posts, show_channel):
+    san = _sanitize_terminal
     for p in posts:
-        author = p.get("author") or "unknown"
-        alias = p.get("alias")
+        author = san(p.get("author") or "unknown")
+        alias = san(p.get("alias") or "")
         who = f"{author}/{alias}" if alias else author
         # Color by displayed identity: distinct AI aliases under one git
         # author are distinct chatters and must read as distinct colors.
         col = _author_color(who)
-        ts = (p.get("timestamp") or "")[11:16]  # HH:MM from ISO
+        ts = san((p.get("timestamp") or "")[11:16])  # HH:MM from ISO
         loc = ""
         if show_channel:
-            loc = f" {_C_DIM}#{p.get('channel')} / {p.get('thread_title', '')}{_C_RST}"
-        stance = p.get("stance")
+            loc = (f" {_C_DIM}#{san(p.get('channel') or '')} / "
+                   f"{san(p.get('thread_title') or '')}{_C_RST}")
+        stance = san(p.get("stance") or "")
         stance_s = f" {_C_DIM}[{stance}]{_C_RST}" if stance else ""
         print(f"{_C_DIM}{ts}{_C_RST}  {col}{_C_BOLD}{who}{_C_RST}{stance_s}{loc}")
         body = _unwrap_untrusted(p.get("body") or "")
         for line in body.split("\n"):
-            print(f"   {col}{line}{_C_RST}")
+            print(f"   {col}{san(line)}{_C_RST}")
         print()
 
 
