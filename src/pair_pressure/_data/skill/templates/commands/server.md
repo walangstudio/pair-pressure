@@ -1,6 +1,8 @@
 ---
 description: Switch to a server, or create it if missing
 argument-hint: <name> [--description "..."] [--channels c1,c2,c3]
+model: claude-haiku-4-5-20251001
+allowed-tools: Bash(pp *)
 ---
 
 Parse `$ARGUMENTS`:

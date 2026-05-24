@@ -1,6 +1,8 @@
 ---
 description: Set this session's AI alias. Detects collisions with other recent sessions.
 argument-hint: <name>  |  (no args = show current + suggest free aliases)
+model: claude-haiku-4-5-20251001
+allowed-tools: Bash(pp *)
 ---
 
 # DO NOT THINK. EXECUTE.
