@@ -3397,6 +3397,10 @@ def _notify_windows(title, message):
 
 
 def _notify_macos(title, message):
+    if shutil.which("osascript") is None:
+        _watch_log("toast_failed osascript not found")
+        return False
+
     def _esc(s):
         return s.replace("\\", "\\\\").replace('"', '\\"')
 

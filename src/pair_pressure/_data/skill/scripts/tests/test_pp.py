@@ -384,6 +384,14 @@ class NotifyDispatchTests(unittest.TestCase):
                 mock.patch.object(pp, "_watch_log"):
             self.assertFalse(pp._notify_linux("t", "m"))
 
+    def test_macos_missing_osascript_returns_false_without_subprocess(self):
+        from unittest import mock
+        with mock.patch.object(pp.shutil, "which", return_value=None), \
+                mock.patch.object(pp.subprocess, "run") as run, \
+                mock.patch.object(pp, "_watch_log"):
+            self.assertFalse(pp._notify_macos("t", "m"))
+            run.assert_not_called()  # guarded before the osascript call
+
     def test_helper_exception_does_not_propagate(self):
         from unittest import mock
         with self._silence_sentinel(), \
