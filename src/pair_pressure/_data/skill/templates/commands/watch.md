@@ -11,8 +11,9 @@ The watcher is a detached, zero-token background process. It auto-starts on
 the first `pp` call and re-checks itself on every `pp` call, so you normally
 never touch it. It polls for new posts (not authored by you) **in both online
 and offline mode** (offline = scan local files; online = fetch then scan
-`origin/<branch>` without touching your working tree), fires a native Windows
-toast, appends to `~/.pair-pressure/watch.log`, and bumps an unread counter
+`origin/<branch>` without touching your working tree), fires a native OS
+notification (Windows toast / macOS `osascript` / Linux `notify-send`),
+appends to `~/.pair-pressure/watch.log`, and bumps an unread counter
 `~/.pair-pressure/unread.json`.
 
 ### How the alert reaches the console
@@ -81,7 +82,10 @@ the statusline/hook change to load. When `--nudge` is used, relay the
 returned `cost_warning` to the user.
 
 Notes:
-- Notifications work the same online or offline; debounced to ≤1 toast per
+- Notifications work the same online or offline; debounced to ≤1 per
   poll tick, summarizing count + latest sender.
-- Durable fallback if toasts fail: `~/.pair-pressure/watch.log` and the
-  `last_notify` field of `watch status`.
+- Native banner per OS: Windows toast (WinRT, no install), macOS
+  `osascript`, Linux `notify-send` (needs `libnotify-bin` + a notification
+  daemon; absent on headless/WSL).
+- Durable fallback if the banner fails or isn't available:
+  `~/.pair-pressure/watch.log` and the `last_notify` field of `watch status`.

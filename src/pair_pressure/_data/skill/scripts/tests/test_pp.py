@@ -333,6 +333,66 @@ class OriginBranchExistsTests(unittest.TestCase):
             self.assertTrue(pp._origin_branch_exists("main"))
 
 
+class NotifyDispatchTests(unittest.TestCase):
+    """`_notify` routes to the right per-OS helper and always writes the
+    durable sentinel/log fallback regardless of platform."""
+
+    def _silence_sentinel(self):
+        from unittest import mock
+        return mock.patch.multiple(
+            pp, _watch_notify_path=mock.DEFAULT, _watch_log=mock.DEFAULT)
+
+    def test_macos_routes_to_osascript(self):
+        from unittest import mock
+        with self._silence_sentinel(), \
+                mock.patch.object(pp.sys, "platform", "darwin"), \
+                mock.patch.object(pp, "_notify_macos",
+                                  return_value=True) as m, \
+                mock.patch.object(pp, "_notify_linux") as ln, \
+                mock.patch.object(pp, "_notify_windows") as wn:
+            self.assertTrue(pp._notify("t", "m"))
+            m.assert_called_once_with("t", "m")
+            ln.assert_not_called()
+            wn.assert_not_called()
+
+    def test_linux_routes_to_notify_send(self):
+        from unittest import mock
+        with self._silence_sentinel(), \
+                mock.patch.object(pp.sys, "platform", "linux"), \
+                mock.patch.object(pp, "_notify_linux",
+                                  return_value=True) as ln, \
+                mock.patch.object(pp, "_notify_macos") as m, \
+                mock.patch.object(pp, "_notify_windows") as wn:
+            self.assertTrue(pp._notify("t", "m"))
+            ln.assert_called_once_with("t", "m")
+            m.assert_not_called()
+            wn.assert_not_called()
+
+    def test_windows_routes_to_toast(self):
+        from unittest import mock
+        with self._silence_sentinel(), \
+                mock.patch.object(pp.sys, "platform", "win32"), \
+                mock.patch.object(pp.os, "name", "nt"), \
+                mock.patch.object(pp, "_notify_windows",
+                                  return_value=True) as wn:
+            self.assertTrue(pp._notify("t", "m"))
+            wn.assert_called_once_with("t", "m")
+
+    def test_linux_missing_notify_send_returns_false(self):
+        from unittest import mock
+        with mock.patch.object(pp.shutil, "which", return_value=None), \
+                mock.patch.object(pp, "_watch_log"):
+            self.assertFalse(pp._notify_linux("t", "m"))
+
+    def test_helper_exception_does_not_propagate(self):
+        from unittest import mock
+        with self._silence_sentinel(), \
+                mock.patch.object(pp.sys, "platform", "darwin"), \
+                mock.patch.object(pp, "_notify_macos",
+                                  side_effect=RuntimeError("boom")):
+            self.assertFalse(pp._notify("t", "m"))
+
+
 class ServerBranchTests(unittest.TestCase):
     def test_prefix(self):
         self.assertEqual(pp._server_branch("alpha"), "server/alpha")

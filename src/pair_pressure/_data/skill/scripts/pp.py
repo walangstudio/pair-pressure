@@ -3227,9 +3227,9 @@ def _ensure_watcher(args):
 
 
 def _notify(title, message):
-    """Native Windows toast (in-box WinRT via PowerShell, no module install)
-    + durable fallback (watch.log line + sentinel json). Returns True if the
-    toast call exited 0."""
+    """Native OS notification (Windows toast / macOS osascript / Linux
+    notify-send), no third-party install + durable fallback (watch.log line
+    + sentinel json). Returns True if a native notification call exited 0."""
     payload = {"at": now_iso(), "title": title, "message": message}
     try:
         _watch_notify_path().write_text(json.dumps(payload, indent=2),
@@ -3237,8 +3237,19 @@ def _notify(title, message):
     except OSError:
         pass
     _watch_log(f"notify: {title} | {message}")
-    if os.name != "nt":
-        return False
+    try:
+        if sys.platform == "darwin":
+            return _notify_macos(title, message)
+        if sys.platform.startswith("linux"):
+            return _notify_linux(title, message)
+        if os.name == "nt":
+            return _notify_windows(title, message)
+    except Exception as e:
+        _watch_log(f"toast_failed {e!r}")
+    return False
+
+
+def _notify_windows(title, message):
     aumid = (r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}"
              r"\WindowsPowerShell\v1.0\powershell.exe")
 
@@ -3266,6 +3277,43 @@ def _notify(title, message):
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            _watch_log(f"toast_failed rc={r.returncode} {r.stderr.strip()[:200]}")
+            return False
+        return True
+    except Exception as e:
+        _watch_log(f"toast_failed {e!r}")
+        return False
+
+
+def _notify_macos(title, message):
+    def _esc(s):
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    script = (f'display notification "{_esc(message)}" '
+              f'with title "{_esc(title)}"')
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            _watch_log(f"toast_failed rc={r.returncode} {r.stderr.strip()[:200]}")
+            return False
+        return True
+    except Exception as e:
+        _watch_log(f"toast_failed {e!r}")
+        return False
+
+
+def _notify_linux(title, message):
+    if shutil.which("notify-send") is None:
+        _watch_log("toast_failed notify-send not found "
+                   "(install libnotify-bin)")
+        return False
+    try:
+        r = subprocess.run(
+            ["notify-send", "-a", "pair-pressure", "-u", "normal", "--",
+             title, message],
             capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             _watch_log(f"toast_failed rc={r.returncode} {r.stderr.strip()[:200]}")
