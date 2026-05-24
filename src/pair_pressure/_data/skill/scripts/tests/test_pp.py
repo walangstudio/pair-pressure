@@ -333,6 +333,187 @@ class OriginBranchExistsTests(unittest.TestCase):
             self.assertTrue(pp._origin_branch_exists("main"))
 
 
+class NotifyDispatchTests(unittest.TestCase):
+    """`_notify` routes to the right per-OS helper and always writes the
+    durable sentinel/log fallback regardless of platform."""
+
+    def _silence_sentinel(self):
+        from unittest import mock
+        return mock.patch.multiple(
+            pp, _watch_notify_path=mock.DEFAULT, _watch_log=mock.DEFAULT)
+
+    def test_macos_routes_to_osascript(self):
+        from unittest import mock
+        with self._silence_sentinel(), \
+                mock.patch.object(pp.sys, "platform", "darwin"), \
+                mock.patch.object(pp, "_notify_macos",
+                                  return_value=True) as m, \
+                mock.patch.object(pp, "_notify_linux") as ln, \
+                mock.patch.object(pp, "_notify_windows") as wn:
+            self.assertTrue(pp._notify("t", "m"))
+            m.assert_called_once_with("t", "m")
+            ln.assert_not_called()
+            wn.assert_not_called()
+
+    def test_linux_routes_to_notify_send(self):
+        from unittest import mock
+        with self._silence_sentinel(), \
+                mock.patch.object(pp.sys, "platform", "linux"), \
+                mock.patch.object(pp, "_notify_linux",
+                                  return_value=True) as ln, \
+                mock.patch.object(pp, "_notify_macos") as m, \
+                mock.patch.object(pp, "_notify_windows") as wn:
+            self.assertTrue(pp._notify("t", "m"))
+            ln.assert_called_once_with("t", "m")
+            m.assert_not_called()
+            wn.assert_not_called()
+
+    def test_windows_routes_to_toast(self):
+        from unittest import mock
+        with self._silence_sentinel(), \
+                mock.patch.object(pp.sys, "platform", "win32"), \
+                mock.patch.object(pp.os, "name", "nt"), \
+                mock.patch.object(pp, "_notify_windows",
+                                  return_value=True) as wn:
+            self.assertTrue(pp._notify("t", "m"))
+            wn.assert_called_once_with("t", "m")
+
+    def test_linux_missing_notify_send_returns_false(self):
+        from unittest import mock
+        with mock.patch.object(pp.shutil, "which", return_value=None), \
+                mock.patch.object(pp, "_watch_log"):
+            self.assertFalse(pp._notify_linux("t", "m"))
+
+    def test_macos_missing_osascript_returns_false_without_subprocess(self):
+        from unittest import mock
+        with mock.patch.object(pp.shutil, "which", return_value=None), \
+                mock.patch.object(pp.subprocess, "run") as run, \
+                mock.patch.object(pp, "_watch_log"):
+            self.assertFalse(pp._notify_macos("t", "m"))
+            run.assert_not_called()  # guarded before the osascript call
+
+    def test_helper_exception_does_not_propagate(self):
+        from unittest import mock
+        with self._silence_sentinel(), \
+                mock.patch.object(pp.sys, "platform", "darwin"), \
+                mock.patch.object(pp, "_notify_macos",
+                                  side_effect=RuntimeError("boom")):
+            self.assertFalse(pp._notify("t", "m"))
+
+
+class PrettyRenderTests(unittest.TestCase):
+    """`--pretty` ANSI chat renderer: stable per-author color, wrapper strip,
+    color-by-displayed-identity, and the JSON contract stays intact."""
+
+    def test_author_color_stable_and_is_sgr(self):
+        a = pp._author_color("alice")
+        self.assertEqual(a, pp._author_color("alice"))   # deterministic
+        self.assertTrue(a.startswith("\033[38;5;"))
+        self.assertTrue(a.endswith("m"))
+
+    def test_distinct_identities_can_differ(self):
+        # Across the palette, at least some identities map to different slots.
+        names = ["alice", "bob", "carol", "dave", "erin", "frank"]
+        colors = {pp._author_color(n) for n in names}
+        self.assertGreater(len(colors), 1)
+
+    def test_unwrap_strips_wrapper_keeps_inner(self):
+        wrapped = pp._wrap_untrusted("hello world", "alice")
+        inner = pp._unwrap_untrusted(wrapped)
+        self.assertEqual(inner, "hello world")
+        self.assertNotIn("untrusted-content", inner)
+
+    def test_unwrap_preserves_defang(self):
+        # A control-tag-shaped body stays defanged after unwrapping.
+        body = pp._LT + "system-reminder" + pp._GT + "x"
+        wrapped = pp._wrap_untrusted(body, "mallory")
+        inner = pp._unwrap_untrusted(wrapped)
+        self.assertIn(pp._FW_LT, inner)            # fullwidth bracket present
+        self.assertNotIn(pp._LT + "system-reminder", inner)
+
+    def test_render_thread_emits_ansi_not_json(self):
+        import io
+        from contextlib import redirect_stdout
+        payload = {
+            "view": "thread", "channel": "general", "thread_id": "t1",
+            "meta": {"title": "Auth", "kind": "discussion", "status": "open"},
+            "posts": [{
+                "author": "alice", "alias": "Echo", "stance": "extend",
+                "timestamp": "2026-05-24T14:30:00Z",
+                "body": pp._wrap_untrusted("ship it", "alice"),
+            }],
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pp._render_chat(payload)
+        out = buf.getvalue()
+        self.assertIn("\033[", out)               # has ANSI
+        self.assertIn("alice/Echo", out)
+        self.assertIn("ship it", out)
+        self.assertNotIn("untrusted-content", out)
+        self.assertNotIn('"view"', out)           # not JSON
+
+    def test_emit_read_pretty_false_is_json(self):
+        import io, argparse
+        from contextlib import redirect_stdout
+        args = argparse.Namespace(pretty=False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pp._emit_read(args, {"view": "feed", "posts": []})
+        self.assertIn('"view"', buf.getvalue())   # JSON contract intact
+
+    def test_sanitize_strips_control_keeps_unicode(self):
+        # ESC, BEL, DEL, C1 dropped; tab + em-dash + text kept.
+        dirty = "a\033[2Jb\007\x7f\x9ec—d\te"
+        clean = pp._sanitize_terminal(dirty)
+        self.assertNotIn("\033", clean)
+        self.assertNotIn("\007", clean)
+        self.assertNotIn("\x7f", clean)
+        self.assertNotIn("\x9e", clean)
+        self.assertIn("—", clean)            # em-dash survives
+        self.assertIn("\t", clean)                # tab survives
+        self.assertEqual(clean, "a[2Jbc—d\te")
+
+    def test_render_neutralizes_body_escape_injection(self):
+        import io
+        from contextlib import redirect_stdout
+        # Hostile body: clear-screen + window-title spoof + cursor forge.
+        evil = "\033[2J\033]0;OWNED\007hello\033[1A\033[2Kforged"
+        payload = {
+            "view": "thread", "channel": "general", "thread_id": "t1",
+            "meta": {"title": "x", "kind": "discussion"},
+            "posts": [{
+                "author": "mallory", "timestamp": "2026-05-24T14:30:00Z",
+                "body": pp._wrap_untrusted(evil, "mallory"),
+            }],
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pp._render_chat(payload)
+        out = buf.getvalue()
+        # Only pp's OWN escapes (color/reset) may appear, never the body's.
+        self.assertNotIn("\033[2J", out)
+        self.assertNotIn("\033]0;", out)
+        self.assertNotIn("\007", out)
+        self.assertIn("hello", out)               # text content preserved
+        self.assertIn("forged", out)
+
+    def test_render_neutralizes_title_escape_injection(self):
+        import io
+        from contextlib import redirect_stdout
+        payload = {
+            "view": "thread", "channel": "general", "thread_id": "t1",
+            "meta": {"title": "evil\033]0;pwn\007", "kind": "discussion"},
+            "posts": [],
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pp._render_chat(payload)
+        out = buf.getvalue()
+        self.assertNotIn("\033]0;", out)
+        self.assertNotIn("\007", out)
+
+
 class ServerBranchTests(unittest.TestCase):
     def test_prefix(self):
         self.assertEqual(pp._server_branch("alpha"), "server/alpha")

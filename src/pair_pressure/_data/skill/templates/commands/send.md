@@ -1,156 +1,80 @@
 ---
 description: Post to the current thread. Verbatim by default — instant, no AI thinking.
 argument-hint: <message> | ai [stance] <steering> | <channel> [<thread>] <message>
+model: claude-haiku-4-5-20251001
+allowed-tools: Bash, Read
 ---
 
-# DO NOT THINK. EXECUTE.
+# DO NOT THINK. EXECUTE. No preamble, no narration.
 
-The default behaviour is **post the bytes verbatim, immediately, no pre-flight
-reads, no rewriting**. Only branch into AI mode when the user explicitly asks
-for it.
+`pp send` resolves server/channel/thread from state itself. Never pre-scan
+with `pp status`, `pp list-channels`, `pp list-threads`, or `pp read` — those
+are the noise we are eliminating.
 
----
+## Confirming the send (what the human sees)
 
-## Fast path — handle this FIRST
+`pp send` returns JSON (`{"ok","kind","channel","thread_id","post_id"}`).
+**Do NOT print that JSON** — it's machine plumbing, not useful to a human, and
+`post_id` is `null` on a new thread by design. Instead, after a successful
+send, confirm in one short human line **what was posted and where**, then the
+message itself:
 
-If the first token of `$ARGUMENTS` is NOT `ai` or `ai-reply`, just pipe the
-whole thing to `pp send`. One tool call:
+```
+Sent to #<channel> › <thread_id>   (use "new thread" when kind=seed)
 
+<the exact message body that was posted>
+```
+
+This matters most in **AI mode**: the human needs to see the message you
+composed on their behalf. Echo the body you actually sent (after any
+`@<path>` inlining). If `--attach`/`@@` added files, append
+`(+ <n> attachment(s))`. On `{"ok":false,...}` handle the reason (see Notes) —
+don't show the success line.
+
+## Fast path (DEFAULT — first token is NOT `ai`/`ai-reply`)
+
+One tool call — pipe `$ARGUMENTS` verbatim:
 ```
 pp send --via human --body-file -
 ```
+- `@<path>` in the body → inline the file's verbatim contents (Read it).
+- `@@<path>` → leave the token verbatim; `pp send` copies the file into the
+  post's `attachments/` and rewrites it to a link.
+- `--attach <path>` (repeatable) → strip from the body, forward as flags:
+  `pp send --via human --attach <p1> [--attach <p2>] --body-file -`.
 
-Pipe `$ARGUMENTS` verbatim on stdin. `pp send` itself handles:
+Response: `{"ok":true,"kind":"reply|seed","thread_id":"...","post_id":"..."}`.
 
-- channel resolution (state → env → `general`),
-- thread lookup (state → fuzzy match by default title → auto-seed),
-- channel auto-creation,
-- state update so the next `/pp-chat:send` lands on the same thread.
+## AI mode (first token is `ai` or `ai-reply`)
 
-Do NOT read the thread first. Do NOT call `pp list-channels`, `pp list-threads`,
-`pp channel ensure`, or `pp status` — `pp send` does all of that internally.
-Do NOT paraphrase, polish, or add framing. Echo only the returned `thread_id`
-and `post_id`.
+Compose a reply signed `<author>/<alias>`. Stay to TWO tool calls max:
 
-The response shape is:
-
-```json
-{"ok": true, "kind": "reply" | "seed",
- "server": "...", "channel": "...", "thread_id": "...", "post_id": "..."}
-```
-
-If `$ARGUMENTS` contains `@<path>` tokens, replace each with the file's
-verbatim contents (text first, blank line, then file body if mixed). Resolve
-relative paths against the user's cwd.
-
-If `$ARGUMENTS` contains `@@<path>` tokens (double-at), do NOT inline. Leave
-them in the body verbatim — `pp send` itself copies each referenced file
-into `channels/<C>/<thread>/attachments/<post-id>/` and rewrites the token
-to a relative markdown link. Use `@@<path>` for binaries, large files, or
-anything you want preserved as a standalone artifact alongside the post.
-
-If `$ARGUMENTS` contains one or more `--attach <path>` tokens, strip them
-out before piping the remainder as the body, and forward each as a real
-flag to `pp send`:
-
-```
-pp send --via human --attach <path1> [--attach <path2> …] --body-file -
-```
-
-The stripped body (everything except the `--attach <path>` pairs) becomes
-the post body on stdin. `--attach` appends an `## Attachments` section to
-the post; `@@<path>` attaches inline. The two can be combined freely.
-
-If the user explicitly says "attach <file>" (vs. "include" or "paste"),
-prefer `--attach <path>` over inlining.
-
-After `pp send` returns, remember `(server, channel, thread_id)` for any
-follow-up tool calls this turn. `pp send` itself persists this — but other
-verbs (`pp read`, `pp claim`, etc.) read state on entry, so you don't have to
-pass anything forward.
-
----
-
-## AI mode
-
-Trigger: first token is literally `ai` or `ai-reply`. The body is signed
-`<author>/<alias>`.
-
-1. **Read the thread once** so you have something to reply about. If
-   conversation context already has the thread loaded this turn, skip:
-   `pp read-thread --server <S> --channel <C> --thread <T> --no-pull`.
-   If no current thread is set, run `pp read` (no args) for a feed view and
-   ask the user which thread you should respond in.
-2. Parse the steering text after `ai`:
-   - Optional next token: stance `agree | contradict | extend | question | summary` (default `extend`).
-   - Free-form: any `check: …` / "verify that …" items are pre-flight lookups; any
-     `about: …` / "focus on …" items are topic constraints.
-3. Compose. Open with a one-line stance summary, then specifics. Cite earlier
-   posts as `[<short-id>]` (last 6 chars of the timestamp suffice).
-4. If your reply meaningfully shifts the thread's conclusion, include
-   `--summary "<2-3 sentence rolling digest>"`.
-5. Post:
+1. Resolve the target thread WITHOUT scanning:
+   - Default = the current thread from state (no lookup needed).
+   - If the steering names a *different* thread and it's not the current one,
+     or no current thread is set, **ask the user which thread** (one question).
+     Do NOT run `list-channels`/`list-threads`/`read` to hunt for it.
+2. (Optional, 1 call) For context, read ONLY the target thread:
+   `pp read-thread --channel <C> --thread <T> --no-pull`.
+3. Post:
    ```
-   pp send --stance <stance> --via claude-code [--alias <N>] --body-file -
+   pp send --stance <agree|contradict|extend|question|summary> --via claude-code [--alias <N>] --body-file -
    ```
-   `pp send` reuses the current thread from state, so you don't need
-   `--channel`/`--thread`.
+   `pp send` reuses the current thread from state. Add `--summary "<2-3 sentences>"`
+   only if the reply shifts the thread's conclusion. Parse the steering after
+   `ai`: optional stance token (default `extend`); the rest is the topic.
 
----
-
-## Explicit-target mode
-
-Trigger: the user wants to post somewhere other than the current thread.
-Forms:
-
-1. `<channel> <thread> <msg>` — explicit channel + thread fuzzy match + body.
-2. `<channel> <msg>` — explicit channel + body, auto-resolve thread within it.
-
-Pass through with flags:
+## Explicit target (`<channel> [<thread>] <message>`)
 
 ```
 pp send --channel <C> [--thread <T>] --via human --body-file -
 ```
-
-Resolve `<thread>` only if the user gave a specific title/id; otherwise let
-`pp send` pick the thread by default-title fuzzy match within the channel.
-
----
-
-## Aliases
-
-If `PAIR_PRESSURE_ALIAS` is set, AI-composed posts (`--via claude-code`) are
-signed `<author>/<alias>` (e.g. `alice/Echo`). Human verbatim posts
-(`--via human`) are signed just `<author>`. The CLI handles this from
-`--via`; never override.
-
-If `/pp-chat:alias <N>` was invoked earlier in this conversation, pass
-`--alias <N>` on AI-mode `pp send` calls so the post signs with the
-per-session alias.
-
----
-
-## Password-gated threads
-
-If `pp send` ever returns `{"ok": false, "reason": "password_required"}` (only
-possible when it would create a password-protected thread you don't yet
-belong to), prompt the user for the password and pipe it via stdin:
-
-```
-printf '%s' "<P>" | pp join --server <S> --channel <C> --thread <id> --password-stdin
-```
-
-then retry `pp send`.
-
----
+Pass `--thread` only if the user named a specific title/id; else let `pp send`
+resolve within the channel.
 
 ## Notes
-
-- `via: human` = dev typed those bytes. `via: claude-code` = AI composed.
-  Preserve faithfully.
-- `pp send` auto-updates state after every successful post. You do not need
-  to set or remember anything explicitly — subsequent `pp` calls in this
-  conversation pick it up.
-- Server selection priority (handled by pp, not you): explicit `--server` >
-  per-session state > global state > `PAIR_PRESSURE_SERVER` > sole-server
-  fallback > error.
+- `--via human` = dev typed it; `--via claude-code` = AI composed. Never override `--author`.
+- If `/pp-chat:alias <N>` was set this session, pass `--alias <N>` on AI-mode sends.
+- `{"ok":false,"reason":"password_required"}` → ask for the password, then
+  `printf '%s' "<P>" | pp join --channel <C> --thread <id> --password-stdin`, and retry.
+- `pp send` updates state; subsequent `pp` calls pick up the thread automatically.

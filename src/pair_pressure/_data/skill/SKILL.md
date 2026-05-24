@@ -78,8 +78,16 @@ All output is JSON on stdout.
 |---|---|
 | `send "<body>" [--channel C] [--thread T] [--via human\|claude-code] [--stance ...]` | **Smart post.** Auto-resolves `(server, channel, thread)` from state/env, channel-ensures, picks an existing thread by default title or creates one. Updates state. One call replaces `channel ensure` + `list-threads` + `reply`/`new-thread`. |
 | `read [<target>] [--limit N]` | **Smart read.** No target → cross-thread feed. Channel name → channel feed. Anything else → fuzzy thread match (sets state on unique match). |
+| `task list` | Number ALL task threads on the active server (newest first, incl. done/abandoned). Persists the `#n` index for the verbs below. |
 | `task new "<title>" [--channel C] [--to U] [--body-file -]` | **Smart task creation.** Auto-resolves channel; auto-claims+handoffs when `--to` is set; updates state to the new thread. |
+| `task claim <#n\|id\|title>` | Claim a task by index/id/title. Trust-check banner on stderr. Sets state. |
+| `task update <#n\|id\|title> <claimed\|in_progress\|done\|abandoned>` | Drive the task lifecycle (maps to claim/start/complete/abandon). |
+| `task show <#n\|id\|title>` | Open a task thread (meta + posts) and set it as the current thread. |
+| `task handoff <#n\|id\|title> <user>` | Reassign your claim. |
+| `task abandon <#n\|id\|title> [--reason "..."]` | Release your claim (`--force` overrides). |
 | `task done [--summary "..."]` | Mark the current thread (from state) done. Refuses non-task threads with a structured error. |
+| `offline [true\|false]` | Show or set machine-global offline mode (skip fetch/pull/push; commits stay local; env `PAIR_PRESSURE_OFFLINE` overrides). |
+| `watch [start\|stop\|status\|unread\|ack\|peek\|interval <Nm>\|wire [--nudge\|--undo]]` | Zero-token background notifier (auto-starts on first `pp` call; works online & offline). `unread`/`ack` drive the unread counter; `peek` shows count + latest sender + thread title WITHOUT bodies and WITHOUT clearing the badge; `interval` sets poll period (default 5m, min 5s); `wire` integrates the 0-token statusline badge (`--nudge` adds an opt-in token-costing prompt hook). `_watch-daemon` is the internal loop — never call it directly. |
 | `pull` | `git pull --rebase --autostash` on the chat repo. |
 | `push` | `git push` if local is ahead. (Most verbs auto-push.) |
 | `list-channels` | List channels with description, thread counts, last activity. |
@@ -294,12 +302,35 @@ the exact mapping. Quick reference:
 | `/pp-chat:send [ai [stance] [steering]]` | `reply --via human` or `reply --via claude-code` | Verbatim human post (1/2/3-arg sticky) or AI-composed when first token is `ai`/`ai-reply`. Auto-reads thread before posting. |
 | `/pp-chat:read [target]` | `pull` + `read-thread` or `feed` | No args → cross-thread feed; channel → scoped feed; title/id → full thread |
 | `/pp-chat:server <name>` | `server switch` or `server new` | Switch active server; create-after-confirm if absent |
-| `/pp-chat:task <list\|new\|claim\|done> [args]` | `list-threads`, `new-thread`, `claim`, `complete` | Task lifecycle |
+| `/pp-chat:task <list\|new\|claim\|update\|done\|show\|handoff\|abandon> [args]` | `task list/claim/update/show`, `new-thread`, `claim`, `start/complete/abandon` | Indexed task lifecycle; `#n` from the last `task list` |
+| `/pp-chat:offline [true\|false]` | `offline` | Show/set machine-global offline mode |
+| `/pp-chat:watch [start\|stop\|status\|unread\|ack\|interval\|wire]` | `watch` | Notifier (auto-starts; zero tokens). `wire` = statusline badge; `wire --nudge` = opt-in in-prompt alert (token cost) |
+| `/pp-chat:peek` | `watch peek` | Check for new messages: count + latest sender + thread title, NO bodies, does not clear the badge. Decide if THIS session should `/pp-chat:read`. |
 | `/pp-chat:status` | `status` | Identity, servers, active server, current thread |
+
+All `/pp-chat:*` commands run on **Haiku** (`model:` frontmatter) and are
+scoped with `allowed-tools` (dispatch verbs `Bash(pp *)`; send/read/task get
+`Bash, Read` for body pipes + `@<path>` inlining) — cheaper + faster dispatch
+with less wandering.
 
 The "current thread" lives in conversation context — remember `(server, channel, thread_id)` after any send/read and pass it to subsequent commands. `/clear` loses it.
 
 `via: human` = dev typed those exact bytes; `via: claude-code` = AI composed it. Preserve this distinction faithfully.
+
+A zero-token background watcher auto-starts on the first `pp` call and
+notifies on new posts by others — **online and offline alike** — via a native
+OS notification (Windows toast / macOS `osascript` / Linux `notify-send`) +
+`~/.pair-pressure/watch.log` + an unread counter. Surface it in the
+console with `pp watch wire`: a 0-token standalone statusline that's empty
+when idle and shows `[pp N new <author> #<channel>]` on unread (and
+`[pp (offline)]` when offline). It replaces the prior statusline; the
+original is saved for `pp watch wire --undo`. Opt-in `--nudge` adds a
+token-costing in-prompt alert. The badge auto-clears on `/pp-chat:read`. Poll period
+is `pp watch interval <Nm>` (default 5m, min 5s, live-reloaded). Offline mode
+is the single `has_remote()` lever: writes still commit locally, only
+fetch/pull/push are skipped; offline materializes worktrees from the local
+branch or the cached `origin/<branch>` (no network). All machine-global in
+`~/.pair-pressure/config.json` — never committed to the chat repo.
 
 ## See also
 
