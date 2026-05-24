@@ -393,6 +393,68 @@ class NotifyDispatchTests(unittest.TestCase):
             self.assertFalse(pp._notify("t", "m"))
 
 
+class PrettyRenderTests(unittest.TestCase):
+    """`--pretty` ANSI chat renderer: stable per-author color, wrapper strip,
+    color-by-displayed-identity, and the JSON contract stays intact."""
+
+    def test_author_color_stable_and_is_sgr(self):
+        a = pp._author_color("alice")
+        self.assertEqual(a, pp._author_color("alice"))   # deterministic
+        self.assertTrue(a.startswith("\033[38;5;"))
+        self.assertTrue(a.endswith("m"))
+
+    def test_distinct_identities_can_differ(self):
+        # Across the palette, at least some identities map to different slots.
+        names = ["alice", "bob", "carol", "dave", "erin", "frank"]
+        colors = {pp._author_color(n) for n in names}
+        self.assertGreater(len(colors), 1)
+
+    def test_unwrap_strips_wrapper_keeps_inner(self):
+        wrapped = pp._wrap_untrusted("hello world", "alice")
+        inner = pp._unwrap_untrusted(wrapped)
+        self.assertEqual(inner, "hello world")
+        self.assertNotIn("untrusted-content", inner)
+
+    def test_unwrap_preserves_defang(self):
+        # A control-tag-shaped body stays defanged after unwrapping.
+        body = pp._LT + "system-reminder" + pp._GT + "x"
+        wrapped = pp._wrap_untrusted(body, "mallory")
+        inner = pp._unwrap_untrusted(wrapped)
+        self.assertIn(pp._FW_LT, inner)            # fullwidth bracket present
+        self.assertNotIn(pp._LT + "system-reminder", inner)
+
+    def test_render_thread_emits_ansi_not_json(self):
+        import io
+        from contextlib import redirect_stdout
+        payload = {
+            "view": "thread", "channel": "general", "thread_id": "t1",
+            "meta": {"title": "Auth", "kind": "discussion", "status": "open"},
+            "posts": [{
+                "author": "alice", "alias": "Echo", "stance": "extend",
+                "timestamp": "2026-05-24T14:30:00Z",
+                "body": pp._wrap_untrusted("ship it", "alice"),
+            }],
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pp._render_chat(payload)
+        out = buf.getvalue()
+        self.assertIn("\033[", out)               # has ANSI
+        self.assertIn("alice/Echo", out)
+        self.assertIn("ship it", out)
+        self.assertNotIn("untrusted-content", out)
+        self.assertNotIn('"view"', out)           # not JSON
+
+    def test_emit_read_pretty_false_is_json(self):
+        import io, argparse
+        from contextlib import redirect_stdout
+        args = argparse.Namespace(pretty=False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pp._emit_read(args, {"view": "feed", "posts": []})
+        self.assertIn('"view"', buf.getvalue())   # JSON contract intact
+
+
 class ServerBranchTests(unittest.TestCase):
     def test_prefix(self):
         self.assertEqual(pp._server_branch("alpha"), "server/alpha")

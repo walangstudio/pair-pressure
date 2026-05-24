@@ -5,11 +5,31 @@ model: claude-haiku-4-5-20251001
 allowed-tools: Bash, Read
 ---
 
-# DO NOT THINK. EXECUTE. Echo ONLY the returned JSON (thread_id, post_id). No preamble, no narration.
+# DO NOT THINK. EXECUTE. No preamble, no narration.
 
 `pp send` resolves server/channel/thread from state itself. Never pre-scan
 with `pp status`, `pp list-channels`, `pp list-threads`, or `pp read` — those
 are the noise we are eliminating.
+
+## Confirming the send (what the human sees)
+
+`pp send` returns JSON (`{"ok","kind","channel","thread_id","post_id"}`).
+**Do NOT print that JSON** — it's machine plumbing, not useful to a human, and
+`post_id` is `null` on a new thread by design. Instead, after a successful
+send, confirm in one short human line **what was posted and where**, then the
+message itself:
+
+```
+Sent to #<channel> › <thread_id>   (use "new thread" when kind=seed)
+
+<the exact message body that was posted>
+```
+
+This matters most in **AI mode**: the human needs to see the message you
+composed on their behalf. Echo the body you actually sent (after any
+`@<path>` inlining). If `--attach`/`@@` added files, append
+`(+ <n> attachment(s))`. On `{"ok":false,...}` handle the reason (see Notes) —
+don't show the success line.
 
 ## Fast path (DEFAULT — first token is NOT `ai`/`ai-reply`)
 

@@ -669,6 +669,104 @@ def _wrap_untrusted(body, author):
     return f"{open_tag}\n{_defang(body or '')}\n{close_tag}"
 
 
+def _unwrap_untrusted(body):
+    """Strip the `<untrusted-content ...>` frame added by `_wrap_untrusted`,
+    keeping the (still-defanged) inner text. Used by the --pretty renderer:
+    the colored author header is the visual external-data boundary, so the
+    textual wrapper is redundant noise on screen."""
+    if not isinstance(body, str):
+        return body
+    lines = body.split("\n")
+    if lines and lines[0].startswith(f"{_LT}untrusted-content"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == f"{_LT}/untrusted-content{_GT}":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+# Distinct 256-color foreground codes for per-author coloring. Red (1/9) is
+# deliberately omitted -- it reads as error/trust-banner. Deterministic: the
+# same author always maps to the same slot.
+_AUTHOR_PALETTE = (39, 208, 40, 170, 214, 51, 205, 118, 147, 220, 81, 213)
+_C_RST = "\033[0m"
+_C_DIM = "\033[2m"
+_C_BOLD = "\033[1m"
+
+
+def _author_color(name):
+    """Stable per-author 256-color SGR prefix. Dependency-free hash so the
+    mapping is identical across processes/machines (Python's built-in hash()
+    is salted per-run and would not be stable)."""
+    key = (name or "unknown").encode("utf-8", "replace")
+    idx = sum(key) % len(_AUTHOR_PALETTE)
+    return f"\033[38;5;{_AUTHOR_PALETTE[idx]}m"
+
+
+def _render_chat(payload):
+    """Print a read payload as ANSI-colored human chat (NOT JSON). Author
+    name + timestamp in the author's bold color; message body dim/neutral so
+    the colored nick stands out -- the standard IRC/Discord look. Forced
+    color: this is only ever called for `--pretty`, whose output renders in
+    the terminal/command panel."""
+    # Post bodies carry non-ASCII (em-dashes, etc.); the default Windows
+    # cp1252 stdout would raise UnicodeEncodeError. Force UTF-8 with graceful
+    # degradation. JSON output is unaffected (it's ensure_ascii).
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    view = payload.get("view") if isinstance(payload, dict) else None
+
+    if view == "ambiguous":
+        print(f"{_C_BOLD}Multiple threads match - pick one:{_C_RST}")
+        for m in payload.get("matches", []):
+            print(f"  #{m.get('channel')}  {m.get('thread_id')}")
+        return
+
+    if view == "thread":
+        meta = payload.get("meta", {}) or {}
+        ch = payload.get("channel", "?")
+        head = f"#{ch} > {meta.get('title') or payload.get('thread_id', '?')}"
+        bits = [meta.get("kind", "discussion")]
+        if meta.get("status"):
+            bits.append(meta["status"])
+        if meta.get("assignee"):
+            bits.append(f"@{meta['assignee']}")
+        print(f"{_C_BOLD}{head}{_C_RST}  {_C_DIM}({', '.join(bits)}){_C_RST}")
+        print(f"{_C_DIM}{'-' * min(len(head) + 8, 60)}{_C_RST}")
+        _render_posts(payload.get("posts", []), show_channel=False)
+        return
+
+    # feed / channel (bare list under "posts") or no-match feed
+    if view == "channel":
+        print(f"{_C_BOLD}#{payload.get('channel')}{_C_RST}")
+    elif payload.get("matched") is False:
+        print(f"{_C_DIM}(nothing matched '{payload.get('query')}' — "
+              f"showing recent feed){_C_RST}")
+    _render_posts(payload.get("posts", []), show_channel=(view != "channel"))
+
+
+def _render_posts(posts, show_channel):
+    for p in posts:
+        author = p.get("author") or "unknown"
+        alias = p.get("alias")
+        who = f"{author}/{alias}" if alias else author
+        # Color by displayed identity: distinct AI aliases under one git
+        # author are distinct chatters and must read as distinct colors.
+        col = _author_color(who)
+        ts = (p.get("timestamp") or "")[11:16]  # HH:MM from ISO
+        loc = ""
+        if show_channel:
+            loc = f" {_C_DIM}#{p.get('channel')} / {p.get('thread_title', '')}{_C_RST}"
+        stance = p.get("stance")
+        stance_s = f" {_C_DIM}[{stance}]{_C_RST}" if stance else ""
+        print(f"{_C_DIM}{ts}{_C_RST}  {col}{_C_BOLD}{who}{_C_RST}{stance_s}{loc}")
+        body = _unwrap_untrusted(p.get("body") or "")
+        for line in body.split("\n"):
+            print(f"   {col}{line}{_C_RST}")
+        print()
+
+
 def dump_slim(by, via, model, pid, stance, in_reply_to, body):
     by_line = f"by: {by} via={_short_via(via)}"
     sm = _short_model(model)
@@ -1873,6 +1971,16 @@ def cmd_send(args):
     })
 
 
+def _emit_read(args, payload):
+    """Emit a read payload: ANSI-colored chat when --pretty (and not being
+    captured in-process), else the JSON contract. Keeps every machine
+    consumer (MCP shim, _capture) on JSON untouched."""
+    if getattr(args, "pretty", False) and _OUT_CAPTURE is None:
+        _render_chat(payload)
+    else:
+        out(payload)
+
+
 def cmd_read(args):
     """Smart read: no target → feed; exact channel name → channel feed;
     otherwise fuzzy thread match → read-thread + update state. Ambiguous
@@ -1897,7 +2005,8 @@ def cmd_read(args):
             server=args.server, channel=None, since=None,
             limit=args.limit or 30, no_pull=True,
         )
-        out({"view": "feed", "posts": _capture(cmd_feed, feed_args) or []})
+        _emit_read(args, {"view": "feed",
+                          "posts": _capture(cmd_feed, feed_args) or []})
         return
 
     # Exact channel match?
@@ -1906,8 +2015,8 @@ def cmd_read(args):
             server=args.server, channel=target, since=None,
             limit=args.limit or 30, no_pull=True,
         )
-        out({"view": "channel", "channel": target,
-             "posts": _capture(cmd_feed, feed_args) or []})
+        _emit_read(args, {"view": "channel", "channel": target,
+                          "posts": _capture(cmd_feed, feed_args) or []})
         return
 
     # Fuzzy thread match. Prefer the channel-context candidate; otherwise
@@ -1924,12 +2033,12 @@ def cmd_read(args):
         )
         payload = _capture(cmd_read_thread, rt_args) or {}
         _state_save(server=args.server, channel=ch, thread_id=tid, source="read")
-        out({"view": "thread", "server": args.server, "channel": ch,
-             "thread_id": tid, **payload})
+        _emit_read(args, {"view": "thread", "server": args.server,
+                          "channel": ch, "thread_id": tid, **payload})
         return
 
     if len(matches) > 1:
-        out({"view": "ambiguous", "matches": [
+        _emit_read(args, {"view": "ambiguous", "matches": [
             {"channel": c, "thread_id": t} for c, t in matches[:20]
         ]})
         return
@@ -1939,8 +2048,8 @@ def cmd_read(args):
         server=args.server, channel=None, since=None,
         limit=args.limit or 30, no_pull=True,
     )
-    out({"view": "feed", "matched": False, "query": target,
-         "posts": _capture(cmd_feed, feed_args) or []})
+    _emit_read(args, {"view": "feed", "matched": False, "query": target,
+                      "posts": _capture(cmd_feed, feed_args) or []})
 
 
 def _fuzzy_thread_candidates(query, preferred_channel):
@@ -4049,6 +4158,9 @@ def main():
                     help="optional channel name or thread title/id substring")
     sp.add_argument("--limit", type=int, default=30)
     sp.add_argument("--no-pull", action="store_true")
+    sp.add_argument("--pretty", action="store_true",
+                    help="render human-readable ANSI-colored chat instead of "
+                         "JSON (per-author color); for terminal display")
     _add_server_arg(sp)
     sp.set_defaults(func=cmd_read)
 
