@@ -496,8 +496,10 @@ def _mcp_snippet(shape, env):
             }
         }, indent=2) + "\n"
     if shape == "toml":  # Codex CLI
+        def tstr(s):  # TOML basic-string escape (Windows paths have backslashes)
+            return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
         lines = ["[mcp_servers.pair-pressure]", 'command = "pair-pressure-mcp"']
-        env_pairs = ", ".join(f'{k} = "{v}"' for k, v in env.items())
+        env_pairs = ", ".join(f"{k} = {tstr(v)}" for k, v in env.items())
         lines.append(f"env = {{ {env_pairs} }}")
         return "\n".join(lines) + "\n"
     raise ValueError(f"unknown MCP client shape: {shape}")

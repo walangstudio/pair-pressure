@@ -507,6 +507,14 @@ class McpClientConfigTests(unittest.TestCase):
         self.assertIn('command = "pair-pressure-mcp"', text)
         self.assertIn('PAIR_PRESSURE_REPO = "/abs/chat"', text)
 
+    def test_codex_toml_escapes_windows_path(self):
+        # Backslashes in a TOML basic string must be escaped or the file is
+        # invalid TOML (\c is an illegal escape, \t parses as a tab).
+        snip = self.mod._mcp_snippet(
+            "toml", self.mod._mcp_env(r"C:\chat\team", "alice"))
+        self.assertIn(r'PAIR_PRESSURE_REPO = "C:\\chat\\team"', snip)
+        self.assertNotIn(r'"C:\chat\team"', snip)
+
     def test_idempotent_overwrite(self):
         p1, _ = self.mod.write_mcp_client_config("cline", "/abs/chat", "alice")
         first = p1.read_text(encoding="utf-8")
