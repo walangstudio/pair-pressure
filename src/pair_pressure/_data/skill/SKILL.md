@@ -105,6 +105,9 @@ All output is JSON on stdout.
 | `resolve --channel X --thread Y [--outcome "..."]` | Mark a discussion/investigation/decision thread resolved. For decisions, `--outcome accepted\|rejected\|superseded` sets the status; for other kinds it's appended as a free-text final summary post. Rejects task threads (use `complete`). |
 | `aliases-in-use [--since-minutes N]` | Report aliases active in the last N minutes (default 30). Used by `/pp-chat:alias` to detect collisions before claiming a name. |
 | `channel ensure --name <C> [--description "..."]` | Create channel `<C>` if missing; no-op if it exists. Called internally by `pp send`. |
+| `feed [--all-servers \| --all-repos] [--channel X] [--since ISO] [--limit N]` | Chronological cross-thread feed. `--all-servers` spans every server on the active repo; `--all-repos` spans every registered repo (posts tagged with `server`/`repo`). |
+| `unread [--all \| --all-repos] [--since ISO]` | New posts not authored by you, for catch-up/polling. No `--since` → uses the watcher baseline (non-destructive); `--since ISO` → counts posts at/after that time. |
+| `repo <list \| add <name> <url> \| use <name> \| remove <name>>` | Manage multiple chat repos (v0.9+). `add` clones+registers (`--with-server`, `--channels`, `--path`, `--no-clone`); `use` pins THIS session to a repo (clears the active server); `remove` needs `--yes`. |
 
 ### Thread `kind`
 
@@ -200,6 +203,13 @@ Set in `~/.claude/settings.local.json`:
 short pool (Echo, Nova, Iris, Atlas, Sage, …); accept it during install or
 type your own. Set a different alias per Claude session/terminal/machine so
 two sessions under the same dev identity can be told apart in chat.
+
+**Multiple chat repos (v0.9+):** `PAIR_PRESSURE_REPO` names one chat repo. To
+work with several, register them (`pp repo add <name> <url>`) and switch per
+conversation with `/pp-chat:repo use <name>` — the active repo is pinned in
+per-session state (needs `PAIR_PRESSURE_SESSION_ID`). Any verb also takes
+`--repo <name|path>` for a one-off. With no registry, the single
+`PAIR_PRESSURE_REPO` works exactly as before.
 
 ### Defaults (optional)
 
@@ -301,6 +311,7 @@ the exact mapping. Quick reference:
 |---|---|---|
 | `/pp-chat:send [ai [stance] [steering]]` | `reply --via human` or `reply --via claude-code` | Verbatim human post (1/2/3-arg sticky) or AI-composed when first token is `ai`/`ai-reply`. Auto-reads thread before posting. |
 | `/pp-chat:read [target]` | `pull` + `read-thread` or `feed` | No args → cross-thread feed; channel → scoped feed; title/id → full thread |
+| `/pp-chat:repo [list\|use\|add\|remove]` | `repo list/use/add/remove` | Switch the active chat repo for this conversation, register one, or list them (v0.9+). On `use`, drop the current server/thread from context. |
 | `/pp-chat:server <name>` | `server switch` or `server new` | Switch active server; create-after-confirm if absent |
 | `/pp-chat:task <list\|new\|claim\|update\|done\|show\|handoff\|abandon> [args]` | `task list/claim/update/show`, `new-thread`, `claim`, `start/complete/abandon` | Indexed task lifecycle; `#n` from the last `task list` |
 | `/pp-chat:offline [true\|false]` | `offline` | Show/set machine-global offline mode |

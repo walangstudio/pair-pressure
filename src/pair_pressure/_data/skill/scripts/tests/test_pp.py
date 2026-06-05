@@ -1306,6 +1306,358 @@ class StatusCurrentBlockTests(unittest.TestCase):
         self.assertEqual(payload["current"]["thread_id"], "sess-thread")
 
 
+# ---- multi-repo (v0.9+) ----
+
+def _mkgit(parent, name):
+    """Create a tempdir-like child with a .git marker; return its Path."""
+    d = Path(parent) / name
+    (d / ".git").mkdir(parents=True)
+    return d
+
+
+class ReposRegistryTests(unittest.TestCase):
+    """repos.json load/save/tolerance, anchored under _PP_HOME."""
+
+    def setUp(self):
+        self._home = tempfile.TemporaryDirectory()
+        self._patch = unittest.mock.patch.object(
+            pp, "_PP_HOME", Path(self._home.name))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._home.cleanup()
+
+    def test_load_default_when_missing(self):
+        self.assertEqual(pp._repos_load(), {"schema_version": 1, "repos": []})
+
+    def test_save_then_load(self):
+        data = {"schema_version": 1,
+                "repos": [{"name": "work", "path": "/x", "remote": "u"}]}
+        pp._repos_save(data)
+        self.assertEqual(pp._repos_load(), data)
+
+    def test_malformed_returns_default(self):
+        p = pp._repos_registry_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json", encoding="utf-8")
+        self.assertEqual(pp._repos_load(), {"schema_version": 1, "repos": []})
+
+    def test_path_under_pp_home(self):
+        self.assertEqual(pp._repos_registry_path(),
+                         Path(self._home.name) / "repos.json")
+
+    def test_repo_entry_lookup(self):
+        pp._repos_save({"schema_version": 1,
+                        "repos": [{"name": "a", "path": "/p"}]})
+        self.assertEqual(pp._repo_entry("a")["path"], "/p")
+        self.assertIsNone(pp._repo_entry("nope"))
+
+
+class MainRepoPathPriorityTests(unittest.TestCase):
+    """_main_repo_path priority: override > session > env > sole > die.
+    The env-only / no-registry path is the back-compat guarantee."""
+
+    def setUp(self):
+        self._home = tempfile.TemporaryDirectory()
+        self._ppwd = tempfile.TemporaryDirectory()
+        self._patch_home = unittest.mock.patch.object(
+            pp, "_PP_HOME", Path(self._ppwd.name))
+        self._patch_home.start()
+        self._scratch = tempfile.TemporaryDirectory()
+        self._envrepo = _mkgit(self._scratch.name, "envrepo")
+        self._regrepo = _mkgit(self._scratch.name, "regrepo")
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_SESSION_ID",
+                        "HOME", "USERPROFILE")}
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        os.environ.pop("PAIR_PRESSURE_SESSION_ID", None)
+        pp._REPO_OVERRIDE = None
+
+    def tearDown(self):
+        pp._REPO_OVERRIDE = None
+        self._patch_home.stop()
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._home.cleanup()
+        self._ppwd.cleanup()
+        self._scratch.cleanup()
+
+    def test_env_used_when_no_registry_backcompat(self):
+        os.environ["PAIR_PRESSURE_REPO"] = str(self._envrepo)
+        with unittest.mock.patch.object(pp, "_session_repo_name",
+                                        return_value=None):
+            self.assertEqual(pp._main_repo_path(), self._envrepo)
+
+    def test_override_wins(self):
+        os.environ["PAIR_PRESSURE_REPO"] = str(self._envrepo)
+        pp._REPO_OVERRIDE = self._regrepo
+        self.assertEqual(pp._main_repo_path(), self._regrepo)
+
+    def test_session_repo_beats_env(self):
+        os.environ["PAIR_PRESSURE_REPO"] = str(self._envrepo)
+        with unittest.mock.patch.object(pp, "_session_repo_name",
+                                        return_value="work"), \
+             unittest.mock.patch.object(
+                 pp, "_repos_list",
+                 return_value=[{"name": "work", "path": str(self._regrepo)}]):
+            self.assertEqual(pp._main_repo_path(), self._regrepo)
+
+    def test_session_pin_ignored_when_no_registry(self):
+        # A stale session pin with an empty registry must not block the env
+        # var (a pin can only name a registered repo).
+        os.environ["PAIR_PRESSURE_REPO"] = str(self._envrepo)
+        with unittest.mock.patch.object(pp, "_session_repo_name",
+                                        return_value="work"), \
+             unittest.mock.patch.object(pp, "_repos_list", return_value=[]):
+            self.assertEqual(pp._main_repo_path(), self._envrepo)
+
+    def test_sole_repo_fallback(self):
+        os.environ.pop("PAIR_PRESSURE_REPO", None)
+        with unittest.mock.patch.object(pp, "_session_repo_name",
+                                        return_value=None), \
+             unittest.mock.patch.object(
+                 pp, "_repos_list",
+                 return_value=[{"name": "only", "path": str(self._regrepo)}]):
+            self.assertEqual(pp._main_repo_path(), self._regrepo)
+
+    def test_die_when_nothing_resolves(self):
+        os.environ.pop("PAIR_PRESSURE_REPO", None)
+        with unittest.mock.patch.object(pp, "_session_repo_name",
+                                        return_value=None), \
+             unittest.mock.patch.object(pp, "_repos_list", return_value=[]):
+            with self.assertRaises(SystemExit):
+                pp._main_repo_path()
+
+    def test_session_repo_name_no_recursion(self):
+        # _session_repo_name reads the per-session file under HOME and must
+        # NOT route through _main_repo_path (which would recurse).
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "sess-x"
+        sp = pp._state_path_session()
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text('{"repo": "work"}', encoding="utf-8")
+        with unittest.mock.patch.object(
+                pp, "_main_repo_path",
+                side_effect=AssertionError("must not recurse")):
+            self.assertEqual(pp._session_repo_name(), "work")
+
+
+class StateRepoFieldTests(unittest.TestCase):
+    """The per-session `repo` field: persist, preserve, clear, schema bump."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        repo = Path(self._td.name)
+        (repo / ".git").mkdir()
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_SESSION_ID",
+                        "HOME", "USERPROFILE")}
+        os.environ["PAIR_PRESSURE_REPO"] = str(repo)
+        self._home = tempfile.TemporaryDirectory()
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "s1"
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._td.cleanup()
+        self._home.cleanup()
+
+    def _session(self):
+        return pp._state_load_one(pp._state_path_session())
+
+    def test_repo_persists_and_schema_is_2(self):
+        pp._state_save(repo="work", source="repo_use", session_only=True)
+        sess = self._session()
+        self.assertEqual(sess["repo"], "work")
+        self.assertEqual(sess["schema_version"], 2)
+
+    def test_routine_write_preserves_repo(self):
+        pp._state_save(repo="work", session_only=True)
+        pp._state_save(server="eng", channel="general", thread_id="t",
+                       session_only=True)
+        sess = self._session()
+        self.assertEqual(sess["repo"], "work")
+        self.assertEqual(sess["server"], "eng")
+
+    def test_clear_repo_unpins(self):
+        pp._state_save(repo="work", session_only=True)
+        pp._state_save(clear_repo=True, session_only=True)
+        sess = self._session()
+        self.assertIsNone(sess["repo"])
+
+    def test_old_schema1_file_loads(self):
+        sp = pp._state_path_session()
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text('{"schema_version": 1, "server": "a", '
+                      '"channel": "c", "thread_id": "t"}', encoding="utf-8")
+        sess = self._session()
+        self.assertEqual(sess["server"], "a")
+        self.assertIsNone(sess.get("repo"))
+
+
+class ConcurrencyIsolationTests(unittest.TestCase):
+    """Two sessions pin different repos without clobbering each other."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PAIR_PRESSURE_SESSION_ID", "HOME", "USERPROFILE")}
+        self._home = tempfile.TemporaryDirectory()
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._home.cleanup()
+
+    def test_distinct_session_repos(self):
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "A"
+        pp._state_save(repo="work", session_only=True)
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "B"
+        pp._state_save(repo="oss", session_only=True)
+        self.assertEqual(pp._session_repo_name(), "oss")
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "A"
+        self.assertEqual(pp._session_repo_name(), "work")
+
+
+class RepoVerbTests(unittest.TestCase):
+    """cmd_repo_use / cmd_repo_add / cmd_repo_remove validation + effects."""
+
+    def setUp(self):
+        self._home = tempfile.TemporaryDirectory()
+        self._patch_home = unittest.mock.patch.object(
+            pp, "_PP_HOME", Path(self._home.name))
+        self._patch_home.start()
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PAIR_PRESSURE_AUTHOR", "PAIR_PRESSURE_SESSION_ID",
+                        "PAIR_PRESSURE_REPO", "HOME", "USERPROFILE")}
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        os.environ["PAIR_PRESSURE_AUTHOR"] = "alice"
+        os.environ["PAIR_PRESSURE_SESSION_ID"] = "s1"
+        os.environ.pop("PAIR_PRESSURE_REPO", None)  # hermetic vs ambient env
+        self._scratch = tempfile.TemporaryDirectory()
+        self._repo = _mkgit(self._scratch.name, "work")
+        pp._REPO_OVERRIDE = None
+
+    def tearDown(self):
+        pp._REPO_OVERRIDE = None
+        self._patch_home.stop()
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._home.cleanup()
+        self._scratch.cleanup()
+
+    def _ns(self, **kw):
+        import argparse
+        return argparse.Namespace(**kw)
+
+    def test_repo_use_pins_and_clears_server(self):
+        with unittest.mock.patch.object(
+                pp, "_repo_entry",
+                return_value={"name": "work", "path": str(self._repo)}):
+            res = pp._capture(pp.cmd_repo_use, self._ns(name="work"))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["active_repo"], "work")
+        self.assertTrue(res["sticky"])
+        # Read the per-session file directly: cmd_repo_use writes session-only,
+        # and _state_load() would also resolve the global path via
+        # _main_repo_path (registry lookup of the just-pinned repo).
+        sess = pp._state_load_one(pp._state_path_session())
+        self.assertEqual(sess["repo"], "work")
+        self.assertIsNone(sess["server"])
+
+    def test_repo_use_unknown_dies(self):
+        with unittest.mock.patch.object(pp, "_repo_entry", return_value=None):
+            with self.assertRaises(SystemExit):
+                pp.cmd_repo_use(self._ns(name="ghost"))
+
+    def test_repo_add_bad_name_dies(self):
+        with self.assertRaises(SystemExit):
+            pp.cmd_repo_add(self._ns(name="Bad Name", url="u", path=None,
+                                     no_clone=False, with_server=None,
+                                     channels=None))
+
+    def test_repo_add_duplicate_dies(self):
+        with unittest.mock.patch.object(
+                pp, "_repo_entry", return_value={"name": "work"}):
+            with self.assertRaises(SystemExit):
+                pp.cmd_repo_add(self._ns(name="work", url="u", path=None,
+                                         no_clone=False, with_server=None,
+                                         channels=None))
+
+    def test_repo_remove_without_yes_dies(self):
+        with unittest.mock.patch.object(
+                pp, "_repo_entry",
+                return_value={"name": "work", "path": str(self._repo)}):
+            with self.assertRaises(SystemExit):
+                pp.cmd_repo_remove(self._ns(name="work", yes=False,
+                                            delete_clone=False))
+
+    def test_repo_remove_yes_unregisters(self):
+        pp._repos_save({"schema_version": 1,
+                        "repos": [{"name": "work", "path": str(self._repo)}]})
+        res = pp._capture(pp.cmd_repo_remove,
+                          self._ns(name="work", yes=True, delete_clone=False))
+        self.assertTrue(res["ok"])
+        self.assertIsNone(pp._repo_entry("work"))
+
+
+class CollectFeedPostsTests(unittest.TestCase):
+    """_collect_feed_posts tags server/repo and honors --since."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name) / "channels"
+        thread = self.root / "general" / "2026-01-01_topic"
+        thread.mkdir(parents=True)
+        (thread / "meta.json").write_text(
+            '{"title": "Topic", "kind": "discussion", "status": "open"}',
+            encoding="utf-8")
+        # Two legacy-format posts (parse_post falls back to YAML frontmatter).
+        (thread / "001-seed.md").write_text(
+            "---\nid: 001\nauthor: alice\nvia: human\nstance: extend\n"
+            "timestamp: 2026-01-01T00:00:00Z\n---\nfirst\n", encoding="utf-8")
+        (thread / "002-reply.md").write_text(
+            "---\nid: 002\nauthor: bob\nvia: human\nstance: extend\n"
+            "timestamp: 2026-02-01T00:00:00Z\n---\nsecond\n", encoding="utf-8")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_tags_server_and_repo(self):
+        posts = pp._collect_feed_posts(self.root, None, server="eng",
+                                       repo="work")
+        self.assertEqual(len(posts), 2)
+        self.assertTrue(all(p["server"] == "eng" for p in posts))
+        self.assertTrue(all(p["repo"] == "work" for p in posts))
+
+    def test_no_tags_when_unset(self):
+        posts = pp._collect_feed_posts(self.root, None)
+        self.assertNotIn("server", posts[0])
+        self.assertNotIn("repo", posts[0])
+
+    def test_since_filters(self):
+        posts = pp._collect_feed_posts(self.root, "2026-01-15T00:00:00Z")
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["author"], "bob")
+
+
 if __name__ == "__main__":
     # Don't require env vars to be set just to run tests.
     os.environ.setdefault("PAIR_PRESSURE_REPO", "/tmp/_pp_unused")
