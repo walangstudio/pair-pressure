@@ -443,6 +443,80 @@ def write_shell_profile(env_updates):
     return written
 
 
+# ---- MCP client config (non-Claude clients) ----
+
+# Each entry: (snippet filename, shape, human-readable canonical destination).
+# We write a ready-to-use snippet rather than mutating the client's real
+# config in place -- the on-disk location of several of these (Cline/Kilo
+# live in editor extension storage) varies by OS/editor/version, and a
+# wrong-path or malformed write is worse than a copy-paste. CLIENTS.md lists
+# the canonical paths.
+MCP_CLIENTS = {
+    "cursor":   ("cursor.mcp.json",   "mcpservers",
+                 "~/.cursor/mcp.json (global) or <project>/.cursor/mcp.json"),
+    "cline":    ("cline.mcp.json",    "mcpservers",
+                 "Cline panel > MCP Servers > Configure (cline_mcp_settings.json)"),
+    "kilo":     ("kilo.mcp.json",     "mcpservers",
+                 "Kilo Code > MCP settings (mcp_settings.json)"),
+    "opencode": ("opencode.json",     "opencode",
+                 "~/.config/opencode/opencode.json"),
+    "codex":    ("codex.config.toml", "toml",
+                 "~/.codex/config.toml"),
+}
+
+
+def _mcp_env(chat_repo, author, alias=None):
+    env = {
+        "PAIR_PRESSURE_REPO": str(chat_repo),
+        "PAIR_PRESSURE_AUTHOR": author,
+    }
+    if alias:
+        env["PAIR_PRESSURE_ALIAS"] = alias
+    return env
+
+
+def _mcp_snippet(shape, env):
+    """Render an MCP server config snippet for the given client shape."""
+    if shape == "mcpservers":  # Cursor / Cline / Kilo
+        return json.dumps({
+            "mcpServers": {
+                "pair-pressure": {"command": "pair-pressure-mcp", "env": env}
+            }
+        }, indent=2) + "\n"
+    if shape == "opencode":
+        return json.dumps({
+            "$schema": "https://opencode.ai/config.json",
+            "mcp": {
+                "pair-pressure": {
+                    "type": "local",
+                    "command": ["pair-pressure-mcp"],
+                    "enabled": True,
+                    "environment": env,
+                }
+            }
+        }, indent=2) + "\n"
+    if shape == "toml":  # Codex CLI
+        lines = ["[mcp_servers.pair-pressure]", 'command = "pair-pressure-mcp"']
+        env_pairs = ", ".join(f'{k} = "{v}"' for k, v in env.items())
+        lines.append(f"env = {{ {env_pairs} }}")
+        return "\n".join(lines) + "\n"
+    raise ValueError(f"unknown MCP client shape: {shape}")
+
+
+def write_mcp_client_config(client, chat_repo, author, alias=None):
+    """Write a ready-to-use MCP config snippet for `client` under
+    ~/.pair-pressure/mcp/. Returns (snippet_path, canonical_destination).
+    Idempotent: overwrites the snippet each run."""
+    filename, shape, dest = MCP_CLIENTS[client]
+    env = _mcp_env(chat_repo, author, alias)
+    content = _mcp_snippet(shape, env)
+    out_dir = Path.home() / ".pair-pressure" / "mcp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / filename
+    path.write_text(content, encoding="utf-8")
+    return path, dest
+
+
 # ---- skill install ----
 
 def _is_junction_or_symlink(p: Path) -> bool:
@@ -1048,6 +1122,16 @@ def fresh_install_flow(args):
     for path, action in write_shell_profile(env_updates):
         print(f"  shell profile: {action} {path}")
 
+    # Optional: MCP config snippets for non-Claude clients (opt-in).
+    if args.mcp_client:
+        print("\nMCP client config snippets (non-Claude clients):")
+        for client in args.mcp_client:
+            snippet, dest = write_mcp_client_config(
+                client, chat_repo, author, alias)
+            print(f"  {client}: wrote {snippet}")
+            print(f"    -> merge into {dest}")
+        print("  (see docs/CLIENTS.md for per-client wiring details)")
+
     # Verify
     resolved_server = env_updates.get("PAIR_PRESSURE_SERVER")
     label = (f"pp list-channels --server {resolved_server}"
@@ -1110,6 +1194,12 @@ def main():
     ap.add_argument("--no-skill", action="store_true", help="skip skill install")
     ap.add_argument("--commands",    action="store_true", help="install slash commands (default: prompt yes)")
     ap.add_argument("--no-commands", action="store_true", help="skip slash commands install")
+    ap.add_argument("--mcp-client", action="append", default=None,
+                    choices=sorted(MCP_CLIENTS),
+                    metavar="CLIENT",
+                    help="generate an MCP config snippet for a non-Claude "
+                         "client (codex|opencode|cline|cursor|kilo); "
+                         "repeatable. Opt-in: omitted = Claude Code only.")
 
     args = ap.parse_args()
 
