@@ -1127,6 +1127,8 @@ def fresh_install_flow(args):
     # Optional: MCP config snippets for non-Claude clients (opt-in).
     if args.mcp_client:
         print("\nMCP client config snippets (non-Claude clients):")
+        print("  prerequisite: install the MCP extra so the server can start:")
+        print('    pip install "pair-pressure[mcp]"  (or: uv tool install "pair-pressure[mcp]")')
         for client in args.mcp_client:
             snippet, dest = write_mcp_client_config(
                 client, chat_repo, author, alias)
