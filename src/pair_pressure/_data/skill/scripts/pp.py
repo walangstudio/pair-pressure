@@ -912,6 +912,23 @@ def _render_chat(payload):
             print(f"  #{san(str(m.get('channel')))}  {san(str(m.get('thread_id')))}")
         return
 
+    if view == "message":
+        if payload.get("matched") is False:
+            print(f"{_C_DIM}(no post matched "
+                  f"'{san(str(payload.get('query')))}'){_C_RST}")
+            return
+        _render_posts([payload.get("post") or {}], show_channel=True)
+        return
+
+    if view == "ambiguous_message":
+        print(f"{_C_BOLD}Multiple posts match "
+              f"'{san(str(payload.get('query')))}' - use a longer id:{_C_RST}")
+        for m in payload.get("matches", []):
+            print(f"  {san(str(m.get('id')))}  {_C_DIM}#"
+                  f"{san(str(m.get('channel')))} / "
+                  f"{san(str(m.get('thread_title')))}{_C_RST}")
+        return
+
     if view == "thread":
         meta = payload.get("meta", {}) or {}
         ch = san(str(payload.get("channel", "?")))
@@ -928,11 +945,22 @@ def _render_chat(payload):
         return
 
     # feed / channel (bare list under "posts") or no-match feed
+    active = payload.get("active_channel")
     if view == "channel":
         print(f"{_C_BOLD}#{san(str(payload.get('channel')))}{_C_RST}")
-    elif payload.get("matched") is False:
-        print(f"{_C_DIM}(nothing matched '{san(str(payload.get('query')))}' - "
-              f"showing recent feed){_C_RST}")
+        # Reading a channel does NOT change where you send -- say so when the
+        # active channel differs from the one being viewed.
+        if active and active != payload.get("channel"):
+            print(f"{_C_DIM}(active: #{san(str(active))} - your next send "
+                  f"lands here){_C_RST}")
+    else:
+        if payload.get("matched") is False:
+            print(f"{_C_DIM}(nothing matched "
+                  f"'{san(str(payload.get('query')))}' - showing recent "
+                  f"feed){_C_RST}")
+        if active:
+            print(f"{_C_DIM}(active: #{san(str(active))} - your next send "
+                  f"lands here){_C_RST}")
     _render_posts(payload.get("posts", []), show_channel=(view != "channel"))
 
 
@@ -952,7 +980,12 @@ def _render_posts(posts, show_channel):
                    f"{san(p.get('thread_title') or '')}{_C_RST}")
         stance = san(p.get("stance") or "")
         stance_s = f" {_C_DIM}[{stance}]{_C_RST}" if stance else ""
-        print(f"{_C_DIM}{ts}{_C_RST}  {col}{_C_BOLD}{who}{_C_RST}{stance_s}{loc}")
+        sid = san(p.get("id") or "")
+        # Short id handle (last 6 chars) so a truncated post can be fetched in
+        # full via `pp read --message <id>`. Matches read.md's convention.
+        ids = f" {_C_DIM}·{sid[-6:]}{_C_RST}" if sid else ""
+        print(f"{_C_DIM}{ts}{_C_RST}  {col}{_C_BOLD}{who}{_C_RST}"
+              f"{stance_s}{loc}{ids}")
         body = _unwrap_untrusted(p.get("body") or "")
         for line in body.split("\n"):
             print(f"   {col}{san(line)}{_C_RST}")
@@ -1099,9 +1132,13 @@ def cmd_list_channels(args):
         maybe_pull()
     root = repo_path() / "channels"
     channels = []
+    show_all = getattr(args, "all", False)
     if root.exists():
         for ch in sorted(p for p in root.iterdir() if p.is_dir()):
             meta = read_json(ch / "channel.json", {"name": ch.name, "description": ""})
+            archived = bool(meta.get("archived"))
+            if archived and not show_all:
+                continue
             threads = [t for t in ch.iterdir() if t.is_dir()]
             last_ts = max((t.stat().st_mtime for t in threads), default=ch.stat().st_mtime)
             channels.append({
@@ -1109,6 +1146,7 @@ def cmd_list_channels(args):
                 "description": meta.get("description", ""),
                 "thread_count": len(threads),
                 "last_activity": datetime.fromtimestamp(last_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "archived": archived,
             })
     out(channels)
 
@@ -2040,8 +2078,44 @@ def _thread_exists(channel, thread):
         return False
 
 
-def _channel_exists(channel):
-    return bool(channel) and (repo_path() / "channels" / channel).is_dir()
+def _channel_archived(ch_dir):
+    """True when a channel dir is archived (channel.json `archived: true`).
+    Archived channels keep their history but drop out of list/feed/read/watch."""
+    try:
+        meta = read_json(ch_dir / "channel.json", {})
+    except (OSError, ValueError):
+        return False
+    return bool(isinstance(meta, dict) and meta.get("archived"))
+
+
+def _active_channel_dirs(channels_root):
+    """Sorted, non-archived channel subdirs under a `channels/` root."""
+    if not channels_root.is_dir():
+        return []
+    return [p for p in sorted(channels_root.iterdir())
+            if p.is_dir() and not _channel_archived(p)]
+
+
+def _channel_active(name):
+    """True when channel `name` exists AND is not archived."""
+    if not name:
+        return False
+    d = repo_path() / "channels" / name
+    return d.is_dir() and not _channel_archived(d)
+
+
+def _archived_names(wt):
+    """Set of archived channel names from a worktree's channels/*/channel.json.
+    The watcher's git-ls-tree scan lists committed paths but not their content,
+    so it filters with this (read off the local worktree)."""
+    names = set()
+    ch_root = wt / "channels"
+    if not ch_root.is_dir():
+        return names
+    for ch_dir in ch_root.iterdir():
+        if ch_dir.is_dir() and _channel_archived(ch_dir):
+            names.add(ch_dir.name)
+    return names
 
 
 def _find_thread_by_title_slug(channel, title):
@@ -2070,8 +2144,9 @@ def _find_thread_by_title_slug(channel, title):
 
 
 def _ensure_channel_inline(server, name):
-    """Make sure channel exists in the active server's worktree. Idempotent."""
-    if _channel_exists(name):
+    """Make sure the channel exists AND is active in the active server's
+    worktree. Sending to an archived channel revives it. Idempotent."""
+    if _channel_active(name):
         return
     ns = argparse.Namespace(name=name, description=None, server=server)
     _capture(cmd_channel_ensure, ns)
@@ -2097,6 +2172,13 @@ def cmd_send(args):
     _activate_server(args)
     maybe_pull()
     _ensure_channel_inline(args.server, args.channel)
+
+    # Always-on awareness: when the channel was resolved implicitly (state/env/
+    # default, not an explicit --channel), tell the user where this lands.
+    csource = resolved["sources"].get("channel")
+    if csource != "arg":
+        print(f"(active channel: #{args.channel} [from {csource}])",
+              file=sys.stderr)
 
     # Stored thread might point at one that no longer exists or moved
     # channels; fall through to title-match in that case.
@@ -2128,6 +2210,7 @@ def cmd_send(args):
             "kind": "reply",
             "server": args.server,
             "channel": args.channel,
+            "channel_source": csource,
             "thread_id": target,
             "post_id": payload.get("reply_id"),
         })
@@ -2158,6 +2241,7 @@ def cmd_send(args):
         "kind": "seed",
         "server": args.server,
         "channel": args.channel,
+        "channel_source": csource,
         "thread_id": new_tid,
         "post_id": None,
     })
@@ -2190,6 +2274,27 @@ def cmd_read(args):
     if not getattr(args, "no_pull", False):
         maybe_pull()
 
+    # Where the user's next /pp-chat:send will land -- surfaced in every
+    # feed/channel view so they're never unsure of their active channel.
+    active_ch = (
+        (sess.get("channel") if sess else None)
+        or (glob.get("channel") if glob else None)
+        or _default_channel()
+    )
+
+    mid = getattr(args, "message_id", None)
+    if mid:
+        hit = _find_post_by_id(mid)
+        if hit is None:
+            _emit_read(args, {"view": "message", "matched": False,
+                              "query": mid})
+        elif isinstance(hit, dict) and "ambiguous" in hit:
+            _emit_read(args, {"view": "ambiguous_message", "query": mid,
+                              "matches": hit["ambiguous"]})
+        else:
+            _emit_read(args, {"view": "message", "post": hit})
+        return
+
     target = (args.target or "").strip()
 
     if not target:
@@ -2197,17 +2302,18 @@ def cmd_read(args):
             server=args.server, channel=None, since=None,
             limit=args.limit or 30, no_pull=True,
         )
-        _emit_read(args, {"view": "feed",
+        _emit_read(args, {"view": "feed", "active_channel": active_ch,
                           "posts": _capture(cmd_feed, feed_args) or []})
         return
 
-    # Exact channel match?
-    if _channel_exists(target):
+    # Exact channel match? (archived channels are hidden -- fall through.)
+    if _channel_active(target):
         feed_args = argparse.Namespace(
             server=args.server, channel=target, since=None,
             limit=args.limit or 30, no_pull=True,
         )
         _emit_read(args, {"view": "channel", "channel": target,
+                          "active_channel": active_ch,
                           "posts": _capture(cmd_feed, feed_args) or []})
         return
 
@@ -2241,7 +2347,67 @@ def cmd_read(args):
         limit=args.limit or 30, no_pull=True,
     )
     _emit_read(args, {"view": "feed", "matched": False, "query": target,
+                      "active_channel": active_ch,
                       "posts": _capture(cmd_feed, feed_args) or []})
+
+
+def _post_row(post_file, channel, thread_dir, thread_title):
+    """Feed-row dict for a single post with the FULL (untruncated) body.
+    Mirrors a `_collect_feed_posts` row so the --pretty/JSON renderers handle
+    it unchanged."""
+    fm, body = parse_post(post_file.read_text())
+    meta = read_json(thread_dir / "meta.json", {})
+    return {
+        "channel": channel,
+        "thread": thread_dir.name,
+        "thread_title": thread_title,
+        "thread_kind": meta.get("kind", "discussion"),
+        "thread_status": meta.get("status"),
+        "id": fm.get("id", _stem_id(post_file)),
+        "author": fm.get("author"),
+        "alias": fm.get("alias"),
+        "via": fm.get("via"),
+        "stance": fm.get("stance"),
+        "timestamp": fm.get("timestamp") or "",
+        "body": _wrap_untrusted(body.strip(), fm.get("author")),
+        "filename": post_file.name,
+    }
+
+
+def _find_post_by_id(post_id):
+    """Locate one post by id across the active server's (non-archived)
+    channels. `post_id` may be a full id (`YYYYMMDDTHHMMSSfffZ` or legacy
+    `NNN`) or a short handle (e.g. the last 6 chars shown in --pretty).
+    Returns the full-body post row on a unique match, `{"ambiguous": [...]}`
+    when a short handle hits >1 post, or None on no match. An exact full-id
+    match always wins over partial hits."""
+    q = str(post_id or "").strip()
+    if not q:
+        return None
+    ch_root = repo_path() / "channels"
+    if not ch_root.is_dir():
+        return None
+    partial = []
+    for ch_dir in _active_channel_dirs(ch_root):
+        for tdir in sorted(p for p in ch_dir.iterdir() if p.is_dir()):
+            meta = read_json(tdir / "meta.json", {})
+            title = meta.get("title", tdir.name)
+            for pf in _post_files(tdir):
+                sid = _stem_id(pf)
+                if sid == q:
+                    return _post_row(pf, ch_dir.name, tdir, title)
+                if q in sid:
+                    partial.append((pf, ch_dir.name, tdir, title, sid))
+    if len(partial) == 1:
+        pf, ch, tdir, title, _sid = partial[0]
+        return _post_row(pf, ch, tdir, title)
+    if len(partial) > 1:
+        return {"ambiguous": [
+            {"channel": ch, "thread": tdir.name, "id": sid,
+             "thread_title": title}
+            for (pf, ch, tdir, title, sid) in partial[:20]
+        ]}
+    return None
 
 
 def _fuzzy_thread_candidates(query, preferred_channel):
@@ -2252,7 +2418,7 @@ def _fuzzy_thread_candidates(query, preferred_channel):
     if not ch_root.is_dir():
         return []
     hits = []
-    for ch_dir in sorted(p for p in ch_root.iterdir() if p.is_dir()):
+    for ch_dir in _active_channel_dirs(ch_root):
         for tdir in ch_dir.iterdir():
             if not tdir.is_dir():
                 continue
@@ -2384,7 +2550,9 @@ def _task_index_load():
 
 
 def _find_thread_channel(tid):
-    """Channel dir containing thread id `tid`, or None."""
+    """Channel dir containing thread id `tid`, or None. Intentionally includes
+    archived channels: explicit task/thread refs must stay resolvable even when
+    their channel is archived (archive declutters browsing, not actioning)."""
     ch_root = repo_path() / "channels"
     if not ch_root.is_dir():
         return None
@@ -2453,7 +2621,10 @@ def cmd_task_list(args):
     ch_root = repo_path() / "channels"
     rows = []
     if ch_root.is_dir():
-        for ch_dir in sorted(p for p in ch_root.iterdir() if p.is_dir()):
+        # The task board hides archived channels (declutter); explicit task
+        # refs (#n / id / fuzzy) still resolve via _resolve_task_ref so an
+        # archived channel never strands a task.
+        for ch_dir in _active_channel_dirs(ch_root):
             for tdir in ch_dir.iterdir():
                 if not tdir.is_dir():
                     continue
@@ -2882,19 +3053,37 @@ def cmd_search(args):
     out(results)
 
 
+def _snippet_len():
+    """List-view body truncation length. Configurable so long threads stay
+    scannable while `pp read --message <id>` fetches the full text.
+    env PAIR_PRESSURE_SNIPPET_LEN > config snippet_len > 240."""
+    raw = os.environ.get("PAIR_PRESSURE_SNIPPET_LEN")
+    if raw is None or raw.strip() == "":
+        raw = _config_load().get("snippet_len")
+    try:
+        n = int(raw)
+        return n if n > 0 else 240
+    except (TypeError, ValueError):
+        return 240
+
+
 def _collect_feed_posts(channels_root, since, channel=None,
                         server=None, repo=None):
     """Build feed-post dicts for one repo/server's channels tree.
 
     Tags each post with `server`/`repo` when provided (for cross-scope feeds).
-    Body is truncated to 240 chars for scanability and wrapped as untrusted.
+    Body is truncated to `_snippet_len()` chars for scanability and wrapped as
+    untrusted. Archived channels are skipped (history kept, off the feed).
     """
     if not channels_root.is_dir():
         return []
-    targets = (
-        [channels_root / channel] if channel
-        else sorted(p for p in channels_root.iterdir() if p.is_dir())
-    )
+    slen = _snippet_len()
+    if channel:
+        ch_dir = channels_root / channel
+        # An explicitly-named archived channel still stays off the feed.
+        targets = [] if _channel_archived(ch_dir) else [ch_dir]
+    else:
+        targets = _active_channel_dirs(channels_root)
     posts = []
     for ch_dir in targets:
         if not ch_dir.is_dir():
@@ -2909,8 +3098,8 @@ def _collect_feed_posts(channels_root, since, channel=None,
                 if since and ts < since:
                     continue
                 snippet = body.strip()
-                if len(snippet) > 240:
-                    snippet = snippet[:240].rstrip() + "..."
+                if len(snippet) > slen:
+                    snippet = snippet[:slen].rstrip() + "..."
                 row = {
                     "channel": ch_name,
                     "thread": thread_dir.name,
@@ -3209,6 +3398,22 @@ def cmd_channel_ensure(args):
     ch = repo_path() / "channels" / name
     if ch.is_dir():
         existing = read_json(ch / "channel.json", {"name": name, "description": ""})
+        if existing.get("archived"):
+            # ensure must yield a USABLE channel -- revive an archived one.
+            def unarchive_payload():
+                meta = read_json(ch / "channel.json",
+                                 {"name": name, "description": ""})
+                meta.pop("archived", None)
+                write_json(ch / "channel.json", meta)
+                return {"ok": True, "created": False, "unarchived": True,
+                        "channel": meta.get("name", name)}
+
+            def unarchive_msg(info):
+                return f"{name}: unarchive-channel by " \
+                       f"{by_for_via('claude-code', args)}"
+
+            out(push_with_retry(unarchive_payload, unarchive_msg))
+            return
         out({"ok": True, "created": False, "channel": existing.get("name", name)})
         return
 
@@ -3228,6 +3433,44 @@ def cmd_channel_ensure(args):
         return f"{name}: ensure-channel by {by_for_via('claude-code', args)}"
 
     out(push_with_retry(write_payload, msg))
+
+
+def _set_channel_archived(args, archived):
+    """Flip channel.json `archived` for an existing channel and push.
+    Archiving hides a channel from list/feed/read/watch while keeping every
+    post; unarchiving restores it. Idempotent (a no-op write yields no
+    commit)."""
+    _activate_server(args)
+    maybe_pull()
+    name = args.name
+    ch = repo_path() / "channels" / name
+    if not ch.is_dir():
+        die(f"channel '{name}' does not exist")
+
+    def write_payload():
+        meta = read_json(ch / "channel.json", {"name": name, "description": ""})
+        if archived:
+            meta["archived"] = True
+        else:
+            meta.pop("archived", None)
+        write_json(ch / "channel.json", meta)
+        return {"ok": True, "channel": meta.get("name", name),
+                "archived": bool(archived)}
+
+    verb = "archive" if archived else "unarchive"
+
+    def msg(info):
+        return f"{name}: {verb}-channel by {by_for_via('claude-code', args)}"
+
+    out(push_with_retry(write_payload, msg))
+
+
+def cmd_channel_archive(args):
+    _set_channel_archived(args, True)
+
+
+def cmd_channel_unarchive(args):
+    _set_channel_archived(args, False)
 
 
 def _valid_server_name(name):
@@ -3928,6 +4171,86 @@ def _ensure_watcher(args):
             pass
 
 
+def _autowire_sentinel():
+    return _PP_HOME / "autowire.done"
+
+
+def _statusline_is_pp(data):
+    sl = data.get("statusLine") if isinstance(data, dict) else None
+    return isinstance(sl, dict) and "pp-statusline.ps1" in str(
+        sl.get("command", ""))
+
+
+def _wire_statusline_quiet():
+    """Non-noisy core of `pp watch wire`: point statusLine at pp-statusline.ps1,
+    preserving any prior command in `_pp_prev_statusline` so the wrapper can
+    chain to it. Returns True only if it NEWLY wired. Never prints, never
+    raises -- auto-wire runs on ordinary `pp` calls, so it must stay invisible
+    and never break them."""
+    sp = _claude_settings_path()
+    try:
+        raw = sp.read_text(encoding="utf-8-sig")
+        data = json.loads(raw or "{}")
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict) or _statusline_is_pp(data):
+        return False
+    sl = data.get("statusLine")
+    data["_pp_prev_statusline"] = (
+        str(sl["command"]) if isinstance(sl, dict) and sl.get("command")
+        else "")
+    sl_ps1 = _skill_scripts_dir() / "pp-statusline.ps1"
+    data["statusLine"] = {"type": "command", "command": _ps_invoke(sl_ps1)}
+    try:
+        bak = sp.with_suffix(".json.pp.bak")
+        if not bak.exists():
+            bak.write_text(raw, encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        sp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _ensure_wired(args):
+    """Auto-wire the 0-token statusline badge on any `pp` call, Claude Code
+    only. Idempotent, best-effort, one-shot (a durable sentinel means we
+    attempt at most once and respect a prior `wire --undo`). Opt out with
+    config watch.autowire=false or env PAIR_PRESSURE_NO_AUTOWIRE. The OS toast
+    is the cross-CLI notifier; this badge is the Claude-Code bonus. Wrapped by
+    the caller so a wiring bug can never break a normal `pp`."""
+    cmd = getattr(args, "cmd", None)
+    if cmd in ("_watch-daemon", "watch", "offline"):
+        return
+    if os.environ.get("PAIR_PRESSURE_IS_WATCH_DAEMON") == "1":
+        return
+    ev = os.environ.get("PAIR_PRESSURE_NO_AUTOWIRE")
+    if ev and ev.strip().lower() in ("1", "true", "yes", "on"):
+        return
+    cfg = _config_load()
+    wcfg = cfg.get("watch") if isinstance(cfg.get("watch"), dict) else {}
+    if wcfg.get("autowire", True) is False:
+        return
+    if not _claude_settings_path().exists():
+        return  # not a Claude Code install; the toast covers notifications
+    sentinel = _autowire_sentinel()
+    if sentinel.exists():
+        return  # already attempted once (or deliberately undone)
+    newly = _wire_statusline_quiet()
+    try:
+        _PP_HOME.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+    except OSError:
+        pass
+    if newly:
+        print("(pair-pressure: wired a 0-token statusline badge into "
+              "~/.claude/settings.json; restart the session to see it. "
+              "Opt out with watch.autowire=false or "
+              "PAIR_PRESSURE_NO_AUTOWIRE=1.)", file=sys.stderr)
+
+
 def _notify(title, message):
     """Native OS notification (Windows toast / macOS osascript / Linux
     notify-send), no third-party install + durable fallback (watch.log line
@@ -3949,6 +4272,21 @@ def _notify(title, message):
     except Exception as e:
         _watch_log(f"toast_failed {e!r}")
     return False
+
+
+def _powershell_exe():
+    """Absolute path to powershell.exe (or pwsh). Bare "powershell" is NOT
+    resolvable from the detached pythonw daemon, nor when pp runs under a
+    foreign AI CLI / Git-Bash whose PATH lacks C:\\Windows\\System32 -- that
+    raised FileNotFoundError(2) and silently killed every toast. Resolve PATH
+    first, then fall back to the System32 literal which always exists."""
+    exe = shutil.which("powershell") or shutil.which("pwsh")
+    if exe:
+        return exe
+    sysroot = os.environ.get("SystemRoot") or r"C:\Windows"
+    cand = os.path.join(sysroot, "System32", "WindowsPowerShell",
+                        "v1.0", "powershell.exe")
+    return cand if os.path.exists(cand) else "powershell"
 
 
 def _notify_windows(title, message):
@@ -3978,7 +4316,8 @@ def _notify_windows(title, message):
     )
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            [_powershell_exe(), "-NoProfile", "-NonInteractive",
+             "-Command", ps],
             capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             _watch_log(f"toast_failed rc={r.returncode} {r.stderr.strip()[:200]}")
@@ -4066,6 +4405,7 @@ def _scan_server_new(server, state):
         git("fetch", "origin", branch, check=False)
         if _origin_branch_exists(branch):
             ref = f"origin/{branch}"
+    archived = _archived_names(wt)  # archived channels never raise a notify
     if ref:
         r = git("ls-tree", "-r", "--name-only", ref, check=False)
         names = r.stdout.splitlines() if r.returncode == 0 else []
@@ -4075,13 +4415,13 @@ def _scan_server_new(server, state):
             if not m:
                 continue
             ch, thr, stem = m.group(1), m.group(2), m.group(3)
+            if ch in archived:
+                continue
             posts.append((ch, thr, stem, ("git", ref, path)))
     else:
         ch_root = wt / "channels"
         if ch_root.is_dir():
-            for ch_dir in ch_root.iterdir():
-                if not ch_dir.is_dir():
-                    continue
+            for ch_dir in _active_channel_dirs(ch_root):
                 for tdir in ch_dir.iterdir():
                     if not tdir.is_dir():
                         continue
@@ -4222,8 +4562,10 @@ def _other_recent_sessions(window_seconds=3600):
 
 
 def _ps_invoke(ps1):
-    return (f'powershell -NoProfile -ExecutionPolicy Bypass -File '
-            f'"{ps1}"')
+    # Absolute powershell path so the wired statusLine/nudge work even when
+    # Claude Code spawns them with a PATH that lacks System32.
+    return (f'"{_powershell_exe()}" -NoProfile -ExecutionPolicy Bypass '
+            f'-File "{ps1}"')
 
 
 def _watch_wire(undo=False, with_nudge=False):
@@ -4297,6 +4639,12 @@ def _watch_wire(undo=False, with_nudge=False):
                 changed.append("nudge hook removed")
         try:
             prev_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        # A deliberate undo must stick: stamp the sentinel so the auto-wire
+        # hook won't silently re-wire on the next `pp` call.
+        try:
+            _autowire_sentinel().touch()
         except OSError:
             pass
         sp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -4531,6 +4879,8 @@ def main():
 
     sp = sub.add_parser("list-channels")
     sp.add_argument("--no-pull", action="store_true")
+    sp.add_argument("--all", action="store_true",
+                    help="include archived channels (hidden by default)")
     _add_server_arg(sp)
     _add_repo_arg(sp)
     sp.set_defaults(func=cmd_list_channels)
@@ -4791,6 +5141,10 @@ def main():
                              "fuzzy thread match otherwise")
     sp.add_argument("target", nargs="?", default=None,
                     help="optional channel name or thread title/id substring")
+    sp.add_argument("--message", dest="message_id", default=None,
+                    metavar="<id>",
+                    help="print the FULL body of one post by id (full id or "
+                         "short 6-char handle); bypasses feed truncation")
     sp.add_argument("--limit", type=int, default=30)
     sp.add_argument("--no-pull", action="store_true")
     sp.add_argument("--pretty", action="store_true",
@@ -4941,6 +5295,21 @@ def main():
     _add_repo_arg(sp)
     sp.set_defaults(func=cmd_channel_ensure)
 
+    sp = sub_channel.add_parser("archive",
+                                help="hide a channel from list/feed/read/watch "
+                                     "(history kept; reversible)")
+    sp.add_argument("name")
+    _add_server_arg(sp)
+    _add_repo_arg(sp)
+    sp.set_defaults(func=cmd_channel_archive)
+
+    sp = sub_channel.add_parser("unarchive",
+                                help="restore an archived channel")
+    sp.add_argument("name")
+    _add_server_arg(sp)
+    _add_repo_arg(sp)
+    sp.set_defaults(func=cmd_channel_unarchive)
+
     sp = sub.add_parser("servers", help="list servers (alias for `pp server list`)")
     _add_repo_arg(sp)
     sp.set_defaults(func=cmd_servers)
@@ -5023,6 +5392,10 @@ def main():
         _ensure_watcher(args)
     except Exception:
         pass  # a watcher bug must never break a normal pp call
+    try:
+        _ensure_wired(args)
+    except Exception:
+        pass  # nor an auto-wire bug
     try:
         args.func(args)
     except subprocess.CalledProcessError as e:

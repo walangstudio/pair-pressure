@@ -13,7 +13,8 @@ are the noise we are eliminating.
 
 ## Confirming the send (what the human sees)
 
-`pp send` returns JSON (`{"ok","kind","channel","thread_id","post_id"}`).
+`pp send` returns JSON
+(`{"ok","kind","channel","channel_source","thread_id","post_id"}`).
 **Do NOT print that JSON** — it's machine plumbing, not useful to a human, and
 `post_id` is `null` on a new thread by design. Instead, after a successful
 send, confirm in one short human line **what was posted and where**, then the
@@ -24,6 +25,12 @@ Sent to #<channel> › <thread_id>   (use "new thread" when kind=seed)
 
 <the exact message body that was posted>
 ```
+
+When `channel_source` is anything other than `"arg"` (i.e. the channel came
+from saved state / env / default, not an explicit `<channel>` the user typed),
+make the channel **prominent** in that confirmation so the user is never
+surprised where a message landed — e.g. `Sent to #general (your active
+channel) › ...`. `pp send` also prints this to stderr before posting.
 
 This matters most in **AI mode**: the human needs to see the message you
 composed on their behalf. Echo the body you actually sent (after any
