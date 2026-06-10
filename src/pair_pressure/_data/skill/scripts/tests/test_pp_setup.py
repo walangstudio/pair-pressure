@@ -464,6 +464,70 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(seen["env_server"], "alpha")
 
 
+@unittest.skipUnless(INSTALL_PATH.exists(), f"missing {INSTALL_PATH}")
+class McpClientConfigTests(unittest.TestCase):
+    """`--mcp-client` snippet generation: correct shape per client, written
+    under ~/.pair-pressure/mcp/, idempotent."""
+
+    def setUp(self):
+        self.mod = _load_install_module()
+        self._home = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(
+            self.mod.Path, "home", return_value=Path(self._home.name))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._home.cleanup()
+
+    def test_mcpservers_shape(self):
+        path, dest = self.mod.write_mcp_client_config(
+            "cursor", "/abs/chat", "alice")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        srv = data["mcpServers"]["pair-pressure"]
+        self.assertEqual(srv["command"], "pair-pressure-mcp")
+        self.assertEqual(srv["env"]["PAIR_PRESSURE_REPO"], "/abs/chat")
+        self.assertEqual(srv["env"]["PAIR_PRESSURE_AUTHOR"], "alice")
+        self.assertIn(".cursor", dest)
+
+    def test_opencode_shape(self):
+        path, _ = self.mod.write_mcp_client_config(
+            "opencode", "/abs/chat", "alice", alias="Echo")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        srv = data["mcp"]["pair-pressure"]
+        self.assertEqual(srv["type"], "local")
+        self.assertEqual(srv["command"], ["pair-pressure-mcp"])
+        self.assertEqual(srv["environment"]["PAIR_PRESSURE_ALIAS"], "Echo")
+
+    def test_codex_toml_shape(self):
+        path, _ = self.mod.write_mcp_client_config(
+            "codex", "/abs/chat", "alice")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("[mcp_servers.pair-pressure]", text)
+        self.assertIn('command = "pair-pressure-mcp"', text)
+        self.assertIn('PAIR_PRESSURE_REPO = "/abs/chat"', text)
+
+    def test_codex_toml_escapes_windows_path(self):
+        # Backslashes in a TOML basic string must be escaped or the file is
+        # invalid TOML (\c is an illegal escape, \t parses as a tab).
+        snip = self.mod._mcp_snippet(
+            "toml", self.mod._mcp_env(r"C:\chat\team", "alice"))
+        self.assertIn(r'PAIR_PRESSURE_REPO = "C:\\chat\\team"', snip)
+        self.assertNotIn(r'"C:\chat\team"', snip)
+
+    def test_idempotent_overwrite(self):
+        p1, _ = self.mod.write_mcp_client_config("cline", "/abs/chat", "alice")
+        first = p1.read_text(encoding="utf-8")
+        p2, _ = self.mod.write_mcp_client_config("cline", "/abs/chat", "alice")
+        self.assertEqual(p1, p2)
+        self.assertEqual(first, p2.read_text(encoding="utf-8"))
+
+    def test_written_under_pp_home_mcp(self):
+        path, _ = self.mod.write_mcp_client_config("kilo", "/abs/chat", "alice")
+        self.assertEqual(path.parent,
+                         Path(self._home.name) / ".pair-pressure" / "mcp")
+
+
 if __name__ == "__main__":
     os.environ.setdefault("PAIR_PRESSURE_REPO", "/tmp/_pp_unused")
     os.environ.setdefault("PAIR_PRESSURE_AUTHOR", "test")

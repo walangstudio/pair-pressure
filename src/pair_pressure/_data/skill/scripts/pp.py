@@ -33,6 +33,11 @@ _VIA_LONG = {v: k for k, v in _VIA_SHORT.items()}
 # None means "registry / main checkout", used by server-management verbs.
 _CURRENT_REPO: "Path | None" = None
 
+# Set by _activate_repo() from an explicit --repo flag. When set it wins over
+# the session-pinned repo and PAIR_PRESSURE_REPO in _main_repo_path(). None
+# means "resolve the repo normally" (session > env > sole registered).
+_REPO_OVERRIDE: "Path | None" = None
+
 def _read_version() -> str:
     # Single source of truth: <skill>/VERSION (sibling of scripts/). Works
     # for both the in-tree path (src/pair_pressure/_data/skill/VERSION) and
@@ -61,12 +66,47 @@ def env(name):
     return val
 
 
-def _main_repo_path():
-    """The main checkout (where the registry on `main` lives)."""
-    p = Path(env("PAIR_PRESSURE_REPO")).expanduser()
+def _validated_repo(p):
+    """Confirm `p` is a git repo or die with a clear message."""
     if not (p / ".git").exists():
-        die(f"PAIR_PRESSURE_REPO={p} is not a git repository.")
+        die(f"chat repo {p} is not a git repository.")
     return p
+
+
+def _main_repo_path():
+    """The active chat repo's main checkout (where the registry on `main`
+    lives). Resolution priority:
+
+      1. explicit --repo override (`_REPO_OVERRIDE`, set by `_activate_repo`)
+      2. the repo pinned to THIS session (per-session state `repo`)
+      3. PAIR_PRESSURE_REPO env var (back-compat: unchanged when no registry)
+      4. the sole registered repo, when exactly one exists
+      5. die with remediation
+
+    Back-compat: with `PAIR_PRESSURE_REPO` set and an empty/absent repo
+    registry, step 3 fires and behavior is byte-identical to pre-0.9.
+    """
+    if _REPO_OVERRIDE is not None:
+        return _REPO_OVERRIDE
+    # Only consult the per-session pin when a registry exists -- a pin can only
+    # name a registered repo (set via `pp repo use`), so with no registry the
+    # session read is pure waste. This keeps the env-var-only path (the
+    # back-compat common case) to a single cheap repos.json stat.
+    repos = _repos_list()
+    if repos:
+        name = _session_repo_name()
+        if name:
+            entry = next((r for r in repos if r.get("name") == name), None)
+            if entry and entry.get("path"):
+                return _validated_repo(Path(entry["path"]).expanduser())
+    ev = os.environ.get("PAIR_PRESSURE_REPO")
+    if ev:
+        return _validated_repo(Path(ev).expanduser())
+    if len(repos) == 1 and repos[0].get("path"):
+        return _validated_repo(Path(repos[0]["path"]).expanduser())
+    die("PAIR_PRESSURE_REPO is not set and no chat repo is registered. "
+        "Set the env var, or run `pp repo add <name> <url>` then "
+        "`pp repo use <name>`.")
 
 
 def repo_path():
@@ -117,7 +157,7 @@ def _registry_save(data):
 
 # ---- smart-verb state (active.json + per-session sidecar) ----
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2  # v2 adds the per-session `repo` field
 
 # Machine-global, NON-git-tracked home for local config + watcher state.
 # (active.json deliberately lives inside the chat repo for cross-session
@@ -153,6 +193,66 @@ def _state_load_one(path):
     return data if isinstance(data, dict) else None
 
 
+# ---- machine-global repo registry (multiple chat repos) ----
+#
+# Sits ABOVE the per-repo servers.json: a "repo" is a clone with its own
+# remote; each repo contains many "servers" (branches). Lives under _PP_HOME
+# (NOT inside any chat repo, since it indexes repos). Tolerant load mirrors
+# _config_load -- a missing/malformed file yields an empty registry, never a
+# die(), so back-compat installs (env-var only) keep working untouched.
+
+def _repos_registry_path():
+    return _PP_HOME / "repos.json"
+
+
+def _repos_load():
+    p = _repos_registry_path()
+    if not p.exists():
+        return {"schema_version": 1, "repos": []}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {"schema_version": 1, "repos": []}
+    if not isinstance(data, dict) or not isinstance(data.get("repos"), list):
+        return {"schema_version": 1, "repos": []}
+    return data
+
+
+def _repos_save(data):
+    """Best-effort write of repos.json. Never raises (same contract as
+    _config_save)."""
+    try:
+        p = _repos_registry_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _repos_list():
+    return _repos_load().get("repos", [])
+
+
+def _repo_entry(name):
+    for r in _repos_list():
+        if r.get("name") == name:
+            return r
+    return None
+
+
+def _session_repo_name():
+    """The repo name pinned to THIS session, if any.
+
+    Reads ONLY the per-session state file under _PP_HOME -- never the global
+    state file, whose path goes through _main_repo_path() and would recurse.
+    """
+    path = _state_path_session()
+    data = _state_load_one(path) if path else None
+    if data and data.get("repo"):
+        return data["repo"]
+    return None
+
+
 def _state_load():
     """Return (per_session, global). Either may be None."""
     sess = _state_load_one(_state_path_session()) if _session_id() else None
@@ -160,18 +260,32 @@ def _state_load():
     return sess, glob
 
 
-def _state_save(server=None, channel=None, thread_id=None, source=None):
-    """Best-effort write to both per-session and global state files. Never
-    raises -- smart verbs must not die on state-write failure."""
+def _state_save(server=None, channel=None, thread_id=None, source=None,
+                repo=None, session_only=False, clear_repo=False):
+    """Best-effort write to per-session (and, unless session_only, global)
+    state files. Never raises -- smart verbs must not die on state-write
+    failure.
+
+    `repo` pins the session to a registered chat repo. `session_only=True`
+    writes ONLY the per-session file -- used by `pp repo use` so switching a
+    repo for one conversation never stomps the repo's shared global state.
+    `clear_repo=True` unpins the repo (used by `pp repo remove`); without it,
+    a None `repo` is treated as "leave the existing pin alone".
+    """
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
         "server": server,
         "channel": channel,
         "thread_id": thread_id,
+        "repo": repo,
         "updated_at": now_iso(),
         "source": source or "unknown",
     }
-    for path in (_state_path_session(), _state_path_global()):
+    paths = (
+        (_state_path_session(),) if session_only
+        else (_state_path_session(), _state_path_global())
+    )
+    for path in paths:
         if path is None:
             continue
         try:
@@ -180,6 +294,12 @@ def _state_save(server=None, channel=None, thread_id=None, source=None):
             existing = _state_load_one(path) or {}
             if "task_index" in existing:  # survive routine state writes
                 merged["task_index"] = existing["task_index"]
+            # Preserve a previously-pinned repo when a routine write omits it,
+            # so a `send`/`read` doesn't blank the session's active repo.
+            # `clear_repo` opts out (pp repo remove unpins).
+            if (not clear_repo and merged.get("repo") is None
+                    and existing.get("repo")):
+                merged["repo"] = existing["repo"]
             path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
         except OSError:
             continue
@@ -250,6 +370,20 @@ def resolve_active(args):
     sess, glob = _state_load()
     sources = {}
 
+    # Repo is already pinned by _activate_repo (--repo) / _main_repo_path
+    # (session > env > sole) before we get here; this block is diagnostic.
+    repo_name = getattr(args, "repo", None)
+    if repo_name:
+        sources["repo"] = "arg"
+    elif _session_repo_name():
+        repo_name, sources["repo"] = _session_repo_name(), "session"
+    elif os.environ.get("PAIR_PRESSURE_REPO"):
+        sources["repo"] = "env"
+    else:
+        repos = _repos_list()
+        if len(repos) == 1:
+            repo_name, sources["repo"] = repos[0].get("name"), "sole-repo"
+
     server = getattr(args, "server", None)
     if server:
         sources["server"] = "arg"
@@ -291,6 +425,7 @@ def resolve_active(args):
     args.thread = thread
 
     return {
+        "repo": repo_name,
         "server": server,
         "channel": channel,
         "thread": thread,
@@ -387,6 +522,40 @@ def _add_server_arg(sp):
              "PAIR_PRESSURE_SERVER. If exactly one server exists in the "
              "registry, it is used by default.",
     )
+
+
+def _add_repo_arg(sp):
+    """Attach the standard --repo flag to a subparser."""
+    sp.add_argument(
+        "--repo", default=None,
+        help="chat repo name (see `pp repo list`) or a path to a clone; "
+             "overrides the session-pinned repo and PAIR_PRESSURE_REPO for "
+             "this call.",
+    )
+
+
+def _activate_repo(args):
+    """Pin `_REPO_OVERRIDE` from an explicit --repo flag.
+
+    Accepts a registered repo name or a path to an existing clone. Called
+    once in main() right after arg parsing, before any verb runs, so that
+    _main_repo_path() (and everything anchored to it) targets the right repo.
+    No-op when --repo is absent.
+    """
+    global _REPO_OVERRIDE
+    name = getattr(args, "repo", None)
+    if not name:
+        return
+    entry = _repo_entry(name)
+    if entry and entry.get("path"):
+        _REPO_OVERRIDE = _validated_repo(Path(entry["path"]).expanduser())
+        return
+    p = Path(name).expanduser()
+    if (p / ".git").exists():
+        _REPO_OVERRIDE = p
+        return
+    die(f"repo '{name}' is not registered (try `pp repo list`) and is not a "
+        "path to a git repository.")
 
 
 def author():
@@ -2538,12 +2707,21 @@ def cmd_status(args):
     elif glob:
         current = {"source": "global", **{k: glob.get(k) for k in
                    ("server", "channel", "thread_id", "updated_at")}}
+    # Repo registry block (multi-repo). Tolerant: empty when no registry.
+    repos_list = [r.get("name") for r in _repos_list()]
+    active_repo = _session_repo_name()
+    if not active_repo and os.environ.get("PAIR_PRESSURE_REPO"):
+        active_repo = "(PAIR_PRESSURE_REPO env)"
+    elif not active_repo and len(repos_list) == 1:
+        active_repo = repos_list[0]
     out({
         "saved": saved,
         "active": active,
         "verdict": verdict,
         "message": message,
         "alias": active.get("PAIR_PRESSURE_ALIAS") or saved.get("PAIR_PRESSURE_ALIAS"),
+        "repos": repos_list,
+        "active_repo": active_repo,
         "servers": servers_list,
         "active_server": active_server,
         "current": current,
@@ -2704,33 +2882,19 @@ def cmd_search(args):
     out(results)
 
 
-def cmd_feed(args):
-    """Cross-thread feed view: posts ordered ASCENDING by timestamp.
+def _collect_feed_posts(channels_root, since, channel=None,
+                        server=None, repo=None):
+    """Build feed-post dicts for one repo/server's channels tree.
 
-    Replaces the need for the user to read each thread separately to catch
-    up. Returns at most --limit posts, with the most recent at the END of
-    the list (chronological / first-pushed first, matching real chat scroll
-    direction).
-
-    --channel narrows to a single channel; --since trims to posts at or
-    after the given ISO timestamp. Body is truncated to 240 chars per post
-    for feed scanability.
+    Tags each post with `server`/`repo` when provided (for cross-scope feeds).
+    Body is truncated to 240 chars for scanability and wrapped as untrusted.
     """
-    _watch_ack()  # reading clears the unread badge (additive, best-effort)
-    _activate_server(args)
-    if not args.no_pull:
-        maybe_pull()
-
-    channels_root = repo_path() / "channels"
     if not channels_root.is_dir():
-        out([])
-        return
-
+        return []
     targets = (
-        [channels_root / args.channel] if args.channel
+        [channels_root / channel] if channel
         else sorted(p for p in channels_root.iterdir() if p.is_dir())
     )
-
     posts = []
     for ch_dir in targets:
         if not ch_dir.is_dir():
@@ -2742,12 +2906,12 @@ def cmd_feed(args):
             for post_file in _post_files(thread_dir):
                 fm, body = parse_post(post_file.read_text())
                 ts = fm.get("timestamp") or ""
-                if args.since and ts < args.since:
+                if since and ts < since:
                     continue
                 snippet = body.strip()
                 if len(snippet) > 240:
                     snippet = snippet[:240].rstrip() + "..."
-                posts.append({
+                row = {
                     "channel": ch_name,
                     "thread": thread_dir.name,
                     "thread_title": title,
@@ -2761,12 +2925,111 @@ def cmd_feed(args):
                     "timestamp": ts,
                     "body": _wrap_untrusted(snippet, fm.get("author")),
                     "filename": post_file.name,
-                })
+                }
+                if server is not None:
+                    row["server"] = server
+                if repo is not None:
+                    row["repo"] = repo
+                posts.append(row)
+    return posts
+
+
+def _materialize_server_wt(srv, no_pull):
+    """Resolve the worktree for `srv` on the active repo, pinning _CURRENT_REPO
+    and pulling (unless no_pull). Materializes when online; returns None when
+    offline and the worktree isn't local yet (never blocks on the network)."""
+    global _CURRENT_REPO
+    main = _main_repo_path()
+    wt = main / ".pp-worktrees" / srv
+    if not (wt.exists() and (wt / ".git").exists()):
+        if _offline():
+            return None
+        try:
+            wt = worktree_path(srv)
+        except SystemExit:
+            return None
+    _CURRENT_REPO = wt
+    if not no_pull:
+        maybe_pull()
+    return wt
+
+
+def _iter_server_worktrees(no_pull):
+    """Yield (server_name, worktree_path) for every registered server of the
+    currently-active repo, materializing worktrees when online. Skips servers
+    with no local worktree in offline mode (never blocks on the network)."""
+    global _CURRENT_REPO
+    try:
+        servers = [s.get("name") for s in _registry_load().get("servers", [])]
+    except SystemExit:
+        servers = []
+    for srv in servers:
+        if not srv:
+            continue
+        wt = _materialize_server_wt(srv, no_pull)
+        if wt is not None:
+            yield srv, wt
+    _CURRENT_REPO = None
+
+
+def _repo_scopes(all_repos):
+    """[(repo_name, repo_root)] to iterate over: every registered repo when
+    `all_repos` and a registry exists, else just the active repo (name None).
+    Shared by the cross-scope feed/unread verbs."""
+    if all_repos and _repos_list():
+        return [(r.get("name"), Path(r["path"]).expanduser())
+                for r in _repos_list() if r.get("path")]
+    return [(None, _main_repo_path())]
+
+
+def cmd_feed(args):
+    """Cross-thread feed view: posts ordered ASCENDING by timestamp.
+
+    Replaces the need for the user to read each thread separately to catch
+    up. Returns at most --limit posts, with the most recent at the END of
+    the list (chronological / first-pushed first, matching real chat scroll
+    direction).
+
+    --channel narrows to a single channel; --since trims to posts at or
+    after the given ISO timestamp. --all-servers spans every server on the
+    active repo; --all-repos spans every registered repo (implies
+    --all-servers). Body is truncated to 240 chars per post.
+    """
+    _watch_ack()  # reading clears the unread badge (additive, best-effort)
+    all_repos = getattr(args, "all_repos", False)
+    all_servers = getattr(args, "all_servers", False) or all_repos
+
+    posts = []
+    if not all_servers:
+        _activate_server(args)
+        if not args.no_pull:
+            maybe_pull()
+        posts = _collect_feed_posts(repo_path() / "channels", args.since,
+                                    channel=args.channel)
+    else:
+        global _REPO_OVERRIDE, _CURRENT_REPO
+        saved_override = _REPO_OVERRIDE
+        try:
+            for repo_name, repo_root in _repo_scopes(all_repos):
+                _REPO_OVERRIDE = repo_root
+                _CURRENT_REPO = None
+                try:
+                    for srv, wt in _iter_server_worktrees(args.no_pull):
+                        posts.extend(_collect_feed_posts(
+                            wt / "channels", args.since, channel=args.channel,
+                            server=srv, repo=repo_name))
+                except SystemExit:
+                    continue  # skip an unreadable repo, never abort the feed
+        finally:
+            _REPO_OVERRIDE = saved_override
+            _CURRENT_REPO = None
 
     # Ascending by timestamp (oldest first). For ties (same second), fall
-    # back to (channel, thread, ordinal) for deterministic ordering.
+    # back to (repo, server, channel, thread, ordinal) for determinism.
     posts.sort(key=lambda p: (
         p.get("timestamp") or "",
+        p.get("repo") or "",
+        p.get("server") or "",
         p.get("channel") or "",
         p.get("thread") or "",
         p.get("id") or "",
@@ -2776,6 +3039,85 @@ def cmd_feed(args):
         # so the consumer reads oldest-at-top.
         posts = posts[-args.limit:]
     out(posts)
+
+
+def cmd_unread(args):
+    """New posts not authored by you, across servers (and repos).
+
+    Default mode reuses the watcher's baseline (watch-state.json), so it
+    reports posts newer than the last time the daemon -- or a prior `pp
+    unread` -- saw each thread, WITHOUT clearing the badge (the in-memory
+    markers are advanced but never persisted). `--since <ISO>` instead counts
+    every post at/after a timestamp (useful for MCP clients that never run the
+    daemon). `--all` spans all servers of the active repo; `--all-repos` spans
+    every registered repo.
+    """
+    me = os.environ.get("PAIR_PRESSURE_AUTHOR")
+    all_repos = getattr(args, "all_repos", False)
+    all_servers = getattr(args, "all", False) or all_repos
+    items = []
+
+    global _REPO_OVERRIDE, _CURRENT_REPO
+    saved_override = _REPO_OVERRIDE
+    # Baseline markers (default mode); a fresh dict each call -- we never save
+    # it, so advancing markers here is non-destructive to the daemon's badge.
+    base_state = None if args.since else _watch_state_load()
+    try:
+        for repo_name, repo_root in _repo_scopes(all_repos):
+            _REPO_OVERRIDE = repo_root
+            _CURRENT_REPO = None
+            try:
+                if all_servers:
+                    servers = [s.get("name")
+                               for s in _registry_load().get("servers", [])]
+                else:
+                    servers = [_server_arg(args)]
+            except SystemExit:
+                continue
+            # Per-repo copy of the baseline so two repos sharing a
+            # server/channel/thread name don't suppress each other's posts via
+            # a shared marker key (which is not repo-namespaced).
+            repo_state = None if args.since else dict(base_state)
+            for srv in servers:
+                if not srv:
+                    continue
+                try:
+                    if args.since:
+                        wt = _materialize_server_wt(srv, args.no_pull)
+                        if wt is None:
+                            continue
+                        for p in _collect_feed_posts(wt / "channels",
+                                                     args.since, server=srv,
+                                                     repo=repo_name):
+                            au = p.get("author")
+                            if au and au != me:
+                                items.append({
+                                    "repo": repo_name, "server": srv,
+                                    "channel": p["channel"],
+                                    "thread": p["thread"],
+                                    "post_id": p["id"], "author": au})
+                        _CURRENT_REPO = None
+                    else:
+                        for n in _scan_server_new(srv, repo_state):
+                            row = dict(n)
+                            row["repo"] = repo_name
+                            items.append(row)
+                except SystemExit:
+                    continue
+                except Exception:
+                    continue
+    finally:
+        _REPO_OVERRIDE = saved_override
+        _CURRENT_REPO = None
+
+    res = {"count": len(items), "items": items}
+    try:
+        buckets = read_json(_watch_unread_path(), {})
+        if buckets:
+            res["buckets"] = buckets
+    except Exception:
+        pass
+    out(res)
 
 
 def cmd_aliases_in_use(args):
@@ -3077,6 +3419,223 @@ def cmd_server_remove(args):
     out(push_with_retry(write_payload, msg))
 
 
+# ---- repo management (multiple chat repos, switchable per session) ----
+
+def _default_repo_clone_dir(name):
+    return _PP_HOME / "repos" / name
+
+
+def _is_chat_repo(path):
+    """A path is an initialized chat repo if it has the registry markers."""
+    pp = Path(path) / ".pair-pressure"
+    return (pp / "servers.json").exists() or (pp / "schema-version").exists()
+
+
+def _ensure_git_identity(cwd):
+    """Give a freshly-cloned chat repo a local commit identity when none is
+    configured (global or local). pair-pressure carries real identity in each
+    post's `by:` field, so the git author is incidental -- but `git commit`
+    still refuses without one. Never overrides an existing identity."""
+    have = git("config", "user.email", cwd=cwd, check=False)
+    if have.returncode == 0 and have.stdout.strip():
+        return
+    au = author()
+    git("config", "user.name", au, cwd=cwd, check=False)
+    git("config", "user.email", f"{au}@pair-pressure.local", cwd=cwd, check=False)
+
+
+def _pp_init_argv():
+    """argv prefix that runs pp-init. Prefer the console script on PATH (the
+    robust path for wheel installs); fall back to the bundled script next to
+    this file (_data/scripts/pp-init.py)."""
+    if shutil.which("pp-init"):
+        return ["pp-init"]
+    bundled = Path(__file__).resolve().parent.parent.parent / "scripts" / "pp-init.py"
+    return [sys.executable, str(bundled)]
+
+
+def _pp_self_argv():
+    """argv prefix that re-invokes THIS pp.py. Always works regardless of
+    whether the `pp` console script is on PATH (it may not be when pp is run
+    as `python pp.py` or via an absolute path)."""
+    return [sys.executable, str(Path(__file__).resolve())]
+
+
+def cmd_repo_add(args):
+    """Register a chat repo: clone (or adopt --path) + optional init + record.
+
+    `pp repo add <name> <url> [--path DIR] [--no-clone] [--with-server NAME]
+    [--channels a,b]`
+
+    A "repo" is a clone with its own remote; it hosts many servers. The clone
+    lands in ~/.pair-pressure/repos/<name> by default. If the remote is an
+    uninitialized repo, it is bootstrapped with `pp-init` and main is pushed.
+    """
+    name = args.name
+    if not _valid_server_name(name):
+        die("repo name must match ^[a-z0-9][a-z0-9._-]{0,63}$")
+    if _repo_entry(name):
+        die(f"repo '{name}' is already registered (try `pp repo list`)")
+
+    dest = Path(args.path).expanduser() if args.path else _default_repo_clone_dir(name)
+    adopt = bool(args.path) or args.no_clone
+
+    if adopt:
+        if not (dest / ".git").exists():
+            die(f"--path {dest} is not a git repository")
+    else:
+        if _offline():
+            die("cannot clone in offline mode; run `pp offline false` first, "
+                "or register an existing clone with `pp repo add <name> "
+                "<url> --path <dir> --no-clone`.")
+        if dest.exists() and any(dest.iterdir()):
+            die(f"clone target {dest} already exists and is not empty")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        res = git("clone", args.url, str(dest), cwd=dest.parent, check=False)
+        if res.returncode != 0:
+            # Leave no partial clone behind, and do NOT touch the registry.
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            die(f"git clone failed: {res.stderr.strip() or res.stdout.strip()}")
+
+    # Bootstrap the chat structure if the remote was empty / not a chat repo.
+    if not _is_chat_repo(dest):
+        # We're about to commit (pp-init), so the clone needs a git identity.
+        _ensure_git_identity(dest)
+        argv = _pp_init_argv() + [str(dest), "--force"]
+        if args.with_server:
+            argv += ["--with-server", args.with_server]
+            if args.channels:
+                argv += ["--channels", args.channels]
+        sub_env = os.environ.copy()
+        sub_env["PAIR_PRESSURE_REPO"] = str(dest)
+        sub_env.setdefault("PAIR_PRESSURE_AUTHOR", author())
+        ir = subprocess.run(argv, env=sub_env, capture_output=True, text=True)
+        if ir.returncode != 0:
+            die(f"pp-init failed: {ir.stderr.strip() or ir.stdout.strip()}")
+        if not _offline():
+            git("push", "-u", "origin", "main", cwd=dest, check=False)
+    elif args.with_server and not _origin_branch_exists(
+            _server_branch(args.with_server), cwd=dest):
+        # Existing chat repo, but the requested server doesn't exist yet:
+        # create it via `pp server new` against this repo (a commit, so ensure
+        # identity). Re-invoke THIS pp.py so it works off-PATH, and surface a
+        # failure instead of silently registering a serverless repo.
+        _ensure_git_identity(dest)
+        sub_env = os.environ.copy()
+        sub_env["PAIR_PRESSURE_REPO"] = str(dest)
+        sub_env.setdefault("PAIR_PRESSURE_AUTHOR", author())
+        sv = _pp_self_argv() + ["server", "new", args.with_server]
+        if args.channels:
+            sv += ["--channels", args.channels]
+        sv_res = subprocess.run(sv, env=sub_env, capture_output=True, text=True)
+        if sv_res.returncode != 0:
+            die(f"server '{args.with_server}' could not be created (repo not "
+                f"registered): {sv_res.stderr.strip() or sv_res.stdout.strip()}")
+
+    reg = _repos_load()
+    reg.setdefault("repos", []).append({
+        "name": name,
+        "path": str(dest.resolve()),
+        "remote": args.url,
+        "added_at": now_iso(),
+        "added_by": author(),
+    })
+    reg.setdefault("schema_version", 1)
+    _repos_save(reg)
+    out({"ok": True, "name": name, "path": str(dest.resolve()),
+         "remote": args.url})
+
+
+def cmd_repo_list(args):
+    """List registered chat repos + which one is active for this session."""
+    active = _session_repo_name()
+    if not active and os.environ.get("PAIR_PRESSURE_REPO"):
+        active = "(PAIR_PRESSURE_REPO env)"
+    rows = []
+    for r in _repos_list():
+        path = r.get("path")
+        server_count = None
+        try:
+            reg = Path(path) / ".pair-pressure" / "servers.json"
+            if reg.exists():
+                data = json.loads(reg.read_text(encoding="utf-8-sig"))
+                server_count = len(data.get("servers", []))
+        except (OSError, json.JSONDecodeError, TypeError):
+            server_count = None
+        rows.append({
+            "name": r.get("name"),
+            "path": path,
+            "remote": r.get("remote"),
+            "servers": server_count,
+            "active": r.get("name") == active,
+        })
+    out({"repos": rows, "active": active})
+
+
+def cmd_repo_use(args):
+    """Pin this session to a registered repo.
+
+    Writes ONLY the per-session state file (never the shared global state),
+    and clears the active server/channel/thread -- those are repo-scoped, so a
+    server name from the previous repo is meaningless in the new one.
+
+    Like `pp server switch`, does NOT mutate process env; it returns export
+    hints for plain CLI shells. The per-session pin requires
+    PAIR_PRESSURE_SESSION_ID to be set (otherwise eval the shell_export line).
+    """
+    name = args.name
+    entry = _repo_entry(name)
+    if not entry:
+        die(f"repo '{name}' is not registered (try `pp repo list`)")
+    path = Path(entry["path"]).expanduser()
+    _validated_repo(path)
+    _state_save(repo=name, server=None, channel=None, thread_id=None,
+                source="repo_use", session_only=True)
+    sticky = _session_id() is not None
+    out({
+        "ok": True,
+        "active_repo": name,
+        "path": str(path),
+        "sticky": sticky,
+        "shell_export": f"export PAIR_PRESSURE_REPO={path}",
+        "powershell": f"$env:PAIR_PRESSURE_REPO = '{path}'",
+        "hint": ("Pinned for this session." if sticky else
+                 "No PAIR_PRESSURE_SESSION_ID -- eval the shell_export line, "
+                 "or pass --repo per call. Claude Code slash command: remember "
+                 "this in conversation context for subsequent /pp-chat:* calls."),
+    })
+
+
+def cmd_repo_remove(args):
+    """Unregister a repo. --yes required. --delete-clone also removes the
+    on-disk clone, but ONLY when it lives under ~/.pair-pressure/repos/."""
+    name = args.name
+    entry = _repo_entry(name)
+    if not entry:
+        die(f"repo '{name}' is not registered")
+    if not args.yes:
+        die("refusing to remove without --yes")
+    if args.delete_clone:
+        raw = entry.get("path") or ""
+        if not raw:
+            die("refusing --delete-clone: registry entry has no path")
+        path = Path(raw).resolve()
+        repos_root = (_PP_HOME / "repos").resolve()
+        if repos_root in path.parents:
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            die(f"refusing --delete-clone: {path} is outside "
+                f"{repos_root} (remove it manually)")
+    reg = _repos_load()
+    reg["repos"] = [r for r in reg.get("repos", []) if r.get("name") != name]
+    _repos_save(reg)
+    # If this session was pinned to the removed repo, unpin it.
+    if _session_repo_name() == name:
+        _state_save(source="repo_remove", session_only=True, clear_repo=True)
+    out({"ok": True, "removed": name})
+
+
 # ---- watcher daemon (zero-token background new-message notifier) ----
 
 def _watch_pid_path():       return _PP_HOME / "watch.pid"
@@ -3317,6 +3876,17 @@ def _spawn_watch_daemon():
     return proc.pid
 
 
+def _watcher_repo_available():
+    """True when a chat repo resolves for the watcher to scan, without ever
+    dying. Covers env-var installs and the registry (session-pinned or sole)."""
+    if os.environ.get("PAIR_PRESSURE_REPO"):
+        return True
+    name = _session_repo_name()
+    if name and _repo_entry(name):
+        return True
+    return len(_repos_list()) == 1
+
+
 def _ensure_watcher(args):
     """Auto-start hook. Called once per `pp` invocation. Hot path is two tiny
     file reads + one liveness check -- no git, no network, no subprocess.
@@ -3326,7 +3896,7 @@ def _ensure_watcher(args):
         return
     if os.environ.get("PAIR_PRESSURE_IS_WATCH_DAEMON") == "1":
         return
-    if not os.environ.get("PAIR_PRESSURE_REPO"):
+    if not _watcher_repo_available():
         return
     cfg = _config_load()
     wcfg = cfg.get("watch") if isinstance(cfg.get("watch"), dict) else {}
@@ -3951,15 +4521,18 @@ def main():
 
     sp = sub.add_parser("pull", help="git pull --rebase --autostash")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_pull)
 
     sp = sub.add_parser("push", help="git push if ahead")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_push)
 
     sp = sub.add_parser("list-channels")
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_list_channels)
 
     sp = sub.add_parser("list-threads")
@@ -3967,6 +4540,7 @@ def main():
     sp.add_argument("--limit", type=int, default=0)
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_list_threads)
 
     sp = sub.add_parser("read-thread")
@@ -3975,6 +4549,7 @@ def main():
     sp.add_argument("--since", type=int, default=0)
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_read_thread)
 
     sp = sub.add_parser("new-thread")
@@ -4005,6 +4580,7 @@ def main():
                          "append a markdown link. Repeatable. Use `@@<path>` "
                          "in the body to attach + link inline instead.")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_new_thread)
 
     sp = sub.add_parser("reply")
@@ -4029,6 +4605,7 @@ def main():
                          "append a markdown link. Repeatable. Use `@@<path>` "
                          "in the body to attach + link inline instead.")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_reply)
 
     sp = sub.add_parser("claim", help="atomically claim a task thread")
@@ -4036,12 +4613,14 @@ def main():
     sp.add_argument("--thread", required=True)
     sp.add_argument("--via", default="claude-code")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_claim)
 
     sp = sub.add_parser("start", help="mark a claimed task as in_progress (assignee only)")
     sp.add_argument("--channel", required=True)
     sp.add_argument("--thread", required=True)
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_start)
 
     sp = sub.add_parser("complete", help="mark a task done (assignee only)")
@@ -4049,6 +4628,7 @@ def main():
     sp.add_argument("--thread", required=True)
     sp.add_argument("--summary", default=None)
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_complete)
 
     sp = sub.add_parser("abandon", help="release a claim (assignee only by default)")
@@ -4058,6 +4638,7 @@ def main():
     sp.add_argument("--force", action="store_true",
                     help="abandon even if you are not the assignee")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_abandon)
 
     sp = sub.add_parser("handoff", help="reassign a claim (current assignee only)")
@@ -4065,6 +4646,7 @@ def main():
     sp.add_argument("--thread", required=True)
     sp.add_argument("--to", required=True)
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_handoff)
 
     sp = sub.add_parser("join", help="record current author as a thread member")
@@ -4077,6 +4659,7 @@ def main():
     sp.add_argument("--password-stdin", action="store_true",
                     help="read password from stdin (entire stdin = password)")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_join)
 
     sp = sub.add_parser("resolve",
@@ -4092,10 +4675,12 @@ def main():
                     help="per-call alias override; beats PAIR_PRESSURE_ALIAS. "
                          "Ignored when --via=human.")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_resolve)
 
     sp = sub.add_parser("status",
                         help="show saved vs active env vars; works without configuration")
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_status)
 
     sp = sub.add_parser("offline",
@@ -4124,6 +4709,7 @@ def main():
     sp.add_argument("--limit", type=int, default=0)
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("feed",
@@ -4134,8 +4720,28 @@ def main():
                     help="ISO timestamp; only posts >= this are returned")
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--no-pull", action="store_true")
+    sp.add_argument("--all-servers", action="store_true",
+                    help="span every server on the active repo")
+    sp.add_argument("--all-repos", action="store_true",
+                    help="span every registered repo (implies --all-servers)")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_feed)
+
+    sp = sub.add_parser("unread",
+                        help="new posts not authored by you across servers/"
+                             "repos; for polling clients")
+    sp.add_argument("--all", action="store_true",
+                    help="span every server on the active repo")
+    sp.add_argument("--all-repos", action="store_true",
+                    help="span every registered repo (implies --all)")
+    sp.add_argument("--since", default=None,
+                    help="ISO timestamp; count posts >= this instead of using "
+                         "the watcher baseline")
+    sp.add_argument("--no-pull", action="store_true")
+    _add_server_arg(sp)
+    _add_repo_arg(sp)
+    sp.set_defaults(func=cmd_unread)
 
     sp = sub.add_parser("aliases-in-use",
                         help="report aliases active in the last N minutes; "
@@ -4144,6 +4750,7 @@ def main():
                     help="activity window in minutes (default: 30)")
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_aliases_in_use)
 
     # --- smart verbs ---
@@ -4176,6 +4783,7 @@ def main():
                          "append a markdown link. Repeatable. Use `@@<path>` "
                          "in the body to attach + link inline instead.")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_send)
 
     sp = sub.add_parser("read",
@@ -4189,6 +4797,7 @@ def main():
                     help="render human-readable ANSI-colored chat instead of "
                          "JSON (per-author color); for terminal display")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_read)
 
     sp_task = sub.add_parser("task", help="task lifecycle (smart, indexed)")
@@ -4199,6 +4808,7 @@ def main():
                                   "server (newest first; incl. done)")
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_task_list)
 
     sp = sub_task.add_parser("claim",
@@ -4206,6 +4816,7 @@ def main():
     sp.add_argument("ref")
     sp.add_argument("--via", default="claude-code")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_task_claim)
 
     sp = sub_task.add_parser("update",
@@ -4217,6 +4828,7 @@ def main():
     sp.add_argument("--reason", default=None)
     sp.add_argument("--via", default="claude-code")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_task_update)
 
     sp = sub_task.add_parser("show",
@@ -4224,6 +4836,7 @@ def main():
     sp.add_argument("ref")
     sp.add_argument("--no-pull", action="store_true")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_task_show)
 
     sp = sub_task.add_parser("handoff",
@@ -4231,6 +4844,7 @@ def main():
     sp.add_argument("ref")
     sp.add_argument("to")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_task_handoff)
 
     sp = sub_task.add_parser("abandon",
@@ -4239,6 +4853,7 @@ def main():
     sp.add_argument("--reason", default=None)
     sp.add_argument("--force", action="store_true")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_task_abandon)
 
     sp = sub_task.add_parser("new",
@@ -4260,6 +4875,7 @@ def main():
                          "and append a markdown link. Repeatable. Use "
                          "`@@<path>` in the body to attach + link inline.")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_task_new)
 
     sp = sub_task.add_parser("done",
@@ -4271,6 +4887,7 @@ def main():
     sp.add_argument("--thread", default=None,
                     help="override resolved thread id")
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_task_done)
 
     sp_watch = sub.add_parser("watch",
@@ -4321,16 +4938,19 @@ def main():
     sp.add_argument("--name", required=True)
     sp.add_argument("--description", default=None)
     _add_server_arg(sp)
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_channel_ensure)
 
-    sub.add_parser("servers", help="list servers (alias for `pp server list`)") \
-        .set_defaults(func=cmd_servers)
+    sp = sub.add_parser("servers", help="list servers (alias for `pp server list`)")
+    _add_repo_arg(sp)
+    sp.set_defaults(func=cmd_servers)
 
     sp_server = sub.add_parser("server", help="server management")
     sub_server = sp_server.add_subparsers(dest="server_cmd", required=True)
 
-    sub_server.add_parser("list", help="list servers in the registry") \
-        .set_defaults(func=cmd_servers)
+    sp = sub_server.add_parser("list", help="list servers in the registry")
+    _add_repo_arg(sp)
+    sp.set_defaults(func=cmd_servers)
 
     sp = sub_server.add_parser("new", help="create a new server (branch + worktree + channels)")
     sp.add_argument("name")
@@ -4338,12 +4958,14 @@ def main():
                     help="short description stored in the registry")
     sp.add_argument("--channels", default=None,
                     help="comma-separated channel list (default: general)")
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_server_new)
 
     sp = sub_server.add_parser("switch",
                                help="validate + materialize a server worktree; "
                                     "prints env-export hints")
     sp.add_argument("name")
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_server_switch)
 
     sp = sub_server.add_parser("remove",
@@ -4351,9 +4973,52 @@ def main():
                                     "(requires --yes)")
     sp.add_argument("name")
     sp.add_argument("--yes", action="store_true")
+    _add_repo_arg(sp)
     sp.set_defaults(func=cmd_server_remove)
 
+    sp_repo = sub.add_parser("repo", help="manage multiple chat repos "
+                                          "(switchable per session)")
+    sub_repo = sp_repo.add_subparsers(dest="repo_cmd", required=False)
+
+    sub_repo.add_parser("list", help="list registered chat repos") \
+        .set_defaults(func=cmd_repo_list)
+
+    sp = sub_repo.add_parser("add",
+                             help="register a chat repo: clone (or adopt "
+                                  "--path) + optional init")
+    sp.add_argument("name")
+    sp.add_argument("url", help="git remote URL (recorded; used for clone)")
+    sp.add_argument("--path", default=None,
+                    help="register an existing clone at this path instead of "
+                         "cloning into ~/.pair-pressure/repos/<name>")
+    sp.add_argument("--no-clone", action="store_true",
+                    help="adopt an existing clone (implied by --path)")
+    sp.add_argument("--with-server", default=None, metavar="NAME",
+                    help="scaffold/ensure an initial server in one step")
+    sp.add_argument("--channels", default=None,
+                    help="comma-separated channels for --with-server")
+    sp.set_defaults(func=cmd_repo_add)
+
+    sp = sub_repo.add_parser("use",
+                             help="pin this session to a registered repo "
+                                  "(clears active server; prints env-export hints)")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_repo_use)
+
+    sp = sub_repo.add_parser("remove",
+                             help="unregister a repo (requires --yes); "
+                                  "--delete-clone also removes the on-disk clone")
+    sp.add_argument("name")
+    sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--delete-clone", action="store_true",
+                    help="also rmtree the clone (only if under "
+                         "~/.pair-pressure/repos/)")
+    sp.set_defaults(func=cmd_repo_remove)
+
+    sp_repo.set_defaults(func=cmd_repo_list, repo_cmd=None)
+
     args = p.parse_args()
+    _activate_repo(args)  # pin --repo before any verb (may die on bad --repo)
     try:
         _ensure_watcher(args)
     except Exception:
