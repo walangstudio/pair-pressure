@@ -1180,7 +1180,7 @@ def main():
     ap.add_argument("--email",  default=None, help="git user.email on the chat repo clone")
     ap.add_argument("--repo",   default=None, help="path to chat repo (skips repo prompt)")
     ap.add_argument("--remote", default=None, help="remote URL when initialising a fresh chat repo")
-    ap.add_argument("--channels", default="general,planning,brainstorm",
+    ap.add_argument("--channels", default="general",
                     help="channels when --create-if-missing creates a fresh chat repo")
     ap.add_argument("--create-if-missing", action="store_true",
                     help="if --repo path doesn't exist, run pp-init on it")

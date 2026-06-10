@@ -5,6 +5,9 @@ Run from the scripts/ directory:
 or:
     python3 tests/test_pp.py
 """
+import contextlib
+import io
+import json
 import os
 import shutil
 import sys
@@ -1656,6 +1659,373 @@ class CollectFeedPostsTests(unittest.TestCase):
         posts = pp._collect_feed_posts(self.root, "2026-01-15T00:00:00Z")
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0]["author"], "bob")
+
+
+class PowershellExeTests(unittest.TestCase):
+    """`_powershell_exe` resolves an ABSOLUTE path so the toast/statusline work
+    from the detached daemon / a PATH without System32 (the FileNotFoundError
+    bug)."""
+
+    def test_prefers_which(self):
+        with unittest.mock.patch.object(pp.shutil, "which",
+                                        side_effect=lambda n: r"C:\ps\pwsh.exe"
+                                        if n == "powershell" else None):
+            self.assertEqual(pp._powershell_exe(), r"C:\ps\pwsh.exe")
+
+    def test_falls_back_to_system32_literal(self):
+        with unittest.mock.patch.object(pp.shutil, "which", return_value=None), \
+                unittest.mock.patch.dict(pp.os.environ,
+                                         {"SystemRoot": r"C:\Windows"}), \
+                unittest.mock.patch.object(pp.os.path, "exists",
+                                           return_value=True):
+            got = pp._powershell_exe()
+            self.assertTrue(got.endswith(
+                r"System32\WindowsPowerShell\v1.0\powershell.exe"))
+            self.assertIn(r"C:\Windows", got)
+
+
+class NotifyWindowsArgvTests(unittest.TestCase):
+    """`_notify_windows` invokes the resolved absolute powershell, not bare
+    'powershell' (which raised FileNotFoundError in the daemon)."""
+
+    def test_argv0_is_resolved_exe(self):
+        captured = {}
+
+        def fake_run(argv, **kw):
+            captured["argv"] = argv
+            return unittest.mock.MagicMock(returncode=0, stdout="", stderr="")
+
+        with unittest.mock.patch.object(pp, "_powershell_exe",
+                                        return_value=r"C:\abs\powershell.exe"), \
+                unittest.mock.patch.object(pp.subprocess, "run",
+                                           side_effect=fake_run), \
+                unittest.mock.patch.object(pp, "_watch_log"):
+            self.assertTrue(pp._notify_windows("t", "m"))
+        self.assertEqual(captured["argv"][0], r"C:\abs\powershell.exe")
+        self.assertNotEqual(captured["argv"][0], "powershell")
+
+
+class ChannelArchiveHelperTests(unittest.TestCase):
+    """archived channels drop out of enumeration but keep their files."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name) / "channels"
+        for ch, archived in (("general", False), ("planning", True),
+                             ("newtest", True)):
+            d = self.root / ch
+            d.mkdir(parents=True)
+            meta = {"name": ch, "description": ""}
+            if archived:
+                meta["archived"] = True
+            (d / "channel.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_channel_archived(self):
+        self.assertTrue(pp._channel_archived(self.root / "planning"))
+        self.assertFalse(pp._channel_archived(self.root / "general"))
+
+    def test_active_channel_dirs_excludes_archived(self):
+        names = [p.name for p in pp._active_channel_dirs(self.root)]
+        self.assertEqual(names, ["general"])
+
+    def test_archived_names(self):
+        # _archived_names reads <wt>/channels/*/channel.json
+        wt = Path(self._td.name)
+        self.assertEqual(pp._archived_names(wt), {"planning", "newtest"})
+
+    def test_collect_feed_skips_archived(self):
+        # seed a post into the archived channel; feed must ignore it
+        thr = self.root / "planning" / "2026-01-01_x"
+        thr.mkdir(parents=True)
+        (thr / "meta.json").write_text('{"title": "X"}', encoding="utf-8")
+        (thr / "001-seed.md").write_text(
+            "---\nid: 001\nauthor: a\ntimestamp: 2026-01-01T00:00:00Z\n---\nhi\n",
+            encoding="utf-8")
+        posts = pp._collect_feed_posts(self.root, None)
+        self.assertEqual(posts, [])
+
+    def test_collect_feed_explicit_archived_channel_is_empty(self):
+        # Even naming the archived channel explicitly keeps it off the feed.
+        thr = self.root / "planning" / "2026-01-01_y"
+        thr.mkdir(parents=True)
+        (thr / "meta.json").write_text('{"title": "Y"}', encoding="utf-8")
+        (thr / "001-seed.md").write_text(
+            "---\nid: 001\nauthor: a\ntimestamp: 2026-01-01T00:00:00Z\n---\nhi\n",
+            encoding="utf-8")
+        self.assertEqual(
+            pp._collect_feed_posts(self.root, None, channel="planning"), [])
+
+
+class RenderMessageViewTests(unittest.TestCase):
+    """`_render_chat` handles the new message / ambiguous_message views."""
+
+    def _render(self, payload):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pp._render_chat(payload)
+        return buf.getvalue()
+
+    def test_message_view_full_body(self):
+        post = {"id": "20260512T143022123Z", "author": "alice",
+                "timestamp": "2026-05-12T14:30:22Z", "stance": "extend",
+                "channel": "general", "thread_title": "T",
+                "body": "the full untruncated body"}
+        out = self._render({"view": "message", "post": post})
+        self.assertIn("the full untruncated body", out)
+
+    def test_message_view_no_match(self):
+        out = self._render({"view": "message", "matched": False, "query": "zz"})
+        self.assertIn("no post matched", out)
+        self.assertIn("zz", out)
+
+    def test_ambiguous_message_lists_candidates(self):
+        out = self._render({"view": "ambiguous_message", "query": "3022",
+                            "matches": [
+                                {"id": "AAA", "channel": "general",
+                                 "thread_title": "T1"},
+                                {"id": "BBB", "channel": "planning",
+                                 "thread_title": "T2"}]})
+        self.assertIn("AAA", out)
+        self.assertIn("BBB", out)
+
+
+class SnippetLenTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = os.environ.get("PAIR_PRESSURE_SNIPPET_LEN")
+        os.environ.pop("PAIR_PRESSURE_SNIPPET_LEN", None)
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PAIR_PRESSURE_SNIPPET_LEN", None)
+        else:
+            os.environ["PAIR_PRESSURE_SNIPPET_LEN"] = self._saved
+
+    def test_default_is_240(self):
+        with unittest.mock.patch.object(pp, "_config_load", return_value={}):
+            self.assertEqual(pp._snippet_len(), 240)
+
+    def test_env_override(self):
+        os.environ["PAIR_PRESSURE_SNIPPET_LEN"] = "80"
+        self.assertEqual(pp._snippet_len(), 80)
+
+    def test_config_fallback(self):
+        with unittest.mock.patch.object(pp, "_config_load",
+                                        return_value={"snippet_len": 500}):
+            self.assertEqual(pp._snippet_len(), 500)
+
+    def test_invalid_falls_back(self):
+        os.environ["PAIR_PRESSURE_SNIPPET_LEN"] = "nope"
+        self.assertEqual(pp._snippet_len(), 240)
+
+
+class FindPostByIdTests(unittest.TestCase):
+    """`_find_post_by_id` matches full id + short handle, skips archived."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self._saved = {k: os.environ.get(k) for k in
+                       ("PAIR_PRESSURE_REPO", "HOME", "USERPROFILE")}
+        repo = Path(self._td.name)
+        (repo / ".git").mkdir()
+        os.environ["PAIR_PRESSURE_REPO"] = str(repo)
+        pp._CURRENT_REPO = None
+        self.repo = repo
+        self._mkchannel("general", False)
+        self._mkchannel("archived-ch", True)
+        # two posts in general; ids share the substring "3022"
+        self._mkpost("general", "20260512T143022100Z", "alice", "first body")
+        self._mkpost("general", "20260513T153022200Z", "bob", "second body")
+        # a post only in the archived channel
+        self._mkpost("archived-ch", "20260514T101010999Z", "carol", "hidden")
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        pp._CURRENT_REPO = None
+        self._td.cleanup()
+
+    def _mkchannel(self, name, archived):
+        d = self.repo / "channels" / name
+        d.mkdir(parents=True)
+        meta = {"name": name, "description": ""}
+        if archived:
+            meta["archived"] = True
+        (d / "channel.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    def _mkpost(self, channel, pid, author, body):
+        thr = self.repo / "channels" / channel / "2026-01-01_t"
+        thr.mkdir(parents=True, exist_ok=True)
+        if not (thr / "meta.json").exists():
+            (thr / "meta.json").write_text('{"title": "T"}', encoding="utf-8")
+        fm = {"id": pid, "in_reply_to": None, "author": author, "alias": None,
+              "via": "human", "model": None, "stance": "extend",
+              "timestamp": "2026-05-12T14:30:22Z"}
+        (thr / f"{pid}-seed.md").write_text(pp.dump_fm(fm, body),
+                                            encoding="utf-8")
+
+    def test_exact_full_id(self):
+        hit = pp._find_post_by_id("20260512T143022100Z")
+        self.assertEqual(hit["author"], "alice")
+        self.assertIn("first body", hit["body"])
+
+    def test_unique_short_handle(self):
+        hit = pp._find_post_by_id("022100Z")  # only in alice's id
+        self.assertEqual(hit["author"], "alice")
+
+    def test_ambiguous_short_handle(self):
+        hit = pp._find_post_by_id("3022")  # in both ids
+        self.assertIn("ambiguous", hit)
+        self.assertEqual(len(hit["ambiguous"]), 2)
+
+    def test_archived_post_not_found(self):
+        self.assertIsNone(pp._find_post_by_id("20260514T101010999Z"))
+
+    def test_no_match(self):
+        self.assertIsNone(pp._find_post_by_id("zzzzzz"))
+
+
+class RenderShortIdTests(unittest.TestCase):
+    """`_render_posts` prints the short id handle so a post can be re-fetched
+    with `pp read --message <id>`."""
+
+    def test_short_id_in_output(self):
+        post = {"id": "20260512T143022123Z", "author": "alice",
+                "timestamp": "2026-05-12T14:30:22Z", "stance": "extend",
+                "body": "hello world"}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pp._render_posts([post], show_channel=False)
+        out = buf.getvalue()
+        self.assertIn("22123Z", out)  # last 6 chars of the id
+        self.assertIn("hello world", out)
+
+
+class WireStatuslineQuietTests(unittest.TestCase):
+    """`_wire_statusline_quiet` is the silent, non-dying core of `watch wire`."""
+
+    def setUp(self):
+        self._home = tempfile.TemporaryDirectory()
+        self._saved = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        self.claude = Path(self._home.name) / ".claude"
+        self.claude.mkdir()
+        self.settings = self.claude / "settings.json"
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._home.cleanup()
+
+    def test_wires_and_preserves_prev(self):
+        self.settings.write_text(
+            '{"statusLine": {"type": "command", "command": "echo hi"}}',
+            encoding="utf-8")
+        self.assertTrue(pp._wire_statusline_quiet())
+        data = json.loads(self.settings.read_text())
+        self.assertEqual(data["_pp_prev_statusline"], "echo hi")
+        self.assertIn("pp-statusline.ps1", data["statusLine"]["command"])
+
+    def test_no_prev_is_empty_string(self):
+        self.settings.write_text("{}", encoding="utf-8")
+        pp._wire_statusline_quiet()
+        data = json.loads(self.settings.read_text())
+        self.assertEqual(data["_pp_prev_statusline"], "")
+
+    def test_idempotent(self):
+        self.settings.write_text("{}", encoding="utf-8")
+        self.assertTrue(pp._wire_statusline_quiet())
+        self.assertFalse(pp._wire_statusline_quiet())  # already pp-wired
+
+    def test_malformed_returns_false(self):
+        self.settings.write_text("{not json", encoding="utf-8")
+        self.assertFalse(pp._wire_statusline_quiet())
+
+
+class EnsureWiredTests(unittest.TestCase):
+    """auto-wire-on-any-pp: one-shot, opt-out, Claude-Code-only, never raises."""
+
+    def setUp(self):
+        self._home = tempfile.TemporaryDirectory()
+        self._pp = tempfile.TemporaryDirectory()
+        self._saved = {k: os.environ.get(k) for k in
+                       ("HOME", "USERPROFILE", "PAIR_PRESSURE_NO_AUTOWIRE",
+                        "PAIR_PRESSURE_IS_WATCH_DAEMON")}
+        os.environ["HOME"] = self._home.name
+        os.environ["USERPROFILE"] = self._home.name
+        os.environ.pop("PAIR_PRESSURE_NO_AUTOWIRE", None)
+        os.environ.pop("PAIR_PRESSURE_IS_WATCH_DAEMON", None)
+        self.claude = Path(self._home.name) / ".claude"
+        self.claude.mkdir()
+        self.settings = self.claude / "settings.json"
+        self.sentinel = Path(self._pp.name) / "autowire.done"
+        self._patch = unittest.mock.patch.object(pp, "_PP_HOME",
+                                                  Path(self._pp.name))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._home.cleanup()
+        self._pp.cleanup()
+
+    def _args(self, cmd="status"):
+        import argparse
+        return argparse.Namespace(cmd=cmd)
+
+    def _silence(self):
+        return contextlib.redirect_stderr(io.StringIO())
+
+    def test_wires_and_stamps_sentinel(self):
+        self.settings.write_text("{}", encoding="utf-8")
+        with self._silence():
+            pp._ensure_wired(self._args())
+        self.assertTrue(self.sentinel.exists())
+        data = json.loads(self.settings.read_text())
+        self.assertIn("pp-statusline.ps1", data["statusLine"]["command"])
+
+    def test_sentinel_blocks_rewire(self):
+        self.sentinel.touch()
+        self.settings.write_text("{}", encoding="utf-8")
+        pp._ensure_wired(self._args())
+        self.assertEqual(self.settings.read_text(), "{}")
+
+    def test_optout_env_skips(self):
+        os.environ["PAIR_PRESSURE_NO_AUTOWIRE"] = "1"
+        self.settings.write_text("{}", encoding="utf-8")
+        pp._ensure_wired(self._args())
+        self.assertEqual(self.settings.read_text(), "{}")
+        self.assertFalse(self.sentinel.exists())
+
+    def test_optout_config_skips(self):
+        self.settings.write_text("{}", encoding="utf-8")
+        with unittest.mock.patch.object(pp, "_config_load",
+                                        return_value={"watch": {"autowire": False}}):
+            pp._ensure_wired(self._args())
+        self.assertEqual(self.settings.read_text(), "{}")
+
+    def test_no_settings_skips_without_sentinel(self):
+        # no settings.json -> not a Claude Code install -> skip, no sentinel
+        pp._ensure_wired(self._args())
+        self.assertFalse(self.sentinel.exists())
+
+    def test_watch_command_skipped(self):
+        self.settings.write_text("{}", encoding="utf-8")
+        pp._ensure_wired(self._args(cmd="watch"))
+        self.assertEqual(self.settings.read_text(), "{}")
 
 
 if __name__ == "__main__":
