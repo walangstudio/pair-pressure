@@ -14,17 +14,22 @@ and offline mode** (offline = scan local files; online = fetch then scan
 `origin/<branch>` without touching your working tree), fires a native OS
 notification (Windows toast / macOS `osascript` / Linux `notify-send`),
 appends to `~/.pair-pressure/watch.log`, and bumps an unread counter
-`~/.pair-pressure/unread.json`.
+`~/.pair-pressure/unread.json`. The OS toast is the **primary, cross-CLI**
+alert (pair-pressure runs under AI CLIs beyond Claude Code); the statusline
+badge below is a Claude-Code-only bonus.
 
 ### How the alert reaches the console
 
-- **Statusline badge — 0 tokens (recommended).** `pp watch wire` sets a
-  standalone pair-pressure statusline. The model never sees it, so it costs
-  nothing. When idle it renders empty; on unread it shows
-  `[pp 3 new alice #general]`; when offline mode is on it shows
-  `[pp (offline)]` (or `[pp (offline) 3 new alice #general]`). It
-  **replaces** any previous statusline; the prior command is saved so
-  `pp watch wire --undo` restores it exactly.
+- **Statusline badge — 0 tokens (auto-wired).** The badge is wired into
+  `~/.claude/settings.json` automatically on your first `pp` call (Claude Code
+  only). The model never sees it, so it costs nothing. When idle it renders
+  empty; on unread it shows `[pp 3 new alice #general]`; when offline mode is
+  on it shows `[pp (offline)]`. It **composes with** any existing statusline:
+  pp runs the prior statusline command, feeds it the same session JSON, and
+  appends its own badge after that output — other statusline plugins keep
+  working. The prior command is saved so `pp watch wire --undo` restores it
+  exactly. Opt out of auto-wiring with `watch.autowire: false` in
+  `~/.pair-pressure/config.json` or env `PAIR_PRESSURE_NO_AUTOWIRE=1`.
 - **In-prompt nudge — INCURS TOKEN COST (opt-in).** `pp watch wire --nudge`
   also adds a `UserPromptSubmit` hook that injects one short line
   (`[pair-pressure] N new messages ... /pp-chat:read`) into your next prompt
@@ -76,10 +81,12 @@ pp watch wire --nudge      # ALSO add the token-costing prompt nudge
 pp watch wire --undo       # restore original statusline + remove the hook
 ```
 Idempotent; backs up `~/.claude/settings.json` to `settings.json.pp.bak`
-once; preserves your existing statusline command and any existing
-`UserPromptSubmit` hooks. Restart Claude Code (or start a new session) for
-the statusline/hook change to load. When `--nudge` is used, relay the
-returned `cost_warning` to the user.
+once; composes with your existing statusline command (runs it, appends the pp
+badge) and preserves any existing `UserPromptSubmit` hooks. The badge is
+already auto-wired on first `pp` call, so you usually only need this for
+`--nudge` or `--undo`. Restart Claude Code (or start a new session) for the
+statusline/hook change to load. When `--nudge` is used, relay the returned
+`cost_warning` to the user.
 
 Notes:
 - Notifications work the same online or offline; debounced to ≤1 per

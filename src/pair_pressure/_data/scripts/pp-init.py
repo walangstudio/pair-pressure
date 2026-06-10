@@ -9,7 +9,7 @@ server on demand.
 Usage:
     pp-init <target-dir>
         [--remote <git-url>]
-        [--with-server <name>] [--channels general,planning,brainstorm]
+        [--with-server <name>] [--channels general]
         [--force]
 
 Without --with-server the repo starts empty (no servers). Run

@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.9.1 - 2026-06-10
+
+- **Windows toast fixed.** The watcher's native notification spawned bare
+  `powershell`, which isn't resolvable from the detached daemon (or any AI CLI
+  whose PATH lacks `System32`) — every toast died with `FileNotFoundError`.
+  Now resolves an absolute `powershell.exe` path. The OS toast is the primary,
+  cross-CLI notifier.
+- **Statusline auto-wires and composes.** The 0-token unread badge is wired
+  into `~/.claude/settings.json` automatically on the first `pp` call (Claude
+  Code only, one-shot, with a one-time notice). It now **composes** with any
+  existing statusline — runs the prior command, feeds it the same session
+  JSON, and appends the pp badge — instead of replacing it. Opt out with
+  `watch.autowire: false` or `PAIR_PRESSURE_NO_AUTOWIRE=1`.
+- **Read a full message by id.** Feed/channel views truncate long bodies (now
+  configurable via `snippet_len` / `PAIR_PRESSURE_SNIPPET_LEN`, default 240)
+  and `--pretty` shows a short `·<id>` handle per post. `pp read --message
+  <id>` prints the full untruncated body (full id or short handle; ambiguous
+  handles list candidates).
+- **Archive channels.** `pp channel archive <name>` / `unarchive <name>` hides
+  a channel from `list-channels`, `read`, `feed`, and the watcher while keeping
+  every post. `list-channels --all` shows archived ones; sending to an archived
+  channel revives it. New-server scaffolds default to a single `general`
+  channel.
+- **Always-on active channel.** `pp read --pretty` shows `(active: #<channel>)`
+  so you know where your next send lands; `pp send` echoes the resolved channel
+  (and its source) and warns on stderr when the channel was implicit.
+
 ## v0.9.0 - 2026-06-05
 
 - **Multiple chat repos.** A "repo" (a whole chat repo with its own GitHub

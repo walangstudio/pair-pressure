@@ -1,13 +1,17 @@
-# pair-pressure standalone statusline (0 LLM tokens).
+# pair-pressure statusline (0 LLM tokens).
 # Claude Code renders our stdout at the bottom; the model never sees it.
-# This script replaces whatever statusLine was configured (a copy of the
-# previous command is saved in settings.json `_pp_prev_statusline` so
-# `pp watch wire --undo` can restore it). No chaining, no subprocesses.
+# Composable: if another statusLine was configured before pp wired itself, we
+# run that prior command (its string is saved in settings.json
+# `_pp_prev_statusline`), feed it the same session JSON on stdin, and APPEND
+# the pp badge after its output -- so other statusline plugins keep working.
+# A failure in the prior command can never break our line (fails to empty).
 $ErrorActionPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch {}
 
-# Drain stdin (Claude Code feeds session JSON; we don't currently use it).
-[void]([Console]::In.ReadToEnd())
+# Buffer stdin ONCE (it can only be read once). Claude Code feeds session JSON;
+# we don't use it ourselves, but the prior statusline command might.
+$stdin = ''
+try { $stdin = [Console]::In.ReadToEnd() } catch {}
 
 $base = $env:USERPROFILE
 if (-not $base) { $base = $HOME }
@@ -48,8 +52,8 @@ if (Test-Path $uf) {
     } catch {}
 }
 
-# Compose. Silent when nothing to report and online (lets the user reclaim
-# screen). Always shows when offline so the mode is visible.
+# Compose the pp badge. Silent when nothing to report and online (lets the
+# user reclaim screen). Always shows when offline so the mode is visible.
 $parts = @('pp')
 if ($offline) { $parts += '(offline)' }
 if ($count -gt 0) {
@@ -59,9 +63,44 @@ if ($count -gt 0) {
     elseif ($where)        { $detail = " $where" }
     $parts += ("$count new$detail")
 }
-
+$ppBadge = ''
 if ($count -gt 0 -or $offline) {
-    Write-Output ('[' + ($parts -join ' ') + ']')
+    $ppBadge = '[' + ($parts -join ' ') + ']'
+}
+
+# Run the previously-configured statusline (if any) and prepend its output, so
+# pp composes with other plugins instead of replacing them.
+$prevOut = ''
+$prev = $null
+$settings = Join-Path $base '.claude\settings.json'
+if (Test-Path $settings) {
+    try {
+        $sj = Get-Content -Raw -LiteralPath $settings | ConvertFrom-Json
+        if ($sj.PSObject.Properties.Match('_pp_prev_statusline').Count -gt 0) {
+            $prev = [string]$sj._pp_prev_statusline
+        }
+    } catch {}
+}
+if ($prev -and $prev.Trim()) {
+    # Run the prior command verbatim from a temp .cmd file. This survives
+    # quoted paths with spaces (which break `cmd /c "<cmd>"` and Windows
+    # PowerShell's native-arg quoting) and forwards the buffered session JSON
+    # on stdin so stdin-driven statuslines still work.
+    $cf = Join-Path ([System.IO.Path]::GetTempPath()) "pp_prev_$PID.cmd"
+    try {
+        Set-Content -LiteralPath $cf -Value $prev -Encoding Default
+        $prevOut = ($stdin | & $env:ComSpec '/q' '/c' $cf 2>$null | Out-String)
+        $prevOut = $prevOut.TrimEnd("`r", "`n")
+    } catch { $prevOut = '' }
+    finally { Remove-Item -LiteralPath $cf -Force -ErrorAction SilentlyContinue }
+}
+
+if ($prevOut -and $ppBadge) {
+    Write-Output ($prevOut + ' ' + $ppBadge)
+} elseif ($prevOut) {
+    Write-Output $prevOut
+} elseif ($ppBadge) {
+    Write-Output $ppBadge
 } else {
     # Nothing to say; emit empty line (Claude Code accepts blank statuslines).
     Write-Output ''
