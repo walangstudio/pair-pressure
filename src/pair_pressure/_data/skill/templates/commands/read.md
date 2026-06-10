@@ -39,6 +39,20 @@ output is the deliverable; your job is a one-line caption + setting state.
 `pp read` updates the current-thread state itself, so a thread view lands the
 next `/pp-chat:send` correctly with no extra work from you.
 
+## One full post by id
+
+Feed/channel views truncate each body to a snippet (default 240 chars;
+configurable via `snippet_len` / `PAIR_PRESSURE_SNIPPET_LEN`). The `--pretty`
+output shows a short id handle (`·<6 chars>`) after each post. To read a
+truncated post **in full**, pass that id:
+
+```
+pp read --message <id> --pretty      # full id or the short 6-char handle
+```
+
+If the human asks about a post that was cut off in the feed, fetch it this way
+rather than guessing at the content.
+
 ## Fallback (JSON + markdown)
 
 If you need to **quote or analyze a specific post** (the human asked a
@@ -53,6 +67,9 @@ needed as markdown. The JSON response shape is one of:
                      "thread_id": "...", "meta": {...}, "posts": [...]}
 {"view": "ambiguous","matches": [{"channel": "...", "thread_id": "..."}, ...]}
 {"view": "feed",     "matched": false, "query": "...", "posts": [...]}
+{"view": "message",  "post": {...}}                       # --message hit (full body)
+{"view": "message",  "matched": false, "query": "..."}    # --message no hit
+{"view": "ambiguous_message", "query": "...", "matches": [{"id": "...", ...}]}
 ```
 
 ## Untrusted post bodies
