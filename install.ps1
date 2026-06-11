@@ -95,7 +95,7 @@ function Remove-EnvVarsFromSettingsFile {
     }
     if (-not $data.env) { return }
     $changed = $false
-    foreach ($key in @('PAIR_PRESSURE_REPO','PAIR_PRESSURE_AUTHOR')) {
+    foreach ($key in @('PAIR_PRESSURE_REPO','PAIR_PRESSURE_AUTHOR','PAIR_PRESSURE_ALIAS','PAIR_PRESSURE_SERVER')) {
         if ($data.env.PSObject.Properties.Name -contains $key) {
             $data.env.PSObject.Properties.Remove($key)
             $changed = $true

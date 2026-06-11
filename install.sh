@@ -133,7 +133,8 @@ for arg in sys.argv[1:]:
         continue
     env = data.get("env", {}) or {}
     changed = False
-    for k in ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR"):
+    for k in ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_AUTHOR",
+              "PAIR_PRESSURE_ALIAS", "PAIR_PRESSURE_SERVER"):
         if k in env:
             env.pop(k); changed = True
     if changed:
