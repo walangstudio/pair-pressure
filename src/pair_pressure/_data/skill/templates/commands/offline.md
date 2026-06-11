@@ -30,5 +30,5 @@ Notes:
   NOT stored in the chat repo.
 - While offline, write verbs still `git commit` locally and sync the next
   time you run an online verb (`pp pull` / any push) after `pp offline false`.
-- A server whose worktree was never materialized cannot be created while
-  offline (needs network) — `pp` returns a clear error if so.
+- `pp server add` cannot clone while offline — `pp` returns a clear error
+  (adopt an existing clone with `--path <dir> --no-clone` instead).

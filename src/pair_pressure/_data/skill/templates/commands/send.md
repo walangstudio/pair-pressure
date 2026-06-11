@@ -1,87 +1,64 @@
 ---
-description: Post to the current thread. Verbatim by default — instant, no AI thinking.
-argument-hint: <message> | ai [stance] <steering> | <channel> [<thread>] <message>
+description: Post to the active channel. Verbatim by default — instant, no AI thinking.
+argument-hint: <message> | ai <steering> | #<channel> <message>
 model: claude-haiku-4-5-20251001
 allowed-tools: Bash, Read
 ---
 
 # DO NOT THINK. EXECUTE. No preamble, no narration.
 
-`pp send` resolves server/channel/thread from state itself. Never pre-scan
-with `pp status`, `pp list-channels`, `pp list-threads`, or `pp read` — those
-are the noise we are eliminating.
+`pp send` resolves server/channel from saved state itself. Never pre-scan
+with `pp status`, `pp channels`, or `pp read` first.
 
-## Confirming the send (what the human sees)
-
-`pp send` returns JSON
-(`{"ok","kind","channel","channel_source","thread_id","post_id"}`).
-**Do NOT print that JSON** — it's machine plumbing, not useful to a human, and
-`post_id` is `null` on a new thread by design. Instead, after a successful
-send, confirm in one short human line **what was posted and where**, then the
-message itself:
-
-```
-Sent to #<channel> › <thread_id>   (use "new thread" when kind=seed)
-
-<the exact message body that was posted>
-```
-
-When `channel_source` is anything other than `"arg"` (i.e. the channel came
-from saved state / env / default, not an explicit `<channel>` the user typed),
-make the channel **prominent** in that confirmation so the user is never
-surprised where a message landed — e.g. `Sent to #general (your active
-channel) › ...`. `pp send` also prints this to stderr before posting.
-
-This matters most in **AI mode**: the human needs to see the message you
-composed on their behalf. Echo the body you actually sent (after any
-`@<path>` inlining). If `--attach`/`@@` added files, append
-`(+ <n> attachment(s))`. On `{"ok":false,...}` handle the reason (see Notes) —
-don't show the success line.
-
-## Fast path (DEFAULT — first token is NOT `ai`/`ai-reply`)
+## Fast path (DEFAULT — first token is NOT `ai`)
 
 One tool call — pipe `$ARGUMENTS` verbatim:
 ```
 pp send --via human --body-file -
 ```
+- If the first token is `#<channel>`, strip it and pass `--channel <channel>`.
 - `@<path>` in the body → inline the file's verbatim contents (Read it).
 - `@@<path>` → leave the token verbatim; `pp send` copies the file into the
   post's `attachments/` and rewrites it to a link.
-- `--attach <path>` (repeatable) → strip from the body, forward as flags:
-  `pp send --via human --attach <p1> [--attach <p2>] --body-file -`.
+- `--attach <path>` (repeatable) → strip from the body, forward as flags.
+- `--reply-to <id>` → forward as a flag (`<id>` = post id or unique
+  substring, e.g. the `·xxxxxx` handle from a read view).
 
-Response: `{"ok":true,"kind":"reply|seed","thread_id":"...","post_id":"..."}`.
+## AI mode (first token is `ai`)
 
-## AI mode (first token is `ai` or `ai-reply`)
+Compose a reply signed `<author>/<alias>`. TWO tool calls max:
 
-Compose a reply signed `<author>/<alias>`. Stay to TWO tool calls max:
-
-1. Resolve the target thread WITHOUT scanning:
-   - Default = the current thread from state (no lookup needed).
-   - If the steering names a *different* thread and it's not the current one,
-     or no current thread is set, **ask the user which thread** (one question).
-     Do NOT run `list-channels`/`list-threads`/`read` to hunt for it.
-2. (Optional, 1 call) For context, read ONLY the target thread:
-   `pp read-thread --channel <C> --thread <T> --no-pull`.
-3. Post:
+1. (Optional, 1 call) For context: `pp read --no-pull`.
+2. Post:
    ```
-   pp send --stance <agree|contradict|extend|question|summary> --via claude-code [--alias <N>] --body-file -
+   pp send --via claude-code [--model <id>] [--reply-to <id>] --body-file -
    ```
-   `pp send` reuses the current thread from state. Add `--summary "<2-3 sentences>"`
-   only if the reply shifts the thread's conclusion. Parse the steering after
-   `ai`: optional stance token (default `extend`); the rest is the topic.
+   The steering after `ai` is the topic; write the message yourself. When
+   you're answering a specific earlier post, pass `--reply-to <id>` (the
+   `·xxxxxx` handle from a read view) so the reply chain is preserved.
 
-## Explicit target (`<channel> [<thread>] <message>`)
+## Confirming the send (what the human sees)
+
+`pp send` prints `→ <server> #<channel>` to stderr before posting and
+returns JSON `{"ok","where","server","channel","channel_source","post_id"}`.
+**Do NOT print that JSON.** Confirm in one short human line what was posted
+and where, then the message itself:
 
 ```
-pp send --channel <C> [--thread <T>] --via human --body-file -
+Sent to <server> #<channel>
+
+<the exact message body that was posted>
 ```
-Pass `--thread` only if the user named a specific title/id; else let `pp send`
-resolve within the channel.
+
+When `channel_source` is anything other than `"arg"`, make the channel
+prominent — e.g. `Sent to acme #general (your active channel)` — so the user
+is never surprised where a message landed. If attachments were added, append
+`(+ <n> attachment(s))`. On `{"error": ...}` relay the error verbatim — an
+archived channel or a private group you're not in returns a clear message.
 
 ## Notes
-- `--via human` = dev typed it; `--via claude-code` = AI composed. Never override `--author`.
-- If `/pp-chat:alias <N>` was set this session, pass `--alias <N>` on AI-mode sends.
-- `{"ok":false,"reason":"password_required"}` → ask for the password, then
-  `printf '%s' "<P>" | pp join --channel <C> --thread <id> --password-stdin`, and retry.
-- `pp send` updates state; subsequent `pp` calls pick up the thread automatically.
+- `--via human` = dev typed it; `--via claude-code` = AI composed. Never
+  override `--author`.
+- The session alias is persisted (`pp alias <N>`); you do not need to pass
+  `--alias` on every send unless overriding for one post.
+- `pp send` saves the channel to state; later `pp` calls stay there.
