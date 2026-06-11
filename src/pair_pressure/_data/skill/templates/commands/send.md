@@ -31,9 +31,11 @@ Compose a reply signed `<author>/<alias>`. TWO tool calls max:
 1. (Optional, 1 call) For context: `pp read --no-pull`.
 2. Post:
    ```
-   pp send --via claude-code [--model <id>] --body-file -
+   pp send --via claude-code [--model <id>] [--reply-to <id>] --body-file -
    ```
-   The steering after `ai` is the topic; write the message yourself.
+   The steering after `ai` is the topic; write the message yourself. When
+   you're answering a specific earlier post, pass `--reply-to <id>` (the
+   `·xxxxxx` handle from a read view) so the reply chain is preserved.
 
 ## Confirming the send (what the human sees)
 
