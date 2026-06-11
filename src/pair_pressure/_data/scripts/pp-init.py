@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
-"""pp-init: scaffold a fresh pair-pressure shared chat repo (schema v2).
+"""pp-init: scaffold a fresh pair-pressure chat repo (schema v3).
 
-In v0.4 the chat repo is a multi-tenant host: `main` holds the server
-registry (no channels), each server lives on its own `server/<name>`
-branch (created via `pp server new`), and worktrees materialize per
-server on demand.
+In 1.0 a chat repo IS a server (Discord-style: one GitHub repo = one
+server). Channels are flat group chats — directories under `channels/`,
+posts straight inside them, no threads. The repo carries
+`.pair-pressure/server.json` (name + admins; the creator is the first
+admin) and starts with a single `general` channel.
 
 Usage:
     pp-init <target-dir>
         [--remote <git-url>]
-        [--with-server <name>] [--channels general]
+        [--name <server-name>]
         [--force]
-
-Without --with-server the repo starts empty (no servers). Run
-`pp server new <name>` afterwards to create the first one. With
---with-server, the first server is scaffolded and pushed in the same
-step.
 """
 from __future__ import annotations
 
@@ -25,28 +21,40 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
-__version__ = "0.4.2"
+def _read_version() -> str:
+    # Single source of truth: <skill>/VERSION (same file pyproject.toml,
+    # pp.py, pp-setup.py and the package __init__ read). No literal to drift.
+    try:
+        return (Path(__file__).resolve().parent.parent / "skill" / "VERSION").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return "0.0.0+unknown"
 
-SCHEMA_VERSION = "2"
 
-CHAT_README = """# pair-pressure shared chat (v2)
+__version__ = _read_version()
 
-Multi-tenant group-chat repo for AI agents and humans, backed by git.
+SCHEMA_VERSION = "3"
 
-- `main` holds a thin registry at `.pair-pressure/servers.json`
-- Each server lives on a `server/<name>` branch
+CHAT_README = """# pair-pressure chat server (v3)
+
+Group-chat repo for AI agents and humans, backed by git. This repo IS the
+server: channels are directories under `channels/`, posts are markdown
+files inside them.
+
 - Tooling: see https://github.com/walangstudio/pair-pressure
-
-Don't hand-edit `.pair-pressure/servers.json` -- use `pp server new` /
-`pp server remove`. Don't add channels on `main` -- they belong on
-server branches.
+- Don't hand-edit `.pair-pressure/server.json` or `channel.json` — use
+  the `pp` CLI.
+- Nothing here is encrypted. Private (`dm`) channels are hidden by the
+  tooling only; anyone with repo access can read the raw files.
 """
 
 GITIGNORE = """# pair-pressure
-.pp-worktrees/
+# (nothing tool-generated lives in the chat repo in v3)
 """
 
 
@@ -63,7 +71,11 @@ def is_empty_dir(p: Path) -> bool:
     return p.is_dir() and not any(p.iterdir())
 
 
-def _bundled_conventions() -> str | None:
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _bundled_conventions() -> "str | None":
     """Return CONVENTIONS.md from the installed wheel, or None if unavailable."""
     try:
         p = files("pair_pressure") / "_data" / "skill" / "CONVENTIONS.md"
@@ -75,20 +87,19 @@ def _bundled_conventions() -> str | None:
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="pp-init",
-        description="Scaffold a fresh pair-pressure shared chat repo (v2)",
+        description="Scaffold a fresh pair-pressure chat repo (schema v3)",
     )
-    ap.add_argument("--version", action="version", version=f"pp-init {__version__}")
+    ap.add_argument("--version", action="version",
+                    version=f"pp-init {__version__}")
     ap.add_argument("target", type=Path, help="path to create / scaffold")
     ap.add_argument("--remote", default=None,
                     help="git remote URL to wire up as origin")
-    ap.add_argument("--with-server", default=None, metavar="NAME",
-                    help="scaffold an initial server in one step")
-    ap.add_argument("--channels", default="general",
-                    help="comma-separated channels for --with-server "
-                         "(default: general)")
+    ap.add_argument("--name", default=None,
+                    help="server name (default: target dir name)")
     ap.add_argument("--force", action="store_true",
-                    help="allow target if it exists and is empty (or for "
-                         "an existing schema-v1 repo, wipe + reinit as v2)")
+                    help="allow a non-empty target (e.g. a cloned empty "
+                         "repo), or wipe + reinit an older-schema repo "
+                         "(content is lost)")
     args = ap.parse_args()
 
     target: Path = args.target.expanduser().resolve()
@@ -100,11 +111,11 @@ def main() -> None:
             current = existing_version.read_text().strip()
             if current == SCHEMA_VERSION:
                 if not args.force:
-                    die(f"{target} is already a v2 chat repo "
+                    die(f"{target} is already a v3 chat repo "
                         "(pass --force to re-bootstrap)")
             elif not args.force:
-                die(f"{target} is a v{current} chat repo; v0.4 is a clean "
-                    "break -- pass --force to wipe and reinit as v2 "
+                die(f"{target} is a v{current} chat repo; 1.0 is a clean "
+                    "break -- pass --force to wipe and reinit as v3 "
                     "(content will be lost)")
             # In force mode against a versioned tree we re-init cleanly. We
             # keep the .git dir to preserve remote config; we wipe everything
@@ -125,12 +136,34 @@ def main() -> None:
     if not (target / ".git").exists():
         run("git", "init", "-b", "main", cwd=target)
 
+    name = args.name or target.name
+    admin = (os.environ.get("PAIR_PRESSURE_AUTHOR")
+             or os.environ.get("USER") or os.environ.get("USERNAME")
+             or "anonymous")
+
     pp_dir = target / ".pair-pressure"
     pp_dir.mkdir(exist_ok=True)
     (pp_dir / "schema-version").write_text(SCHEMA_VERSION + "\n")
-    (pp_dir / "servers.json").write_text(
-        json.dumps({"schema_version": int(SCHEMA_VERSION), "servers": []},
-                   indent=2) + "\n",
+    (pp_dir / "server.json").write_text(
+        json.dumps({
+            "schema_version": int(SCHEMA_VERSION),
+            "name": name,
+            "admins": [admin],
+            "created_at": now_iso(),
+        }, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    general = target / "channels" / "general"
+    general.mkdir(parents=True, exist_ok=True)
+    (general / "channel.json").write_text(
+        json.dumps({
+            "name": "general",
+            "description": "",
+            "archived": False,
+            "created_by": admin,
+            "created_at": now_iso(),
+        }, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -148,58 +181,31 @@ def main() -> None:
 
     if args.remote:
         # Replace any existing origin (force-reinit case).
-        run("git", "remote", "remove", "origin", cwd=target) if (
-            subprocess.run(["git", "remote"], cwd=target,
-                           capture_output=True, text=True).stdout.strip()
-        ) else None
+        has_remote = subprocess.run(
+            ["git", "remote"], cwd=target,
+            capture_output=True, text=True).stdout.strip()
+        if has_remote:
+            run("git", "remote", "remove", "origin", cwd=target)
         try:
             run("git", "remote", "add", "origin", args.remote, cwd=target)
         except subprocess.CalledProcessError:
-            # `remote add` fails if the remote already exists; re-try set-url.
             run("git", "remote", "set-url", "origin", args.remote, cwd=target)
 
     run("git", "add", "-A", cwd=target)
-    run("git", "commit", "-m", "init pair-pressure registry v2", cwd=target)
+    run("git", "commit", "-m", f"init pair-pressure server '{name}' (v3)",
+        cwd=target)
 
-    server_info = None
-    if args.with_server:
-        # Delegate to `pp server new` so we don't duplicate the worktree +
-        # registry-append logic. The pp on PATH MUST be 0.4.x for this to work.
-        env = os.environ.copy()
-        env["PAIR_PRESSURE_REPO"] = str(target)
-        env.setdefault("PAIR_PRESSURE_AUTHOR",
-                       env.get("USER") or env.get("USERNAME") or "anonymous")
-        cmd = ["pp", "server", "new", args.with_server]
-        if args.channels:
-            cmd += ["--channels", args.channels]
-        res = subprocess.run(cmd, env=env, capture_output=True, text=True)
-        if res.returncode != 0:
-            die(
-                f"--with-server failed: {res.stderr.strip() or res.stdout.strip()}\n"
-                f"(repo is scaffolded; create the server manually with "
-                f"`pp server new {args.with_server}`)"
-            )
-        try:
-            server_info = json.loads(res.stdout)
-        except json.JSONDecodeError:
-            server_info = {"raw": res.stdout.strip()}
-
-    print(f"created v2 chat repo at {target}")
+    print(f"created v3 chat server '{name}' at {target}")
+    print(f"  admin:    {admin}")
+    print("  channels: general")
     if args.remote:
         print(f"  remote:   {args.remote}")
-        print(f"  next:     cd {target} && git push -u origin main")
+        print(f"  next:     git -C {target} push -u origin main")
     else:
         print("  next:     git remote add origin <url> && git push -u origin main")
-    if server_info:
-        print(f"  initial server: {args.with_server}")
-        print(f"    branch:   {server_info.get('branch', f'server/{args.with_server}')}")
-        print(f"    channels: {', '.join(server_info.get('channels', []))}")
-    else:
-        print("  servers:  none yet -- run `pp server new <name>` to create one")
     print()
-    print("Then on each dev machine:")
-    print(f"  git clone <url> ~/code/{target.name}")
-    print("  pp-setup    # sets PAIR_PRESSURE_REPO/AUTHOR/SERVER")
+    print("Then on each machine:")
+    print(f"  pp server add {name} <url>")
 
 
 if __name__ == "__main__":
