@@ -8,3 +8,7 @@ from ._paths import pp_script
 
 def main() -> None:
     run_path(str(pp_script()), run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()

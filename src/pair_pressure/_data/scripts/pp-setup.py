@@ -453,6 +453,51 @@ def write_shell_profile(env_updates):
     return written
 
 
+# v1.0 retired these env vars (servers come from the registry now). A stale
+# PAIR_PRESSURE_SERVER outranks the registry default in resolve_server_name,
+# so an upgrader who keeps it wedges every verb on "server not registered".
+RETIRED_ENV_KEYS = ("PAIR_PRESSURE_REPO", "PAIR_PRESSURE_SERVER")
+
+
+def _strip_env_keys_from_settings_file(path, keys):
+    """Remove the given env keys from one Claude settings file. Returns the
+    list of keys actually removed (empty if file absent / invalid / clean)."""
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8-sig").strip()
+        data = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return []
+    env = data.get("env")
+    if not isinstance(env, dict):
+        return []
+    removed = [k for k in keys if k in env]
+    for k in removed:
+        env.pop(k, None)
+    if removed:
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return removed
+
+
+def clear_retired_env(author, alias):
+    """Strip retired PAIR_PRESSURE_REPO/SERVER from both settings files, and
+    rewrite the shell-profile block with just the current identity vars (the
+    block is replaced wholesale, dropping any retired vars it carried).
+    Returns the sorted set of keys removed from the settings files."""
+    removed = set()
+    for p in (SETTINGS_PATH, SETTINGS_GLOBAL_PATH):
+        removed.update(_strip_env_keys_from_settings_file(p, RETIRED_ENV_KEYS))
+    env_updates = {}
+    if author:
+        env_updates["PAIR_PRESSURE_AUTHOR"] = author
+    if alias:
+        env_updates["PAIR_PRESSURE_ALIAS"] = alias
+    if env_updates:
+        write_shell_profile(env_updates)
+    return sorted(removed)
+
+
 # ---- multi-CLI client wiring ----
 #
 # pair-pressure's core (pp CLI, MCP server, OS toasts, watcher) is
@@ -658,7 +703,8 @@ def install_skill():
 
 # ---- slash command install (Claude Code adapter) ----
 
-def install_slash_commands(bin_name="pp", force_overwrite=False):
+def install_slash_commands(bin_name="pp", force_overwrite=False,
+                           prev_version=None):
     """Copy slash command sources into ~/.claude/commands/pp-chat/.
 
     Stale commands from a previous MAJOR version are removed (they dispatch
@@ -666,12 +712,17 @@ def install_slash_commands(bin_name="pp", force_overwrite=False):
     prompting. Within the same major, a customized file prompts before
     overwrite (or honors force_overwrite).
 
+    `prev_version` is the version installed BEFORE this run. Callers must
+    pass it captured before install_skill() ran, because install_skill
+    overwrites the .pp-version sentinel that installed_skill_version() reads
+    — otherwise the major-bump purge never sees the old version.
+
     If bin_name != 'pp', also rewrite the file content so `pp ` becomes
     `<bin_name> ` before writing.
     """
     if not COMMAND_SOURCES.is_dir():
         die(f"missing canonical slash command sources at {COMMAND_SOURCES}")
-    prev = installed_skill_version()
+    prev = prev_version if prev_version is not None else installed_skill_version()
     major_bump = bool(prev) and _major(prev) != _major(__version__)
     if major_bump:
         force_overwrite = True
@@ -777,30 +828,42 @@ def setup_server(args, author):
             return None
 
     name, url, path = args.server, args.remote, args.path
+    adopt = bool(path)  # --path means "adopt this existing clone", not clone
     if not (name and url):
         if PromptCtx.non_interactive:
-            return None
-        print("\nConnect a chat server (one GitHub repo = one server).")
-        print("  1) Clone from a remote URL (bootstraps an empty repo)")
-        print("  2) Adopt an existing local clone")
-        print("  3) Skip — register later with `pp server add <name> <url>`")
-        choice = prompt("choice", default="1", choices=["1", "2", "3"])
-        if choice == "3":
-            return None
-        url = url or prompt("Remote URL (git@... or https://...)")
-        derived = repo_name_from_url(url)
-        name = name or prompt(
-            "Server name", default=derived or "team",
-            validate=lambda s: None if _SERVER_NAME_RE.match(s)
-                                    else "must match ^[a-z0-9][a-z0-9._-]{0,63}$",
-        )
-        if choice == "2" and not path:
-            path = prompt("Path to the existing clone")
+            # Honor whatever flags were given: --remote is required (it's the
+            # registry's record + adopt's recorded URL); derive the name from
+            # it when --server was omitted.
+            if not url:
+                return None
+            name = name or repo_name_from_url(url)
+            if not name:
+                return None
+        else:
+            print("\nConnect a chat server (one GitHub repo = one server).")
+            print("  1) Clone from a remote URL (bootstraps an empty repo)")
+            print("  2) Adopt an existing local clone")
+            print("  3) Skip — register later with `pp server add <name> <url>`")
+            choice = prompt("choice", default="1", choices=["1", "2", "3"])
+            if choice == "3":
+                return None
+            url = url or prompt("Remote URL (git@... or https://...)")
+            derived = repo_name_from_url(url)
+            name = name or prompt(
+                "Server name", default=derived or "team",
+                validate=lambda s: None if _SERVER_NAME_RE.match(s)
+                                        else "must match ^[a-z0-9][a-z0-9._-]{0,63}$",
+            )
+            adopt = (choice == "2")
+            if adopt and not path:
+                path = prompt("Path to the existing clone")
+            elif not adopt:
+                path = None  # clone path: pp server add picks the location
 
     if not _SERVER_NAME_RE.match(name or ""):
         die("server name must match ^[a-z0-9][a-z0-9._-]{0,63}$")
     print(f"Registering server '{name}' ...")
-    ok, msg = _pp_server_add(name, url, author, path=path)
+    ok, msg = _pp_server_add(name, url, author, path=path if adopt else None)
     print(f"  {'ok' if ok else 'failed'}: {msg}")
     return name if ok else None
 
@@ -869,15 +932,19 @@ def upgrade_flow(existing_version, install_method, args):
     print(f"   skill: {install_skill()}")
 
     print("[2/4] Refreshing slash commands...")
+    # Pass the PATH package version as prev: install_skill() above already
+    # overwrote the .pp-version sentinel, so installed_skill_version() would
+    # now read the NEW version and the major-bump stale-purge would never run.
     actions = install_slash_commands(
         bin_name=args.bin_name,
         force_overwrite=args.overwrite_commands or major_bump,
+        prev_version=existing_version,
     )
     print(f"   new={actions['new']} updated={actions['updated']} "
           f"kept-customized={actions['kept']} unchanged={actions['unchanged']} "
           f"removed-stale={actions['removed']}")
 
-    print("[3/4] Preserving existing settings.local.json env vars...")
+    print("[3/4] Preserving identity env vars + clearing retired ones...")
     existing = {}
     if SETTINGS_PATH.exists():
         try:
@@ -889,6 +956,14 @@ def upgrade_flow(existing_version, install_method, args):
         v = existing.get(k)
         mark = "OK" if v else "MISSING"
         print(f"   {k}: {mark}{' = ' + v if v else ''}")
+    # v1.0 retired PAIR_PRESSURE_REPO/SERVER. A stale PAIR_PRESSURE_SERVER
+    # outranks the registry default (resolve_server_name) and makes every
+    # verb die "server not registered"; strip both from the settings files
+    # and the shell-profile block so upgraders aren't wedged.
+    removed_keys = clear_retired_env(
+        existing.get("PAIR_PRESSURE_AUTHOR"), existing.get("PAIR_PRESSURE_ALIAS"))
+    if removed_keys:
+        print(f"   cleared retired env: {', '.join(removed_keys)}")
 
     print("[4/4] Running verification (pp status)...")
     author = existing.get("PAIR_PRESSURE_AUTHOR")
@@ -963,6 +1038,10 @@ def fresh_install_flow(args):
     mcp_clients = [c for c in clients if c in MCP_CLIENTS]
 
     if wire_claude:
+        # Capture the installed skill version BEFORE install_skill overwrites
+        # the .pp-version sentinel, so the slash-command major-bump purge can
+        # see a real prior version (e.g. a stale v0.x on this machine).
+        prev_skill_version = installed_skill_version()
         do_skill = not args.no_skill and (
             args.skill or PromptCtx.non_interactive or yes_no(
                 f"\nInstall the Claude Code skill at {USER_SKILL_PATH}?",
@@ -980,7 +1059,8 @@ def fresh_install_flow(args):
         if do_commands:
             actions = install_slash_commands(
                 bin_name=args.bin_name,
-                force_overwrite=args.overwrite_commands)
+                force_overwrite=args.overwrite_commands,
+                prev_version=prev_skill_version)
             print(f"  slash commands: new={actions['new']} "
                   f"updated={actions['updated']} kept-customized={actions['kept']} "
                   f"unchanged={actions['unchanged']} removed-stale={actions['removed']}")
@@ -993,6 +1073,10 @@ def fresh_install_flow(args):
         merge_settings(env_updates)
         merge_permissions(bin_name=args.bin_name or "pp")
         print(f"  + permissions.allow: pp / pp-init / pp-setup / pp-install / pair-pressure-mcp (no-confirm)")
+        # Drop any retired PAIR_PRESSURE_REPO/SERVER left by a v0.x install.
+        retired = clear_retired_env(author, alias)
+        if retired:
+            print(f"  - cleared retired env: {', '.join(retired)}")
 
     for path, action in write_shell_profile(env_updates):
         print(f"  shell profile: {action} {path}")

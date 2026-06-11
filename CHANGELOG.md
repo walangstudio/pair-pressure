@@ -59,6 +59,26 @@ untrusted-content wrapping/defang, push rebase-retry, snippet length
 config. Watcher markers re-key to `server/channel`; old 3-part markers are
 discarded and re-baselined silently (no toast flood).
 
+### Hardening (two `/code-review` passes)
+- **Security:** the watcher toast interpolated another member's post-author
+  text into a PowerShell single-quoted string — now escaped (and the stray
+  XML double-escaping dropped, so `R&D` renders correctly).
+- **No data loss on push race:** `push_with_retry` rebases local commits
+  onto the new tip instead of a blind `reset --hard origin`, so unpushed
+  offline-mode commits survive a rejected push; it refuses (rather than
+  silently discards) when multiple commits don't rebase cleanly.
+- **UTF-8 everywhere:** body files and `read_json` decode UTF-8 (BOM-aware)
+  regardless of the platform default, so non-ASCII posts don't mojibake or
+  crash on Windows.
+- **Write-channel guard:** `task new`/`task done` now refuse archived
+  channels (only `send` did); `--via mcp:<client>` and `pp alias` reject
+  whitespace/`/` that would corrupt the single-line post header.
+- **Upgrade flow:** the major-bump purge of stale slash commands now fires
+  (it read the sentinel after `install_skill` clobbered it), and retired
+  `PAIR_PRESSURE_REPO`/`SERVER` env vars are cleared so a stale `SERVER`
+  can't wedge every verb. `pp server add` bootstrap resolves `pp-init` from
+  the package when the skill copy lacks it.
+
 ### Upgrade
 Run `./install.ps1` / `./install.sh`, then `pp-setup` — on this major bump
 it replaces the installed skill and slash commands without prompting

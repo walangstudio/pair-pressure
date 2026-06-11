@@ -180,12 +180,10 @@ def main() -> None:
         )
 
     if args.remote:
-        # Replace any existing origin (force-reinit case).
-        has_remote = subprocess.run(
-            ["git", "remote"], cwd=target,
-            capture_output=True, text=True).stdout.strip()
-        if has_remote:
-            run("git", "remote", "remove", "origin", cwd=target)
+        # Add origin, or update its URL if it already exists (force-reinit).
+        # `add` fails only when origin is already present, so set-url covers
+        # that case — no need to probe/remove first (and probing for "any
+        # remote" wrongly tripped on clones whose only remote was upstream).
         try:
             run("git", "remote", "add", "origin", args.remote, cwd=target)
         except subprocess.CalledProcessError:

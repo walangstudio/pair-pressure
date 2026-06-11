@@ -800,11 +800,15 @@ def _capture(func, args):
 def read_json(path, default=None):
     if not path.exists():
         return default if default is not None else {}
-    return json.loads(path.read_text())
+    # utf-8-sig tolerates a BOM (PowerShell 5.1 writes one) and decodes UTF-8
+    # regardless of the platform default (cp1252 on Windows would mangle a
+    # hand-edited channel.json/tasks.json).
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def write_json(path, obj):
-    path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
 
 
 # ---- verbs ----
@@ -1077,7 +1081,10 @@ def read_body(args):
     if args.body_file == "-":
         return sys.stdin.read()
     _warn_if_outside_attach_root(args.body_file)
-    return Path(args.body_file).read_text()
+    # Posts are written back as UTF-8; read the source the same way so a body
+    # file with non-ASCII (em dash, CJK, emoji) doesn't mojibake or crash on
+    # Windows, where the default text encoding is cp1252.
+    return Path(args.body_file).read_text(encoding="utf-8")
 
 
 _ATTACH_TOKEN_RE = re.compile(r"@@(\S+)")
@@ -1225,8 +1232,29 @@ def push_with_retry(write_payload, build_message):
         if res2.returncode != 0:
             die(f"first push to empty remote failed: {res2.stderr.strip()}")
         return info
-    # Push rejected against an existing remote branch. Rebase-retry path.
-    git("rebase", "--abort", check=False)
+    # Push rejected against an existing remote branch: someone pushed between
+    # our fetch and our push. Rebase our local commits onto the new tip --
+    # this PRESERVES any prior unpushed history (offline-mode posts, a send
+    # whose push failed transiently), and distinct post files never conflict.
+    git("rebase", "--abort", check=False)  # clear any half-finished rebase
+    rb = git("rebase", f"origin/{branch}", check=False)
+    if rb.returncode == 0:
+        res2 = git("push", check=False)
+        if res2.returncode == 0:
+            return info
+    else:
+        git("rebase", "--abort", check=False)
+    # Rebase conflicted (a same-file write, e.g. tasks.json) or the re-push
+    # still lost a race. Fall back to a clean replay of THIS write -- but only
+    # when our commit is the sole unpushed one, so we never silently discard
+    # other local history (the old blind `reset --hard origin` ate offline
+    # commits here).
+    ahead = git("rev-list", "--count", f"origin/{branch}..HEAD",
+                check=False).stdout.strip()
+    if ahead not in ("", "0", "1"):
+        die("push rejected and the local branch has unpushed commits that "
+            "don't rebase cleanly onto origin; resolve manually (`git status` "
+            "/ `git log`) so nothing is lost.")
     git("reset", "--hard", f"origin/{branch}")
     info = write_payload()
     _commit_all(build_message(info))
@@ -1305,6 +1333,16 @@ def _require_channel_member(meta, name, me):
         die(f"channel '{name}' is a private group you are not a member of.")
 
 
+def _require_writable_channel(meta, name, me):
+    """Gate every write verb (send, task new/done): the channel must exist,
+    admit `me` (private membership), and not be archived. One place so a new
+    write verb can't forget the archived check the way the task verbs did."""
+    _require_channel_member(meta, name, me)
+    if meta.get("archived"):
+        die(f"channel '{name}' is archived; an admin can restore it with "
+            f"`pp channel unarchive {name}`.")
+
+
 def _snippet_len():
     """Feed body truncation length: env PAIR_PRESSURE_SNIPPET_LEN > config
     snippet_len > 240. `pp read --message <id>` always gives the full body."""
@@ -1325,10 +1363,7 @@ def cmd_send(args):
     ch = channel_dir(args.channel)
     meta = _channel_meta(ch)
     me = author()
-    if meta.get("archived"):
-        die(f"channel '{args.channel}' is archived; an admin can restore it "
-            f"with `pp channel unarchive {args.channel}`.")
-    _require_channel_member(meta, args.channel, me)
+    _require_writable_channel(meta, args.channel, me)
     body = read_body(args)
     if not body.strip():
         die("refusing to post an empty message")
@@ -1554,6 +1589,9 @@ def _alias_in_use_elsewhere(name):
     return False
 
 
+_ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+
+
 def cmd_alias(args):
     name = (getattr(args, "name", None) or "").strip()
     if not name:
@@ -1561,6 +1599,12 @@ def cmd_alias(args):
              "env": os.environ.get("PAIR_PRESSURE_ALIAS") or None,
              "session_id": _session_id()})
         return
+    if not _ALIAS_RE.match(name):
+        # The alias is written into the space-delimited single-line slim
+        # header (`by: author/alias ...`); whitespace or `/` would not
+        # round-trip through parse_slim and would corrupt the attribution.
+        die("alias must start with a letter and contain only letters, "
+            "digits, '_' or '-' (max 32 chars)")
     payload = {"ok": True, "alias": name,
                "persisted": "session" if _session_id() else "global"}
     if _alias_in_use_elsewhere(name):
@@ -1660,7 +1704,7 @@ def cmd_task_new(args):
     _activate(args)
     maybe_pull()
     ch = channel_dir(args.channel)
-    _require_channel_member(_channel_meta(ch), args.channel, author())
+    _require_writable_channel(_channel_meta(ch), args.channel, author())
     title = args.title.strip()
     if not title:
         die("task title must not be empty")
@@ -1704,7 +1748,7 @@ def cmd_task_done(args):
     _activate(args)
     maybe_pull()
     ch = channel_dir(args.channel)
-    _require_channel_member(_channel_meta(ch), args.channel, author())
+    _require_writable_channel(_channel_meta(ch), args.channel, author())
 
     def write_payload():
         data = _tasks_load(ch)
@@ -2110,12 +2154,17 @@ def _ensure_git_identity(cwd):
 
 def _pp_init_argv():
     """argv prefix that runs pp-init. Prefer the console script on PATH (the
-    robust path for wheel installs); fall back to the bundled script next to
-    this file (_data/scripts/pp-init.py)."""
+    robust path for wheel installs). Fall back to the bundled script at
+    _data/scripts/pp-init.py -- but that only exists in the package tree, not
+    in the ~/.claude/skills copy (which ships _data/skill only), so when it's
+    missing, run the installed package module instead."""
     if shutil.which("pp-init"):
         return ["pp-init"]
-    bundled = Path(__file__).resolve().parent.parent.parent / "scripts" / "pp-init.py"
-    return [sys.executable, str(bundled)]
+    bundled = (Path(__file__).resolve().parent.parent.parent
+               / "scripts" / "pp-init.py")
+    if bundled.is_file():
+        return [sys.executable, str(bundled)]
+    return [sys.executable, "-m", "pair_pressure._init"]
 
 
 def cmd_server_add(args):
@@ -2655,11 +2704,12 @@ def _notify_windows(title, message):
     def _esc(s):
         # The value lands inside a PowerShell single-quoted string literal
         # ('...'), so a bare ' would break out and let attacker-controlled
-        # post-author text run as PowerShell in the watcher daemon. Double
-        # every ' (the PS single-quote escape) BEFORE the cosmetic XML
-        # escapes. Author/channel text is written by other repo members.
-        return (s.replace("'", "''")
-                 .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        # post-author text run as PowerShell in the watcher daemon. Doubling
+        # ' is the PS single-quote escape. We do NOT XML-escape &<> here:
+        # the string is handed to CreateTextNode, which stores literal text
+        # and lets the toast serializer escape it -- pre-escaping would
+        # double it (R&D -> "R&amp;D" shown verbatim).
+        return s.replace("'", "''")
 
     ps = (
         "$ErrorActionPreference='Stop';"
@@ -3232,12 +3282,18 @@ def cmd_watch(args):
 def _via_arg(value):
     """Validate --via: claude-code | human | mcp | mcp:<client>. The
     `mcp:<client>` form tags which MCP client composed the post (Codex,
-    Cursor, ...) and is preserved verbatim through the slim header."""
-    if value in ("claude-code", "human", "mcp") or (
-            value.startswith("mcp:") and len(value) > 4):
+    Cursor, ...) and is preserved verbatim through the slim header, so the
+    client tag must be a bare token (no whitespace, which would break the
+    single-line `by:` header)."""
+    if value in ("claude-code", "human", "mcp"):
         return value
+    if value.startswith("mcp:"):
+        client = value[4:]
+        if client and not any(c.isspace() for c in client) and "/" not in client:
+            return value
     raise argparse.ArgumentTypeError(
-        "via must be claude-code, human, mcp, or mcp:<client>")
+        "via must be claude-code, human, mcp, or mcp:<client> "
+        "(client = a bare token, no spaces or '/')")
 
 
 def main():

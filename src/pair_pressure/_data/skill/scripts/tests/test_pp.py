@@ -870,6 +870,13 @@ class AliasTests(PPBase):
         payload = self._run(pp.cmd_alias, argparse.Namespace(name="Echo"))
         self.assertIn("warning_env", payload)
 
+    def test_cmd_alias_rejects_whitespace(self):
+        # An alias with a space can't round-trip the single-line slim header.
+        self._dies(pp.cmd_alias, argparse.Namespace(name="Code Reviewer"))
+
+    def test_cmd_alias_rejects_slash(self):
+        self._dies(pp.cmd_alias, argparse.Namespace(name="a/b"))
+
     def test_alias_in_use_elsewhere(self):
         os.environ["PAIR_PRESSURE_SESSION_ID"] = "me"
         sessions = self.pp_home / "sessions"
@@ -1324,6 +1331,15 @@ class TaskVerbTests(GitRepoBase):
         r = self._done("ship")
         self.assertEqual(r["task"]["status"], "done")
         self.assertEqual(r["task"]["done_by"], "alice")
+
+    def test_new_in_archived_channel_dies(self):
+        # send blocks archived channels; the task verbs must too (no writing
+        # into a channel that listings/feed/watcher all hide).
+        meta = pp._channel_meta(self.repo / "channels" / "general")
+        meta["archived"] = True
+        pp.write_json(self.repo / "channels" / "general" / "channel.json", meta)
+        self._dies(pp.cmd_task_new, argparse.Namespace(
+            title="late task", channel=None, server=None))
 
     def test_done_twice_reports_already_done(self):
         self._new("one")
@@ -1872,6 +1888,38 @@ class TaskRebaseReplayTests(PPBase):
         rb = self._run(pp.cmd_task_new, argparse.Namespace(
             title="from-b", channel="general", server="b"))
         self.assertEqual(rb["task"]["id"], 2)
+
+    def _write_post(self, ch, pid, body):
+        shard = ch / "posts" / pp._shard_for(pid)
+        shard.mkdir(parents=True, exist_ok=True)
+        (shard / f"{pid}.md").write_text(
+            f"---\nby: bob via=h\nrt: {pid}\n---\n\n{body}\n", encoding="utf-8")
+
+    def test_push_retry_preserves_unpushed_offline_commit(self):
+        # B has an offline post committed locally but never pushed.
+        ch_b = self.repo_b / "channels" / "general"
+        self._write_post(ch_b, "20260101T000000001Z", "offline")
+        _git(self.repo_b, "add", "-A")
+        _git(self.repo_b, "commit", "-m", "offline post")
+        # A advances origin with a different post (distinct file).
+        self._run(pp.cmd_send, self._send_ns("from A", server="a"))
+        # B writes a new post and pushes: the first push is rejected (B is
+        # behind), and the rebase-retry must replay BOTH B commits onto the
+        # new tip rather than reset --hard nuking the offline one.
+        pp._ACTIVE_SERVER = "b"
+        pp._ACTIVE_REPO = self.repo_b
+
+        def write_payload():
+            self._write_post(ch_b, "20260101T000000002Z", "newpost")
+            return {"post_id": "20260101T000000002Z"}
+
+        pp.push_with_retry(write_payload, lambda i: "new post from b")
+        # The offline post must have reached origin (pull A's clone to check).
+        _git(self.repo_a, "pull", "--rebase")
+        survived = (self.repo_a / "channels" / "general" / "posts"
+                    / "2026-01" / "20260101T000000001Z.md")
+        self.assertTrue(survived.exists(),
+                        "offline post was lost on push-retry")
 
 
 # ---- server verbs ---------------------------------------------------------------------
@@ -2429,6 +2477,23 @@ class ReadBodyTests(unittest.TestCase):
             try:
                 ns = argparse.Namespace(body_text=None, body_file=str(f))
                 self.assertEqual(pp.read_body(ns), "file body")
+            finally:
+                if saved is None:
+                    os.environ.pop("PAIR_PRESSURE_ATTACH_ROOT", None)
+                else:
+                    os.environ["PAIR_PRESSURE_ATTACH_ROOT"] = saved
+
+    def test_file_path_utf8(self):
+        # A UTF-8 body file with non-ASCII must round-trip regardless of the
+        # platform default encoding (cp1252 on Windows would mangle it).
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "body.md"
+            f.write_bytes("café — 日本語 🚀".encode("utf-8"))
+            saved = os.environ.get("PAIR_PRESSURE_ATTACH_ROOT")
+            os.environ["PAIR_PRESSURE_ATTACH_ROOT"] = d
+            try:
+                ns = argparse.Namespace(body_text=None, body_file=str(f))
+                self.assertEqual(pp.read_body(ns), "café — 日本語 🚀")
             finally:
                 if saved is None:
                     os.environ.pop("PAIR_PRESSURE_ATTACH_ROOT", None)
