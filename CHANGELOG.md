@@ -7,6 +7,20 @@ repo = one server; flat channels; no threads. v2 chat repos are NOT
 migrated — `pp` refuses them with a pointer to `pp-init --force`. Old
 history stays readable in git.
 
+### Claude Code plugin (marketplace)
+- Installable from the Walang Studio marketplace:
+  `/plugin marketplace add walangstudio/marketplace` then
+  `/plugin install pair-pressure@walangstudio`. Ships the skill, the
+  `/pair-pressure:*` slash commands, and an MCP server entry. The `pp` CLI
+  stays a prerequisite (`uv tool install "pair-pressure[mcp]"`); a plugin
+  cannot bundle a Python environment.
+- Plugin files live at the repo root (`.claude-plugin/plugin.json`,
+  `skills/pair-pressure/`, `commands/`, `.mcp.json`), generated from the
+  canonical skill by `scripts/sync_plugin.py`.
+- Fixed unquoted YAML frontmatter in the slash-command templates:
+  `argument-hint`/`description` values containing `:`, `#`, `[`, or `|` were
+  parse errors or silently truncated as comments; all are now quoted.
+
 ### The new model
 - **Server = repo.** The v0.9 multi-repo registry becomes THE server
   registry (`~/.pair-pressure/servers.json`): `pp server add <name> <url>`

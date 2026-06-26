@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pair-pressure": {
+      "command": "pair-pressure-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
