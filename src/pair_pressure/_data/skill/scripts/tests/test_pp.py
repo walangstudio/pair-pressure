@@ -1365,6 +1365,78 @@ class TaskVerbTests(GitRepoBase):
         self.assertEqual(data["next_id"], 2)
         self.assertEqual(len(data["tasks"]), 1)
 
+    def _claim(self, ref):
+        return self._run(pp.cmd_task_claim, argparse.Namespace(
+            ref=ref, channel=None, server=None))
+
+    def _assign(self, ref, user):
+        return self._run(pp.cmd_task_assign, argparse.Namespace(
+            ref=ref, user=user, channel=None, server=None))
+
+    def _release(self, ref):
+        return self._run(pp.cmd_task_release, argparse.Namespace(
+            ref=ref, channel=None, server=None))
+
+    def test_new_task_has_no_assignee(self):
+        self.assertIsNone(self._new("x")["task"]["assignee"])
+
+    def test_claim_sets_assignee_and_status(self):
+        self._new("ship it")
+        r = self._claim("#1")
+        self.assertEqual(r["task"]["assignee"], "alice")
+        self.assertEqual(r["task"]["status"], "claimed")
+
+    def test_assign_hands_off_to_other_user(self):
+        self._new("ship it")
+        r = self._assign("#1", "bob")
+        self.assertEqual(r["task"]["assignee"], "bob")
+        self.assertEqual(r["task"]["status"], "claimed")
+
+    def test_release_returns_task_to_open(self):
+        self._new("ship it")
+        self._claim("#1")
+        r = self._release("#1")
+        self.assertIsNone(r["task"]["assignee"])
+        self.assertEqual(r["task"]["status"], "open")
+
+    def test_claim_held_by_other_dies(self):
+        self._new("ship it")
+        self._assign("#1", "bob")
+        self._dies(pp.cmd_task_claim, argparse.Namespace(
+            ref="#1", channel=None, server=None))
+
+    def test_holder_can_reclaim(self):
+        self._new("ship it")
+        self._claim("#1")
+        self.assertEqual(self._claim("#1")["task"]["assignee"], "alice")
+
+    def test_release_open_task_is_noop(self):
+        self._new("ship it")
+        self.assertTrue(self._release("#1").get("already_open"))
+
+    def test_claim_done_task_dies(self):
+        self._new("ship it")
+        self._done("#1")
+        self._dies(pp.cmd_task_claim, argparse.Namespace(
+            ref="#1", channel=None, server=None))
+
+    def test_assign_done_task_dies(self):
+        self._new("ship it")
+        self._done("#1")
+        self._dies(pp.cmd_task_assign, argparse.Namespace(
+            ref="#1", user="bob", channel=None, server=None))
+
+    def test_release_done_task_dies(self):
+        self._new("ship it")
+        self._done("#1")
+        self._dies(pp.cmd_task_release, argparse.Namespace(
+            ref="#1", channel=None, server=None))
+
+    def test_assign_strips_alias_token(self):
+        self._new("ship it")
+        r = self._assign("#1", "bob/Bot")
+        self.assertEqual(r["task"]["assignee"], "bob")
+
 
 # ---- DMs ---------------------------------------------------------------------------
 
