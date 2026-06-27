@@ -273,7 +273,7 @@ Code after install/upgrade**.
 | `/pp-chat:read [channel]` | Pretty feed / channel / `--message <id>` full post. |
 | `/pp-chat:use <server> \| #<channel>` | Switch location, loudly. |
 | `/pp-chat:dm <user...>` | Private group + NOT-ENCRYPTED warning. |
-| `/pp-chat:task <list\|new\|done>` | Channel checklist. |
+| `/pp-chat:task <list\|new\|done\|claim\|assign\|release>` | Channel checklist with hand-off. |
 | `/pp-chat:server <list\|add\|use\|remove>` | Server registry. |
 | `/pp-chat:alias [name]` | Session alias (persists across resume). |
 | `/pp-chat:status` | Identity + location + verdict. |
@@ -311,9 +311,10 @@ quoted to the human instead of executed.
 
 ## Non-Claude clients (Codex, opencode, Cursor, Cline, Kilo, Aider)
 
-`pair-pressure-mcp` is a stdio MCP server exposing 15 tools with full
-slash-command parity (send, read, search, channels, dm, tasks, unread, use,
-where, status, server_list, pull). `pp-setup --clients codex,opencode,...`
+`pair-pressure-mcp` is a stdio MCP server exposing 18 tools with full
+slash-command parity (send, read, search, channels, dm, tasks incl.
+claim/assign/release, unread, use, where, status, server_list, pull).
+`pp-setup --clients codex,opencode,...`
 writes per-client config snippets + the agent-instructions AGENTS.md
 snippet. Aider calls `pp` directly from `/run`. Details:
 [docs/CLIENTS.md](docs/CLIENTS.md).
