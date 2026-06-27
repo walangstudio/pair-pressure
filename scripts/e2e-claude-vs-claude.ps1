@@ -1,18 +1,21 @@
 <#
 .SYNOPSIS
   End-to-end test: drives two `claude --print` subprocesses through a
-  multi-turn pair-pressure conversation. Each agent reads the thread and
-  posts a contradiction-flavored reply via the /pp-chat:* slash commands.
+  multi-turn pair-pressure debate in one channel. Each agent reads the
+  channel and posts a challenge to the latest post via /pp-chat:* commands.
 
 .DESCRIPTION
-  - Orchestrator seeds a fresh investigation thread (not Claude).
+  - Orchestrator registers both clones as servers (alice/bob) and seeds
+    the debate post (not Claude).
   - Alternates alice (odd turns) and bob (even turns) through N turns.
-  - Each turn gets a tightly-scripted prompt that pins identity, position,
-    channel, and thread_id explicitly so the agent can't drift.
+  - Each turn gets a tightly-scripted prompt that pins identity, server,
+    and channel explicitly so the agent can't drift.
   - Each turn runs in its own ephemeral `claude --print` invocation;
-    state lives only in the pair-pressure git repo (which is the point).
+    state lives only in the pair-pressure git repos (which is the point).
 
 .NOTES
+  - v1.0 model: one repo = one server, flat channels, no threads. Both
+    repos below must be schema-v3 clones of the SAME remote.
   - Requires `claude` and `pp` on PATH (or set $env:PATH before running).
   - Uses --dangerously-skip-permissions because the test runs against
     throwaway clones with no internet exposure.
@@ -48,74 +51,79 @@ foreach ($repo in @($AliceRepo, $BobRepo)) {
     if (-not (Test-Path "$repo\.git")) {
         throw "$repo is not a git working tree"
     }
+    $schema = Join-Path $repo ".pair-pressure\schema-version"
+    if (-not (Test-Path $schema) -or (Get-Content $schema).Trim() -ne "3") {
+        throw "$repo is not a schema-v3 chat repo (re-init with pp-init --force)"
+    }
 }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-# --- seed thread (orchestrator-authored, NOT via Claude) ---
-$env:PAIR_PRESSURE_REPO   = $AliceRepo
+# --- register both clones as servers (idempotent: add fails if present) ---
+$servers = @{ 'alice' = $AliceRepo; 'bob' = $BobRepo }
+foreach ($name in $servers.Keys) {
+    $repo = $servers[$name]
+    $url = (git -C $repo remote get-url origin 2>$null)
+    if (-not $url) { $url = "file://$repo" }
+    $env:PAIR_PRESSURE_AUTHOR = "orchestrator"
+    pp server add $name $url --path $repo --no-clone 2>$null | Out-Null
+}
+
+# --- seed post (orchestrator-authored, NOT via Claude) ---
 $env:PAIR_PRESSURE_AUTHOR = "orchestrator"
+pp use alice "#$Channel" 2>$null | Out-Null
 $seedBody = @"
-## Context
-$Topic
+DEBATE: $Topic
 
-## Findings
-- Each side has tradeoffs; no clear consensus yet.
-- This thread is an automated multi-agent debate driven by the e2e test
-  harness. Two AI agents will alternate turns arguing opposing positions.
-
-## Open questions
-- What's the strongest counter-argument to the previous reply?
-- Where does the previous reply overstate its case?
+This channel hosts an automated multi-agent debate driven by the e2e test
+harness. Two AI agents will alternate turns arguing opposing positions.
+Each reply must challenge the most recent post: name a tradeoff,
+counterexample, or hidden cost.
 "@
 
-$titleSuffix = (Get-Date -Format "HHmmss")
-$title = "E2E debate $titleSuffix"
-Write-Host "[seed] creating thread '$title'..." -ForegroundColor Cyan
-$seedJson = $seedBody | pp new-thread `
-    --channel $Channel --title $title --kind investigation --body-file -
+Write-Host "[seed] posting debate seed to #$Channel..." -ForegroundColor Cyan
+$seedJson = $seedBody | pp send --channel $Channel --via human --body-file -
 $seed = $seedJson | ConvertFrom-Json
-$tid = $seed.thread_id
-Write-Host "[seed] thread_id=$tid" -ForegroundColor Green
+$seedId = $seed.post_id
+Write-Host "[seed] post_id=$seedId" -ForegroundColor Green
 
 # --- turn loop ---
 $roles = @{
     'alice' = "argue FOR structured (JSON) logging -- operability, queryability, tooling"
     'bob'   = "argue AGAINST structured logging -- readability, debugging cost, migration risk"
 }
-$repos = @{ 'alice' = $AliceRepo; 'bob' = $BobRepo }
 $turnResults = @()
 
 for ($i = 1; $i -le $Turns; $i++) {
     $name = if ($i % 2 -eq 1) { 'alice' } else { 'bob' }
-    $env:PAIR_PRESSURE_REPO   = $repos[$name]
     $env:PAIR_PRESSURE_AUTHOR = $name
 
     Write-Host "`n========== TURN $i / $Turns -- $name ==========" -ForegroundColor Cyan
     Write-Host "  position: $($roles[$name])" -ForegroundColor DarkGray
 
     $prompt = @"
-You are "$name" in an automated multi-agent investigation thread on pair-pressure.
+You are "$name" in an automated multi-agent debate on pair-pressure.
 
 Your assigned position: $($roles[$name])
 
-Channel: $Channel
-Thread ID: $tid
+Server: $name    Channel: $Channel
 
 Do EXACTLY these steps in order. Do not skip, do not improvise.
 
-1. Run the slash command: /pp-chat:read $tid
-   This pulls the latest thread state and shows you all current posts.
-2. Identify the MOST RECENT post (highest ordinal). Read its argument carefully.
-3. Compose a 2-4 sentence reply that GENUINELY CHALLENGES that post from
-   your assigned position. Cite the post you are responding to as [NNN]
-   where NNN is the ordinal. Be specific and concrete -- name a tradeoff,
+1. Run: /pp-chat:use $name #$Channel
+   This pins your server and channel.
+2. Run: /pp-chat:read $Channel
+   This pulls the latest channel state and shows you the posts.
+3. Identify the MOST RECENT post (bottom of the feed) and note its short
+   id handle (the 6-char id shown after the post). Read its argument.
+4. Compose a 2-4 sentence reply that GENUINELY CHALLENGES that post from
+   your assigned position. Be specific and concrete -- name a tradeoff,
    counterexample, or hidden cost. Do not be abstract.
-4. Run: /pp-chat:reply contradict <your reply body>
-   (Use stance "contradict" unless you genuinely cannot disagree at all,
-    in which case use "extend" with a sharpening point.)
+5. Run: /pp-chat:send ai <your reply body>
+   (The send must use --reply-to <short-id-from-step-3> so the reply
+    chain is preserved -- pass it through to pp send.)
 
 After posting, your final printed line MUST be:
-TURN_DONE reply_id=<ordinal>
+TURN_DONE post_id=<the post_id from the send result>
 
 That's the orchestrator's signal that you finished. Do not print anything
 after that line.
@@ -128,8 +136,8 @@ after that line.
     # Pipe "" in to close stdin (claude --print otherwise waits 3s for stdin).
     # Note: NO --add-dir — passing the chat repo there caused claude to hang
     # indefinitely on startup (likely .claude/settings autodiscovery in the
-    # added dir). pp accesses the repo via PAIR_PRESSURE_REPO env var inside
-    # its own Bash subprocess; the agent doesn't need file-tool access there.
+    # added dir). pp accesses the repo via the server registry inside its own
+    # Bash subprocess; the agent doesn't need file-tool access there.
     $output = "" | & claude `
         --print `
         --model $Model `
@@ -156,22 +164,23 @@ after that line.
 }
 
 # --- final verification ---
-Write-Host "`n========== FINAL THREAD STATE ==========" -ForegroundColor Cyan
-$env:PAIR_PRESSURE_REPO   = $AliceRepo
+Write-Host "`n========== FINAL CHANNEL STATE ==========" -ForegroundColor Cyan
 $env:PAIR_PRESSURE_AUTHOR = "orchestrator"
+pp use alice "#$Channel" 2>$null | Out-Null
 pp pull | Out-Null
-$threadJson = pp read-thread --channel $Channel --thread $tid
-$thread = $threadJson | ConvertFrom-Json
+$readJson = pp read $Channel --limit 100 --no-pull
+$view = $readJson | ConvertFrom-Json
+$posts = @($view.posts | Where-Object { $_.id -ge $seedId })
 
-Write-Host "title:  $($thread.meta.title)" -ForegroundColor White
-Write-Host "kind:   $($thread.meta.kind)"
-Write-Host "status: $($thread.meta.status)"
-Write-Host "posts:  $($thread.posts.Count)  (expected: $($Turns + 1) -- seed + $Turns replies)"
+Write-Host "where:  $($view.where)" -ForegroundColor White
+Write-Host "posts:  $($posts.Count)  (expected: $($Turns + 1) -- seed + $Turns replies)"
 Write-Host ""
 
-$thread.posts | ForEach-Object {
-    $bodySnippet = ($_.body -replace "`n", " ").Substring(0, [Math]::Min(100, $_.body.Length))
-    "{0,3}  {1,-12} {2,-10} via={3,-12} {4}" -f $_.id, $_.author, $_.stance, $_.via, $bodySnippet
+$posts | ForEach-Object {
+    $bodySnippet = ($_.body -replace "`n", " ")
+    $bodySnippet = $bodySnippet.Substring(0, [Math]::Min(100, $bodySnippet.Length))
+    $reply = if ($_.reply_to) { "->" + $_.reply_to.Substring($_.reply_to.Length - 6) } else { "      " }
+    "{0}  {1,-12} {2} via={3,-12} {4}" -f $_.id, $_.author, $reply, $_.via, $bodySnippet
 }
 
 # --- summary ---
@@ -179,14 +188,14 @@ Write-Host "`n========== TURN SUMMARY ==========" -ForegroundColor Cyan
 $turnResults | Format-Table -AutoSize
 
 $expectedReplies = $Turns
-$actualReplies   = $thread.posts.Count - 1
-$contradictions  = @($thread.posts | Where-Object { $_.stance -eq 'contradict' }).Count
-$aliceReplies    = @($thread.posts | Where-Object { $_.author -eq 'alice' }).Count
-$bobReplies      = @($thread.posts | Where-Object { $_.author -eq 'bob' }).Count
+$actualReplies   = $posts.Count - 1
+$withReplyTo     = @($posts | Where-Object { $_.reply_to }).Count
+$aliceReplies    = @($posts | Where-Object { $_.author -eq 'alice' }).Count
+$bobReplies      = @($posts | Where-Object { $_.author -eq 'bob' }).Count
 
 Write-Host "expected replies: $expectedReplies; actual: $actualReplies"
 Write-Host "alice replies: $aliceReplies; bob replies: $bobReplies"
-Write-Host "contradict-stance posts: $contradictions"
+Write-Host "replies carrying reply-to: $withReplyTo"
 
 if ($actualReplies -eq $expectedReplies) {
     Write-Host "`nE2E PASS -- all $Turns turns posted" -ForegroundColor Green
