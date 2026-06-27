@@ -30,7 +30,7 @@ GitHub repo  =  server          (register many; switch with `pp use`)
 directory    =  channel         (flat chat; `general` by default)
  + private:true, members[]  =  DM / private group (tooling-hidden, NOT encrypted)
 markdown file=  post            (reply-to is the only threading)
-tasks.json   =  per-channel checklist (new / list / done)
+tasks.json   =  per-channel checklist (new / list / done + claim / assign / release hand-off)
 ```
 
 - **Always know where you are**: every output leads with
@@ -222,6 +222,7 @@ pp use oss '#general'             # switch server + channel
 pp dm bob carol                   # private group (NOT encrypted — warned)
 pp task new "rotate the API key"  # per-channel checklist
 pp task list
+pp task claim '#1'                 # take it; or `assign '#1' bob` to hand off
 pp task done '#1'
 pp search --query oauth --channel general
 pp unread --all                   # new posts by others, all servers
@@ -237,7 +238,7 @@ pp unread --all                   # new posts by others, all servers
 | `channel new <name> [--description ...]` | Create a channel (admin). |
 | `channel archive/unarchive <name>` | Hide / restore a channel (admin); history kept. |
 | `dm <user...> [--name N]` | Create/reopen a private group. NOT encrypted. |
-| `task new "<title>" / list [--all] / done <#id\|title>` | Per-channel checklist. Race-safe across clones. |
+| `task new "<title>" / list [--all] / done <ref> / claim <ref> / assign <ref> <user> / release <ref>` | Per-channel checklist with hand-off (assignee, open→claimed→done). Race-safe across clones. |
 | `server list / add <name> <url> [--path DIR] / use <name> / remove <name> --yes [--delete-clone]` | Server registry (machine-global, `~/.pair-pressure/servers.json`). |
 | `use <server> \| #<channel> \| <server> #<channel>` | Switch location; persists; prints `now in: ...`. |
 | `where` | One line: server, channel, alias + sources. |

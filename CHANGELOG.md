@@ -35,9 +35,12 @@ history stays readable in git.
 - **Admin-gated channels (advisory).** `channel new/archive/unarchive`
   require membership in `server.json` admins. Sending to an archived
   channel fails instead of auto-reviving it.
-- **Tasks are a checklist.** `pp task new/list/done` on a per-channel
-  `tasks.json`; stable ids; rebase-replay-safe concurrent writes. The
-  claim/start/complete/handoff/abandon lifecycle is gone.
+- **Tasks are a checklist with lightweight hand-off.** `pp task
+  new/list/done/claim/assign/release` on a per-channel `tasks.json`; stable
+  ids; rebase-replay-safe concurrent writes. The heavy v0.x
+  start/complete/abandon lifecycle is replaced by a minimal hand-off: an
+  `assignee` field and an open -> claimed -> done status, with `claim` (take
+  it yourself), `assign <user>` (hand it off), and `release` (back to open).
 - **Always-visible location.** Every output leads with
   `<server> #<channel>`; new `pp where` and `pp use <server>|#<channel>`
   (switch loudly, `now in: ...`). Location AND alias persist per
@@ -49,22 +52,23 @@ history stays readable in git.
   (`--clients claude,codex,opencode,cursor,cline,kilo`) emitting MCP
   config snippets + a client-neutral AGENTS.md instructions snippet.
 
-### Command surface (56 → 24 CLI parsers, 25 → 15 MCP tools, 10 slash commands)
-- New: `use`, `where`, `dm`, `channel new`, `task new/list/done`,
+### Command surface (56 → 24 CLI parsers, 25 → 18 MCP tools, 10 slash commands)
+- New: `use`, `where`, `dm`, `channel new`, `task new/list/done/claim/assign/release`,
   `server list/add/use/remove`, `unread --ack`.
 - Rewritten: `send` (channel-level, `--reply-to`), `read`
   (feed/channel/`--message`), `channels`, `search` (query/channel/author),
   `status`, `alias` (persists to state).
 - Removed: threads (`new-thread`, `reply`, `read-thread`, `list-threads`),
-  stances, task lifecycle (`claim`/`start`/`complete`/`abandon`/`handoff`),
+  stances, the heavy task lifecycle (`start`/`complete`/`abandon`),
   membership/passwords (`join`, `resolve`), `feed` (merged into `read`),
   `peek` (use `pp unread`), branch servers (`server new/switch`,
   worktrees), `repo *` (renamed `server *`), `aliases-in-use` (folded into
   `pp alias`), indexed-task machinery.
 - Slash commands: deleted `peek`/`repo`; added `dm`/`use`; the rest
   rewritten for v3. MCP tools: send, read, search, list_channels,
-  channel_new, dm_new, task_new/list/done, unread, use, where, status,
-  server_list, pull — full slash-command parity for non-Claude clients.
+  channel_new, dm_new, task_new/list/done/claim/assign/release, unread, use,
+  where, status, server_list, pull — full slash-command parity for non-Claude
+  clients.
 
 ### Kept from v0.9.1 (verbatim behavior)
 Zero-token watcher daemon + OS toasts + composing statusline auto-wire,
