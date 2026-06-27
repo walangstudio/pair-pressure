@@ -2060,6 +2060,27 @@ class ServerVerbTests(PPBase):
         self.assertTrue((dest / ".pair-pressure" /
                          "schema-version").is_file())
 
+    def test_join_clone_sets_commit_identity_without_global(self):
+        # Regression: joining an existing server (cloning a non-empty chat
+        # repo) must give the clone a fallback git identity, else the first
+        # write (send/task) crashes on `git commit` when the user has no
+        # global git identity.
+        origin = self.tmp / "origin2.git"
+        _git(self.tmp, "init", "--bare", "-b", "main", str(origin))
+        src = _init_v3(self.tmp / "src2", name="team")
+        _git(src, "remote", "add", "origin", str(origin))
+        _git(src, "push", "-u", "origin", "main")
+        empty = self.tmp / "empty.gitconfig"
+        empty.write_text("")
+        with unittest.mock.patch.dict(os.environ, {
+                "GIT_CONFIG_GLOBAL": str(empty),
+                "GIT_CONFIG_SYSTEM": str(empty)}):
+            self._add("team", url=str(origin))
+            dest = self.pp_home / "servers" / "team"
+            email = pp.git("config", "--local", "user.email",
+                           cwd=dest, check=False).stdout.strip()
+        self.assertTrue(email, "join clone left without a commit identity")
+
     def test_clone_offline_dies(self):
         os.environ["PAIR_PRESSURE_OFFLINE"] = "1"
         self._dies(pp.cmd_server_add, argparse.Namespace(
