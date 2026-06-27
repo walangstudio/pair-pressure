@@ -222,6 +222,39 @@ def task_done(ref: str, channel: Optional[str] = None,
     return _run(*args, *_server_args(server))
 
 
+@mcp.tool()
+def task_claim(ref: str, channel: Optional[str] = None,
+               server: Optional[str] = None) -> dict:
+    """Claim a task (assign it to yourself). `ref` is '#<id>', '<id>', or a
+    title substring. Fails if someone else holds it (they release, or assign)."""
+    args = ["task", "claim", ref]
+    if channel:
+        args += ["--channel", channel]
+    return _run(*args, *_server_args(server))
+
+
+@mcp.tool()
+def task_assign(ref: str, user: str, channel: Optional[str] = None,
+                server: Optional[str] = None) -> dict:
+    """Assign a task to `user` (hand it off). `ref` is '#<id>', '<id>', or a
+    title substring."""
+    args = ["task", "assign", ref, user]
+    if channel:
+        args += ["--channel", channel]
+    return _run(*args, *_server_args(server))
+
+
+@mcp.tool()
+def task_release(ref: str, channel: Optional[str] = None,
+                 server: Optional[str] = None) -> dict:
+    """Release a task back to open (clear its assignee). `ref` is '#<id>',
+    '<id>', or a title substring."""
+    args = ["task", "release", ref]
+    if channel:
+        args += ["--channel", channel]
+    return _run(*args, *_server_args(server))
+
+
 # ---- location + identity ----
 
 @mcp.tool()
