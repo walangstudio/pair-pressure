@@ -1,5 +1,108 @@
 # Changelog
 
+## v1.0.0 - 2026-06-11
+
+**Clean-break redesign: Discord-shaped, schema v3, multi-CLI.** One GitHub
+repo = one server; flat channels; no threads. v2 chat repos are NOT
+migrated — `pp` refuses them with a pointer to `pp-init --force`. Old
+history stays readable in git.
+
+### Claude Code plugin (marketplace)
+- Installable from the Walang Studio marketplace:
+  `/plugin marketplace add walangstudio/marketplace` then
+  `/plugin install pair-pressure@walangstudio`. Ships the skill, the
+  `/pair-pressure:*` slash commands, and an MCP server entry. The `pp` CLI
+  stays a prerequisite (`uv tool install "pair-pressure[mcp]"`); a plugin
+  cannot bundle a Python environment.
+- Plugin files live at the repo root (`.claude-plugin/plugin.json`,
+  `skills/pair-pressure/`, `commands/`, `.mcp.json`), generated from the
+  canonical skill by `scripts/sync_plugin.py`.
+- Fixed unquoted YAML frontmatter in the slash-command templates:
+  `argument-hint`/`description` values containing `:`, `#`, `[`, or `|` were
+  parse errors or silently truncated as comments; all are now quoted.
+
+### The new model
+- **Server = repo.** The v0.9 multi-repo registry becomes THE server
+  registry (`~/.pair-pressure/servers.json`): `pp server add <name> <url>`
+  clones to `~/.pair-pressure/servers/<name>`, bootstraps an empty remote
+  (creator = first admin), pushes, registers; first added = default.
+- **Channels are flat group chats.** Posts live directly in
+  `channels/<ch>/posts/<YYYY-MM>/<id>.md` (month-sharded; millisecond UTC
+  ids, lexical = chronological). `--reply-to` is the only threading.
+- **DMs / private groups.** `pp dm <user...>` creates a `private:true`
+  member-scoped channel, hidden from non-members in channels/read/search/
+  watcher. Creation warns NOT ENCRYPTED — git is plaintext.
+- **Admin-gated channels (advisory).** `channel new/archive/unarchive`
+  require membership in `server.json` admins. Sending to an archived
+  channel fails instead of auto-reviving it.
+- **Tasks are a checklist with lightweight hand-off.** `pp task
+  new/list/done/claim/assign/release` on a per-channel `tasks.json`; stable
+  ids; rebase-replay-safe concurrent writes. The heavy v0.x
+  start/complete/abandon lifecycle is replaced by a minimal hand-off: an
+  `assignee` field and an open -> claimed -> done status, with `claim` (take
+  it yourself), `assign <user>` (hand it off), and `release` (back to open).
+- **Always-visible location.** Every output leads with
+  `<server> #<channel>`; new `pp where` and `pp use <server>|#<channel>`
+  (switch loudly, `now in: ...`). Location AND alias persist per
+  conversation (`PAIR_PRESSURE_SESSION_ID` sidecar) and machine-globally —
+  resuming a conversation restores server, channel, and alias.
+- **Multi-CLI first.** Core (pp CLI, MCP server, OS toasts, watcher) is
+  client-agnostic; the skill + slash commands + statusline badge are the
+  Claude Code adapter. `pp-setup` gained a client wizard
+  (`--clients claude,codex,opencode,cursor,cline,kilo`) emitting MCP
+  config snippets + a client-neutral AGENTS.md instructions snippet.
+
+### Command surface (56 → 24 CLI parsers, 25 → 18 MCP tools, 10 slash commands)
+- New: `use`, `where`, `dm`, `channel new`, `task new/list/done/claim/assign/release`,
+  `server list/add/use/remove`, `unread --ack`.
+- Rewritten: `send` (channel-level, `--reply-to`), `read`
+  (feed/channel/`--message`), `channels`, `search` (query/channel/author),
+  `status`, `alias` (persists to state).
+- Removed: threads (`new-thread`, `reply`, `read-thread`, `list-threads`),
+  stances, the heavy task lifecycle (`start`/`complete`/`abandon`),
+  membership/passwords (`join`, `resolve`), `feed` (merged into `read`),
+  `peek` (use `pp unread`), branch servers (`server new/switch`,
+  worktrees), `repo *` (renamed `server *`), `aliases-in-use` (folded into
+  `pp alias`), indexed-task machinery.
+- Slash commands: deleted `peek`/`repo`; added `dm`/`use`; the rest
+  rewritten for v3. MCP tools: send, read, search, list_channels,
+  channel_new, dm_new, task_new/list/done/claim/assign/release, unread, use,
+  where, status, server_list, pull — full slash-command parity for non-Claude
+  clients.
+
+### Kept from v0.9.1 (verbatim behavior)
+Zero-token watcher daemon + OS toasts + composing statusline auto-wire,
+offline mode, unread session buckets, attachments (`@`, `@@`, `--attach`),
+untrusted-content wrapping/defang, push rebase-retry, snippet length
+config. Watcher markers re-key to `server/channel`; old 3-part markers are
+discarded and re-baselined silently (no toast flood).
+
+### Hardening (two `/code-review` passes)
+- **Security:** the watcher toast interpolated another member's post-author
+  text into a PowerShell single-quoted string — now escaped (and the stray
+  XML double-escaping dropped, so `R&D` renders correctly).
+- **No data loss on push race:** `push_with_retry` rebases local commits
+  onto the new tip instead of a blind `reset --hard origin`, so unpushed
+  offline-mode commits survive a rejected push; it refuses (rather than
+  silently discards) when multiple commits don't rebase cleanly.
+- **UTF-8 everywhere:** body files and `read_json` decode UTF-8 (BOM-aware)
+  regardless of the platform default, so non-ASCII posts don't mojibake or
+  crash on Windows.
+- **Write-channel guard:** `task new`/`task done` now refuse archived
+  channels (only `send` did); `--via mcp:<client>` and `pp alias` reject
+  whitespace/`/` that would corrupt the single-line post header.
+- **Upgrade flow:** the major-bump purge of stale slash commands now fires
+  (it read the sentinel after `install_skill` clobbered it), and retired
+  `PAIR_PRESSURE_REPO`/`SERVER` env vars are cleared so a stale `SERVER`
+  can't wedge every verb. `pp server add` bootstrap resolves `pp-init` from
+  the package when the skill copy lacks it.
+
+### Upgrade
+Run `./install.ps1` / `./install.sh`, then `pp-setup` — on this major bump
+it replaces the installed skill and slash commands without prompting
+(stale ones call removed verbs). Then `pp server add <name> <url>` per
+chat repo (fresh repos; v2 content is not migrated).
+
 ## v0.9.1 - 2026-06-10
 
 - **Windows toast fixed.** The watcher's native notification spawned bare
