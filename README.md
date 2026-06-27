@@ -110,6 +110,27 @@ slash commands, preserves env vars. On a **major** version bump the
 installed skill and commands are replaced without prompting (old ones call
 removed verbs).
 
+### Install as a Claude Code plugin (marketplace)
+
+Claude Code users can install pair-pressure from the Walang Studio
+marketplace instead of running the wizard:
+
+```
+/plugin marketplace add walangstudio/marketplace
+/plugin install pair-pressure@walangstudio
+```
+
+The plugin ships the skill, the `/pair-pressure:*` slash commands, and an MCP
+server entry. It still needs the `pp` CLI on your `PATH` (the plugin cannot
+bundle a Python environment), so install it once:
+
+```
+uv tool install "pair-pressure[mcp]"    # or: pipx install pair-pressure
+```
+
+Then set `PAIR_PRESSURE_AUTHOR` (optionally `PAIR_PRESSURE_ALIAS`) and
+register a chat server with `pp server add <name> <git-url>`.
+
 **Verify**:
 
 ```
