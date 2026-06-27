@@ -1699,6 +1699,16 @@ def _match_task(tasks, ref):
     return hits or None
 
 
+def _require_task(data, ref, channel):
+    """Resolve a ref to a single task or die with a helpful message."""
+    t = _match_task(data["tasks"], ref)
+    if t is None:
+        die(f"no task matched '{ref}' in #{channel} (try `pp task list`)")
+    if isinstance(t, list):
+        die(f"'{ref}' matches {len(t)} tasks; use the #id")
+    return t
+
+
 def cmd_task_new(args):
     resolve_active(args)
     _activate(args)
@@ -1716,7 +1726,7 @@ def cmd_task_new(args):
         tid = int(data["next_id"])
         task = {"id": tid, "title": title, "status": "open",
                 "by": by_token(), "at": now_iso(),
-                "done_by": None, "done_at": None}
+                "assignee": None, "done_by": None, "done_at": None}
         data["tasks"].append(task)
         data["next_id"] = tid + 1
         write_json(_tasks_path(ch), data)
@@ -1752,12 +1762,7 @@ def cmd_task_done(args):
 
     def write_payload():
         data = _tasks_load(ch)
-        t = _match_task(data["tasks"], args.ref)
-        if t is None:
-            die(f"no task matched '{args.ref}' in #{args.channel} "
-                "(try `pp task list`)")
-        if isinstance(t, list):
-            die(f"'{args.ref}' matches {len(t)} tasks — use the #id")
+        t = _require_task(data, args.ref, args.channel)
         if t.get("status") == "done":
             return {"task": t, "already_done": True}
         t["status"] = "done"
@@ -1769,6 +1774,85 @@ def cmd_task_done(args):
     info = push_with_retry(
         write_payload,
         lambda i: f"#{args.channel}: done task #{i['task']['id']}")
+    out({"ok": True, "channel": args.channel, **info})
+
+
+def cmd_task_claim(args):
+    resolve_active(args)
+    _activate(args)
+    maybe_pull()
+    ch = channel_dir(args.channel)
+    _require_writable_channel(_channel_meta(ch), args.channel, author())
+    me = author()
+
+    def write_payload():
+        data = _tasks_load(ch)
+        t = _require_task(data, args.ref, args.channel)
+        if t.get("status") == "done":
+            die(f"task #{t['id']} is already done")
+        held = t.get("assignee")
+        if held and held != me:
+            die(f"task #{t['id']} is held by {held}; ask them to "
+                "`pp task release`, or use `pp task assign`")
+        t["assignee"] = me
+        t["status"] = "claimed"
+        write_json(_tasks_path(ch), data)
+        return {"task": t}
+
+    info = push_with_retry(
+        write_payload,
+        lambda i: f"#{args.channel}: claim task #{i['task']['id']}")
+    out({"ok": True, "channel": args.channel, **info})
+
+
+def cmd_task_assign(args):
+    resolve_active(args)
+    _activate(args)
+    maybe_pull()
+    ch = channel_dir(args.channel)
+    _require_writable_channel(_channel_meta(ch), args.channel, author())
+    who = args.user.strip().split("/", 1)[0]  # bare username; drop any /alias
+    if not who:
+        die("assignee must not be empty")
+
+    def write_payload():
+        data = _tasks_load(ch)
+        t = _require_task(data, args.ref, args.channel)
+        if t.get("status") == "done":
+            die(f"task #{t['id']} is already done")
+        t["assignee"] = who
+        t["status"] = "claimed"
+        write_json(_tasks_path(ch), data)
+        return {"task": t}
+
+    info = push_with_retry(
+        write_payload,
+        lambda i: f"#{args.channel}: assign task #{i['task']['id']} to {who}")
+    out({"ok": True, "channel": args.channel, **info})
+
+
+def cmd_task_release(args):
+    resolve_active(args)
+    _activate(args)
+    maybe_pull()
+    ch = channel_dir(args.channel)
+    _require_writable_channel(_channel_meta(ch), args.channel, author())
+
+    def write_payload():
+        data = _tasks_load(ch)
+        t = _require_task(data, args.ref, args.channel)
+        if t.get("status") == "done":
+            die(f"task #{t['id']} is already done")
+        if not t.get("assignee"):
+            return {"task": t, "already_open": True}
+        t["assignee"] = None
+        t["status"] = "open"
+        write_json(_tasks_path(ch), data)
+        return {"task": t}
+
+    info = push_with_retry(
+        write_payload,
+        lambda i: f"#{args.channel}: release task #{i['task']['id']}")
     out({"ok": True, "channel": args.channel, **info})
 
 
@@ -3382,6 +3466,22 @@ def main():
     t.add_argument("--channel", default=None)
     _add_server_arg(t)
     t.set_defaults(func=cmd_task_done)
+    t = tsub.add_parser("claim", help="claim a task (assign it to yourself)")
+    t.add_argument("ref")
+    t.add_argument("--channel", default=None)
+    _add_server_arg(t)
+    t.set_defaults(func=cmd_task_claim)
+    t = tsub.add_parser("assign", help="assign a task to a user")
+    t.add_argument("ref")
+    t.add_argument("user")
+    t.add_argument("--channel", default=None)
+    _add_server_arg(t)
+    t.set_defaults(func=cmd_task_assign)
+    t = tsub.add_parser("release", help="release a task back to open")
+    t.add_argument("ref")
+    t.add_argument("--channel", default=None)
+    _add_server_arg(t)
+    t.set_defaults(func=cmd_task_release)
 
     sp = sub.add_parser("server",
                         help="server registry: list/add/use/remove")
