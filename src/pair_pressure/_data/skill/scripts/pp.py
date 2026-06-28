@@ -2304,6 +2304,10 @@ def cmd_server_add(args):
             git("push", "-u", "origin", branch, cwd=dest, check=False)
     else:
         _require_schema_v3(dest)
+        # Joining an existing server: give the clone a fallback commit identity
+        # too, else the first write (send/task) dies on `git commit` when the
+        # user has no global git identity. Never overrides an existing one.
+        _ensure_git_identity(dest)
 
     reg = _servers_load()
     reg.setdefault("servers", []).append({
