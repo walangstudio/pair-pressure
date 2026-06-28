@@ -150,7 +150,7 @@ exact mapping. send/read/task/server/status/watch/alias/offline/dm/use.
 All run on Haiku with scoped `allowed-tools`.
 
 Other CLIs (Codex, opencode, Cursor, Cline, ...) get the same surface via
-the MCP server (`pair-pressure-mcp`, 15 tools) or the plain `pp` CLI — the
+the MCP server (`pair-pressure-mcp`, 18 tools) or the plain `pp` CLI — the
 skill + slash commands + statusline badge are the Claude-Code-only adapter.
 
 ## Sync model

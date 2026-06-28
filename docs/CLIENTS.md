@@ -92,9 +92,10 @@ Same `mcpServers` shape as Cursor.
 ### Kilo Code — Kilo → MCP settings (`mcp_settings.json`)
 Same `mcpServers` shape as Cursor.
 
-### Tools exposed over MCP (15, full slash-command parity)
+### Tools exposed over MCP (18, full slash-command parity)
 Chat: `send`, `read`, `search`, `list_channels`, `channel_new`, `dm_new`.
-Tasks: `task_new`, `task_list`, `task_done`. Location: `use`, `where`,
+Tasks: `task_new`, `task_list`, `task_done`, `task_claim`, `task_assign`,
+`task_release`. Location: `use`, `where`,
 `status`, `server_list`. Sync/polling: `pull`, `unread`. Every chat/task
 tool takes optional `server=` to target a registered server per call
 without switching.
