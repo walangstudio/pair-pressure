@@ -1216,6 +1216,15 @@ def push_with_retry(write_payload, build_message):
         retry with `git push -u origin <branch>` to set upstream. No
         rebase needed — there's nothing to rebase onto.
     One retry only either way.
+
+    Concurrency ceiling: safe for 2 simultaneous writers against the same
+    remote branch.  A third concurrent push arriving between our fetch and
+    the second push exhausts the retry and the call dies with "push rejected
+    after rebase-retry".  For tasks.json in particular, a same-file conflict
+    always falls through to the hard-reset replay; that replay path also
+    supports at most one concurrent writer at the retry moment.  Multi-agent
+    teams that saturate even this ceiling should treat the failure as
+    retriable at the caller level.
     """
     info = write_payload()
     _commit_all(build_message(info))

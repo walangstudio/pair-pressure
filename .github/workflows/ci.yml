@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        # mcp extra not required: test_mcp_server.py stubs the SDK.
+        # pytest is the only test dep; the package itself is stdlib-only.
+        run: pip install pytest -e "."
+
+      - name: Test
+        # Explicit testpaths so pytest finds the buried test directory
+        # regardless of the working directory or conftest search.
+        run: |
+          python -m pytest \
+            src/pair_pressure/_data/skill/scripts/tests \
+            -q --tb=short
