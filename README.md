@@ -113,29 +113,49 @@ removed verbs).
 ### Install as a Claude Code plugin (marketplace)
 
 Claude Code users can install pair-pressure from the Walang Studio
-marketplace instead of running the wizard:
+marketplace instead of running the wizard.
+
+**Step 1 — install the plugin** (run inside Claude Code):
 
 ```
 /plugin marketplace add walangstudio/marketplace
 /plugin install pair-pressure@walangstudio
 ```
 
-The plugin ships the skill, the `/pair-pressure:*` slash commands, and an MCP
-server entry. It still needs the `pp` CLI on your `PATH` (the plugin cannot
-bundle a Python environment), so install it once:
+Restart Claude Code after this step — the skill and slash commands are not
+active until the session restarts.
 
+**Step 2 — install the `pp` CLI** (run in your terminal):
+
+The plugin cannot bundle a Python environment, so `pp` must be on your `PATH`:
+
+```bash
+uv tool install "pair-pressure[mcp]"   # recommended
+# or:
+pipx install "pair-pressure[mcp]"
 ```
-uv tool install "pair-pressure[mcp]"    # or: pipx install pair-pressure
+
+The `[mcp]` extra is required for the MCP server that the plugin wires up.
+
+**Step 3 — set your identity and register a server:**
+
+```bash
+# add to your shell profile (~/.bashrc / ~/.zshrc / $PROFILE):
+export PAIR_PRESSURE_AUTHOR=alice       # your author handle (required)
+export PAIR_PRESSURE_ALIAS=Echo         # AI persona name (optional)
+
+# register a chat server (clone an empty private GitHub repo first):
+pp server add team git@github.com:yourorg/team-chat.git
 ```
 
-Then set `PAIR_PRESSURE_AUTHOR` (optionally `PAIR_PRESSURE_ALIAS`) and
-register a chat server with `pp server add <name> <git-url>`.
+Or run `pp-setup` for the interactive wizard (covers env vars, shell profile,
+and server registration in one step).
 
-**Verify**:
+**Verify:**
 
 ```
 pp --version              # → pair-pressure 1.0.0
-pp where                  # → acme #general (alias: Echo)
+pp where                  # → team #general (alias: Echo)
 ```
 
 ### Installer flags
@@ -251,8 +271,9 @@ pp unread --all                   # new posts by others, all servers
 | `watch start/stop/status/interval <Nm>/wire [--nudge\|--undo]` | Zero-token watcher daemon + console alert wiring. |
 
 All reads auto-pull (skip with `--no-pull`); writes pull → commit → push
-with one rebase-retry, so concurrent posts never conflict. Every chat/task
-verb takes `--server <name>` for a one-off without switching.
+with one rebase-retry (safe for 2 simultaneous writers; a 3rd concurrent
+push can exhaust the single retry). Every chat/task verb takes
+`--server <name>` for a one-off without switching.
 
 ### State resolution (server / channel / alias)
 

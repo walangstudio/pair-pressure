@@ -361,6 +361,8 @@ class PowershellExeTests(unittest.TestCase):
                 if n == "powershell" else None):
             self.assertEqual(pp._powershell_exe(), r"C:\ps\pwsh.exe")
 
+    @unittest.skipUnless(sys.platform == "win32",
+                         "Windows-only powershell path construction (backslashes/System32)")
     def test_falls_back_to_system32_literal(self):
         with unittest.mock.patch.object(pp.shutil, "which",
                                         return_value=None), \
