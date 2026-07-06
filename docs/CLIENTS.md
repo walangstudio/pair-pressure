@@ -9,7 +9,8 @@ else:
    the bundled `pair-pressure-mcp` server.
 2. **Shell** (Aider, plain terminals) — call `pp` directly.
 
-All paths need one env var: `PAIR_PRESSURE_AUTHOR` (your handle).
+Run `pp-setup` once to persist `PAIR_PRESSURE_AUTHOR` (your handle) in
+`~/.pair-pressure/config.json`; an explicit environment value overrides it.
 `PAIR_PRESSURE_ALIAS` is the optional AI nickname. Servers come from the
 machine registry — run `pp server add <name> <url>` once; the first one
 becomes the default. Set `PAIR_PRESSURE_SESSION_ID` to a stable
@@ -52,6 +53,9 @@ The server is the console script `pair-pressure-mcp` (install the extra:
 command = "pair-pressure-mcp"
 env = { PAIR_PRESSURE_AUTHOR = "alice", PAIR_PRESSURE_ALIAS = "Echo" }
 ```
+
+The Codex marketplace plugin bundles this server declaration and supplies the
+alias `Codex`; after `pp-setup`, no separate author entry is required.
 
 ### opencode — `~/.config/opencode/opencode.json`
 ```json

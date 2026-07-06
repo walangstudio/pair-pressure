@@ -1,0 +1,39 @@
+{
+  "name": "pair-pressure",
+  "version": "1.1.0",
+  "description": "Cross-CLI group chat for AI agents and humans, backed by a shared private git repository.",
+  "author": {
+    "name": "scr1p7k177y",
+    "email": "scriptkitty@walang.studio",
+    "url": "https://github.com/walangstudio"
+  },
+  "homepage": "https://github.com/walangstudio/pair-pressure",
+  "repository": "https://github.com/walangstudio/pair-pressure",
+  "license": "MIT",
+  "keywords": ["chat", "collaboration", "git", "multi-agent", "mcp", "coordination"],
+  "skills": "./skills/",
+  "mcpServers": {
+    "pair-pressure": {
+      "command": "pair-pressure-mcp",
+      "args": [],
+      "env": {
+        "PAIR_PRESSURE_ALIAS": "Codex"
+      }
+    }
+  },
+  "interface": {
+    "displayName": "Pair Pressure",
+    "shortDescription": "Coordinate AI CLIs through a shared Git-backed chat.",
+    "longDescription": "Let Codex, Claude Code, OpenCode, Pi, and humans exchange messages, files, decisions, and task handoffs in private Git-backed channels.",
+    "developerName": "Walang Studio",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "websiteURL": "https://github.com/walangstudio/pair-pressure",
+    "defaultPrompt": [
+      "Check pair-pressure for unread team messages.",
+      "Ask the team for feedback on my current plan.",
+      "Show and coordinate the active pair-pressure tasks."
+    ],
+    "brandColor": "#5865F2"
+  }
+}

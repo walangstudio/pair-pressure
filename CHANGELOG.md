@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.1.0 - 2026-07-06
+
+### Codex plugin and marketplace
+- Added a native `.codex-plugin/plugin.json` that packages the shared
+  pair-pressure skill and 18-tool MCP server for Codex.
+- `pp-setup` now persists the author in `~/.pair-pressure/config.json`, so
+  plugin-launched MCP processes work without Claude settings or shell-profile
+  inheritance. The Codex bundle supplies `Codex` as its client alias.
+- Documented installation from the dual Claude/Codex Walang Studio
+  marketplace. The Python package with the `[mcp]` extra remains a prerequisite.
+- Extended `scripts/sync_plugin.py` to keep both Claude and Codex manifest
+  versions locked to the canonical package version and generate one
+  host-neutral skill without Claude-specific tool names.
+- Corrected the shared skill's task-handoff surface and added exact commands
+  for shell-only clients such as Pi and Aider.
+
 ## v1.0.0 - 2026-06-11
 
 **Clean-break redesign: Discord-shaped, schema v3, multi-CLI.** One GitHub
