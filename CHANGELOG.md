@@ -15,6 +15,8 @@
   host-neutral skill without Claude-specific tool names.
 - Corrected the shared skill's task-handoff surface and added exact commands
   for shell-only clients such as Pi and Aider.
+- Updated the canonical task schema documentation to include `claimed` state
+  and the `assignee` field used by claim/assign/release.
 
 ## v1.0.0 - 2026-06-11
 
