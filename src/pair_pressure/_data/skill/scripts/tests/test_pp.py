@@ -1049,6 +1049,16 @@ class StatusVerdictTests(PPBase):
         self.assertEqual(payload["server"], "srv")
         self.assertEqual(payload["where"], "srv #general")
 
+    def test_persisted_author_supports_plugin_process_without_env(self):
+        os.environ.pop("PAIR_PRESSURE_AUTHOR", None)
+        pp._config_save({"author": "codex-user"})
+        self._register("srv", "/p")
+
+        self.assertEqual(pp.author(), "codex-user")
+        payload = self._status()
+        self.assertEqual(payload["verdict"], "ready")
+        self.assertEqual(payload["active"]["PAIR_PRESSURE_AUTHOR"], "codex-user")
+
     def test_state_channel_surfaces(self):
         self._register("srv", "/p")
         pp._state_save(channel="dev", source="t")

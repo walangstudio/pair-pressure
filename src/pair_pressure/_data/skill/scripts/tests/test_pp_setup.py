@@ -152,6 +152,31 @@ class MergeSettingsTests(unittest.TestCase):
 
 
 @unittest.skipUnless(INSTALL_PATH.exists(), f"missing {INSTALL_PATH}")
+class PersistIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_install_module()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.original_home = self.mod.PP_HOME
+        self.mod.PP_HOME = Path(self.tmpdir.name) / ".pair-pressure"
+
+    def tearDown(self):
+        self.mod.PP_HOME = self.original_home
+        self.tmpdir.cleanup()
+
+    def test_preserves_config_and_saves_author(self):
+        self.mod.PP_HOME.mkdir()
+        config = self.mod.PP_HOME / "config.json"
+        config.write_text(json.dumps({"offline": True}), encoding="utf-8")
+
+        self.mod.save_pair_pressure_identity("alice")
+
+        self.assertEqual(
+            json.loads(config.read_text(encoding="utf-8")),
+            {"offline": True, "author": "alice", "schema_version": 1},
+        )
+
+
+@unittest.skipUnless(INSTALL_PATH.exists(), f"missing {INSTALL_PATH}")
 class PromptTests(unittest.TestCase):
     def setUp(self):
         self.mod = _load_install_module()

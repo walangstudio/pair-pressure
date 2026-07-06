@@ -382,6 +382,23 @@ def merge_settings(env_updates, backup=True):
     return data
 
 
+def save_pair_pressure_identity(author):
+    """Persist host-neutral identity for plugin-launched MCP processes."""
+    path = PP_HOME / "config.json"
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["author"] = author
+    data.setdefault("schema_version", 1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
 def _shell_profile_block(env_updates):
     """Render the marker-wrapped env-var block for a POSIX or PowerShell profile."""
     if os.name == "nt":
@@ -1014,6 +1031,7 @@ def fresh_install_flow(args):
     if alias:
         env_updates["PAIR_PRESSURE_ALIAS"] = alias
     os.environ.update(env_updates)
+    save_pair_pressure_identity(author)
 
     # First server (registry-based; `pp server add` clones + bootstraps).
     server = setup_server(args, author)

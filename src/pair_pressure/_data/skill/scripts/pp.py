@@ -399,8 +399,19 @@ def _add_server_arg(sp):
     )
 
 
+def _author_or_none():
+    value = os.environ.get("PAIR_PRESSURE_AUTHOR")
+    if value and value.strip():
+        return value.strip()
+    value = _config_load().get("author")
+    return str(value).strip() if value and str(value).strip() else None
+
+
 def author():
-    return env("PAIR_PRESSURE_AUTHOR")
+    value = _author_or_none()
+    if not value:
+        die("PAIR_PRESSURE_AUTHOR is not set. Run `pp-setup`.")
+    return value
 
 
 def alias():
@@ -1330,7 +1341,7 @@ def _active_channel_dirs(channels_root, me=None):
     """Visible channel dirs, sorted. Skips archived channels and private
     channels `me` is not a member of."""
     if me is None:
-        me = os.environ.get("PAIR_PRESSURE_AUTHOR")
+        me = _author_or_none()
     if not channels_root.exists():
         return []
     return [p for p in sorted(channels_root.iterdir())
@@ -1433,7 +1444,7 @@ def _find_post_by_id(query):
     q = str(query).strip().lstrip("·")
     if not q:
         return None
-    me = os.environ.get("PAIR_PRESSURE_AUTHOR")
+    me = _author_or_none()
     root = repo_path() / "channels"
     exact, partial = [], []
     for ch_dir in _active_channel_dirs(root, me):
@@ -1932,7 +1943,7 @@ def cmd_status(args):
     """Identity + location status. Works pre-configuration (never dies)."""
     saved = _read_saved_env()
     active = {
-        "PAIR_PRESSURE_AUTHOR": os.environ.get("PAIR_PRESSURE_AUTHOR") or None,
+        "PAIR_PRESSURE_AUTHOR": _author_or_none(),
         "PAIR_PRESSURE_REPO":   os.environ.get("PAIR_PRESSURE_REPO")   or None,
         "PAIR_PRESSURE_ALIAS":  os.environ.get("PAIR_PRESSURE_ALIAS")  or None,
     }
@@ -2016,7 +2027,7 @@ def cmd_search(args):
     if not args.no_pull:
         maybe_pull()
     repo = repo_path()
-    me = os.environ.get("PAIR_PRESSURE_AUTHOR")
+    me = _author_or_none()
     visible = {d.name for d in _active_channel_dirs(repo / "channels", me)}
 
     ql = args.query.lower()
@@ -2081,7 +2092,7 @@ def cmd_unread(args):
     never clears the badge. `--since <ISO>` counts every post at/after a
     timestamp instead. `--all` spans every registered server. `--ack` clears
     this session's unread bucket."""
-    me = os.environ.get("PAIR_PRESSURE_AUTHOR")
+    me = _author_or_none()
     if getattr(args, "all", False):
         servers = [s.get("name") for s in _servers_list() if s.get("name")]
     else:
@@ -2944,7 +2955,7 @@ def _scan_server_new(server, state):
     place. Online: fetch + diff origin/<branch> (working tree untouched).
     Offline: scan working-tree files. Never clones — a registered server
     whose clone is missing is skipped."""
-    me = os.environ.get("PAIR_PRESSURE_AUTHOR")
+    me = _author_or_none()
     entry = _server_entry(server)
     if not entry or not entry.get("path"):
         return []
