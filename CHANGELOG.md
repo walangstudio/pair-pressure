@@ -19,6 +19,12 @@ startup, on every statusline refresh, and on every `git` call underneath.
   repointed automatically on the next `pp` call; `wire --undo` is respected.
 - The prior statusline (`_pp_prev_statusline`) still composes, now without
   the `%TEMP%\pp_prev_*.cmd` temp files the PowerShell version left behind.
+- Verified against both the CLI and desktop shapes of Claude and Codex: a
+  desktop host has no console to inherit, a CLI host has a pseudoconsole.
+  The MCP stdio handshake is identical either way (18 tools). The hook
+  scripts now tolerate `sys.stdout is None`, which a GUI-subsystem
+  interpreter yields when the host leaves stdout unredirected; the nudge
+  bails before clearing its counter so an undelivered nudge is not lost.
 
 ## v1.1.0 - 2026-07-06
 

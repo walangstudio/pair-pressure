@@ -21,6 +21,12 @@ def main():
     except Exception:
         pass
 
+    # sys.stdout is None under a GUI-subsystem interpreter when the host
+    # leaves stdout unredirected. Bail BEFORE the counter is cleared -- a
+    # nudge nobody can read must not count as delivered.
+    if sys.stdout is None:
+        return
+
     unread = Path.home() / ".pair-pressure" / "unread.json"
     try:
         root = json.loads(unread.read_text(encoding="utf-8-sig") or "{}")
