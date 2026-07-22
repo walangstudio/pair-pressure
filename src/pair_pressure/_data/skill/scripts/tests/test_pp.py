@@ -2894,6 +2894,25 @@ class NoConsoleWindowTest(unittest.TestCase):
                     "%s:%d subprocess.%s without creationflags -- it will "
                     "pop a console window" % (src.name, node.lineno, fn.attr))
 
+    def test_mcp_entry_point_stays_a_gui_script(self):
+        # Desktop hosts (Claude Desktop, Codex desktop) launch this server
+        # themselves, so we never see its creation flags -- a console-script
+        # entry point would pop a window there no matter what pp.py does.
+        pyproject = (HERE.parent.parent.parent.parent.parent.parent
+                     / "pyproject.toml").read_text(encoding="utf-8")
+        gui = pyproject.split("[project.gui-scripts]", 1)
+        self.assertEqual(len(gui), 2, "no [project.gui-scripts] section")
+        self.assertIn("pair-pressure-mcp", gui[1].split("\n[", 1)[0])
+        console = pyproject.split("[project.scripts]", 1)[1].split("\n[", 1)[0]
+        self.assertNotIn("pair-pressure-mcp", console)
+
+    def test_hook_scripts_survive_a_none_stdout(self):
+        # pythonw leaves sys.stdout None when the host does not redirect it.
+        for name in ("pp-statusline.py", "pp-prompt-nudge.py"):
+            src = (HERE.parent / name).read_text(encoding="utf-8")
+            self.assertIn("sys.stdout is", src,
+                          "%s does not guard a None stdout" % name)
+
     def test_wired_commands_use_a_gui_interpreter(self):
         # pythonw is the only guarantee: Claude Code picks the spawn flags.
         cmd = pp._py_invoke(Path("/x/pp-statusline.py"))
