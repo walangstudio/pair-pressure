@@ -2,7 +2,8 @@
 
 Claude Code injects this script's stdout into the model context. We emit ONE
 short line only when there are unread pair-pressure messages, then clear the
-counter so it fires once per batch (~15-25 tokens, only when there is news).
+counter -- but only once that line is actually delivered -- so it fires once
+per batch (~15-25 tokens, only when there is news).
 Nothing is printed when there is nothing new (0 tokens).
 
 Stdlib only and no `pp` import -- see pp-statusline.py for the rationale.
