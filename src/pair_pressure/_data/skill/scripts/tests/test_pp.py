@@ -2622,7 +2622,7 @@ class WireStatuslineQuietTests(PPBase):
         self.assertTrue(pp._wire_statusline_quiet())
         data = json.loads(self.settings.read_text())
         self.assertEqual(data["_pp_prev_statusline"], "echo hi")
-        self.assertIn("pp-statusline.ps1", data["statusLine"]["command"])
+        self.assertIn("pp-statusline.py", data["statusLine"]["command"])
 
     def test_no_prev_is_empty_string(self):
         self.settings.write_text("{}", encoding="utf-8")
@@ -2646,6 +2646,96 @@ class WireStatuslineQuietTests(PPBase):
         self.assertTrue(bak.exists())
         self.assertEqual(bak.read_text(), "{}")
 
+    def test_legacy_ps1_wiring_is_upgraded(self):
+        # Pre-0.9 install: statusLine names the PowerShell script that no
+        # longer ships, with the real prior command already saved.
+        self.settings.write_text(json.dumps({
+            "statusLine": {
+                "type": "command",
+                "command": '"powershell.EXE" -File "/x/pp-statusline.ps1"'},
+            "_pp_prev_statusline": "ccstatusline",
+        }), encoding="utf-8")
+        self.assertTrue(pp._wire_statusline_quiet())
+        data = json.loads(self.settings.read_text())
+        self.assertIn("pp-statusline.py", data["statusLine"]["command"])
+        self.assertNotIn(".ps1", data["statusLine"]["command"])
+        # Upgrading must not chain the badge to its own old command.
+        self.assertEqual(data["_pp_prev_statusline"], "ccstatusline")
+
+
+class StatuslineScriptTests(PPBase):
+    """Exercise pp-statusline.py the way Claude Code does: a real subprocess
+    fed session JSON on stdin. Runs identically on Windows, macOS and Linux."""
+
+    def setUp(self):
+        super().setUp()
+        (self.home / ".claude").mkdir()
+        (self.home / ".pair-pressure").mkdir()
+        self.settings = self.home / ".claude" / "settings.json"
+        self.unread = self.home / ".pair-pressure" / "unread.json"
+        self.settings.write_text("{}", encoding="utf-8")
+
+    def _run(self, stdin=b'{"session_id":"s"}'):
+        script = Path(pp.__file__).resolve().parent / "pp-statusline.py"
+        r = subprocess.run([sys.executable, str(script)], input=stdin,
+                           stdout=subprocess.PIPE)
+        return r.stdout.decode("utf-8").rstrip("\r\n")
+
+    def _wire_prev(self):
+        """Point _pp_prev_statusline at a helper that echoes a marker plus the
+        byte count it received, so we can prove stdin is forwarded intact."""
+        helper = self.tmp / "prev_helper.py"
+        helper.write_text(
+            "import sys\n"
+            "d = sys.stdin.buffer.read()\n"
+            "sys.stdout.write('PRIOR%d' % len(d))\n", encoding="utf-8")
+        self.settings.write_text(json.dumps({
+            "_pp_prev_statusline": '"%s" "%s"' % (sys.executable, helper),
+        }), encoding="utf-8")
+
+    def test_silent_when_nothing_to_report(self):
+        self.assertEqual(self._run(), "")
+
+    def test_badge_reports_unread(self):
+        self.unread.write_text(json.dumps({"__shared__": {
+            "count": 2,
+            "latest": {"author": "bob", "channel": "general"}}}),
+            encoding="utf-8")
+        self.assertEqual(self._run(), "[pp 2 new bob #general]")
+
+    def test_legacy_flat_unread_shape(self):
+        self.unread.write_text(json.dumps(
+            {"count": 1, "latest": {"author": "ann"}}), encoding="utf-8")
+        self.assertEqual(self._run(), "[pp 1 new ann]")
+
+    def test_offline_badge_shown_with_no_unread(self):
+        (self.home / ".pair-pressure" / "config.json").write_text(
+            '{"offline": true}', encoding="utf-8")
+        self.assertEqual(self._run(), "[pp (offline)]")
+
+    def test_composes_with_prior_and_forwards_stdin_exactly(self):
+        self._wire_prev()
+        payload = '{"session_id":"s","cwd":"x"}'.encode("utf-8")
+        self.assertEqual(self._run(payload), "PRIOR%d" % len(payload))
+
+    def test_prior_output_precedes_badge(self):
+        self._wire_prev()
+        self.unread.write_text(json.dumps(
+            {"__shared__": {"count": 1, "latest": {"author": "bob"}}}),
+            encoding="utf-8")
+        payload = b'{}'
+        self.assertEqual(self._run(payload),
+                         "PRIOR%d [pp 1 new bob]" % len(payload))
+
+    def test_broken_prior_command_cannot_break_the_line(self):
+        self.settings.write_text(json.dumps({
+            "_pp_prev_statusline": "definitely-not-a-real-command-xyz"}),
+            encoding="utf-8")
+        self.unread.write_text(json.dumps(
+            {"__shared__": {"count": 1, "latest": {"author": "bob"}}}),
+            encoding="utf-8")
+        self.assertEqual(self._run(), "[pp 1 new bob]")
+
 
 class EnsureWiredTests(PPBase):
     def setUp(self):
@@ -2667,13 +2757,79 @@ class EnsureWiredTests(PPBase):
             pp._ensure_wired(self._args())
         self.assertTrue(self.sentinel.exists())
         data = json.loads(self.settings.read_text())
-        self.assertIn("pp-statusline.ps1", data["statusLine"]["command"])
+        self.assertIn("pp-statusline.py", data["statusLine"]["command"])
 
     def test_sentinel_blocks_rewire(self):
         self.sentinel.touch()
         self.settings.write_text("{}", encoding="utf-8")
         pp._ensure_wired(self._args())
         self.assertEqual(self.settings.read_text(), "{}")
+
+    def test_sentinel_does_not_block_legacy_upgrade(self):
+        # Every existing install is already sentinel-stamped; if the sentinel
+        # also blocked the .ps1 -> .py rewrite their badge would die silently.
+        self.sentinel.touch()
+        self.settings.write_text(json.dumps({
+            "statusLine": {
+                "type": "command",
+                "command": '"powershell.EXE" -File "/x/pp-statusline.ps1"'},
+            "_pp_prev_statusline": "ccstatusline",
+            "hooks": {"UserPromptSubmit": [{"hooks": [{
+                "type": "command",
+                "command": '"powershell.EXE" -File "/x/pp-prompt-nudge.ps1"',
+            }]}]},
+        }), encoding="utf-8")
+        with self._silence():
+            pp._ensure_wired(self._args())
+        data = json.loads(self.settings.read_text())
+        self.assertIn("pp-statusline.py", data["statusLine"]["command"])
+        nudge = data["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        self.assertIn("pp-prompt-nudge.py", nudge)
+        self.assertEqual(data["_pp_prev_statusline"], "ccstatusline")
+
+    def test_legacy_upgrade_is_one_shot(self):
+        # The MCP shim runs pp once per tool call; re-reading settings.json
+        # forever would undo the sentinel's whole purpose.
+        self.sentinel.touch()
+        self.settings.write_text(json.dumps({
+            "statusLine": {
+                "type": "command",
+                "command": '"powershell.EXE" -File "/x/pp-statusline.ps1"'},
+        }), encoding="utf-8")
+        with self._silence():
+            pp._ensure_wired(self._args())
+        upgraded = self.settings.read_text()
+        self.assertIn("pp-statusline.py", upgraded)
+
+        with unittest.mock.patch.object(
+                pp, "_upgrade_legacy_wiring",
+                side_effect=AssertionError("re-ran after upgrading")):
+            pp._ensure_wired(self._args())
+        self.assertEqual(self.settings.read_text(), upgraded)
+
+    def test_legacy_upgrade_backs_up_settings(self):
+        self.sentinel.touch()
+        original = json.dumps({
+            "statusLine": {
+                "type": "command",
+                "command": '"powershell.EXE" -File "/x/pp-statusline.ps1"'},
+        })
+        self.settings.write_text(original, encoding="utf-8")
+        with self._silence():
+            pp._ensure_wired(self._args())
+        bak = self.settings.with_suffix(".json.pp.bak")
+        self.assertTrue(bak.exists())
+        self.assertEqual(bak.read_text(), original)
+
+    def test_undone_wiring_is_not_resurrected(self):
+        # `wire --undo` leaves a non-pp statusLine plus the sentinel; the
+        # legacy upgrade must never re-wire it.
+        self.sentinel.touch()
+        original = json.dumps({
+            "statusLine": {"type": "command", "command": "ccstatusline"}})
+        self.settings.write_text(original, encoding="utf-8")
+        pp._ensure_wired(self._args())
+        self.assertEqual(self.settings.read_text(), original)
 
     def test_optout_env_skips(self):
         os.environ["PAIR_PRESSURE_NO_AUTOWIRE"] = "1"
@@ -2702,6 +2858,48 @@ class EnsureWiredTests(PPBase):
         self.settings.write_text("{}", encoding="utf-8")
         pp._ensure_wired(self._args())
         self.assertEqual(self.settings.read_text(), "{}")
+
+
+class NoConsoleWindowTest(unittest.TestCase):
+    """Every child we spawn must be window-less on Windows.
+
+    `pp` runs under parents that have no console of their own (an MCP server
+    or a statusline/hook launched by Claude Code or Codex); a console-app
+    child then gets its own console WINDOW -- the command prompts that used
+    to flash on every git call and every MCP tool call.
+    """
+
+    SOURCES = [
+        HERE.parent / "pp.py",
+        HERE.parent.parent / "mcp" / "server.py",
+        HERE.parent / "pp-statusline.py",
+    ]
+
+    def test_every_subprocess_spawn_suppresses_the_console_window(self):
+        import ast
+        for src in self.SOURCES:
+            tree = ast.parse(src.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                if not (isinstance(fn, ast.Attribute)
+                        and fn.attr in ("run", "Popen")
+                        and isinstance(fn.value, ast.Name)
+                        and fn.value.id == "subprocess"):
+                    continue
+                kw = {k.arg for k in node.keywords}
+                self.assertTrue(
+                    "creationflags" in kw or "kwargs" in kw or None in kw,
+                    "%s:%d subprocess.%s without creationflags -- it will "
+                    "pop a console window" % (src.name, node.lineno, fn.attr))
+
+    def test_wired_commands_use_a_gui_interpreter(self):
+        # pythonw is the only guarantee: Claude Code picks the spawn flags.
+        cmd = pp._py_invoke(Path("/x/pp-statusline.py"))
+        if os.name == "nt" and Path(pp._gui_interp()).name == "pythonw.exe":
+            self.assertIn("pythonw", cmd.lower())
+        self.assertIn("pp-statusline.py", cmd)
 
 
 if __name__ == "__main__":
