@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.2.0 - 2026-07-22
+
+### No more flashing command prompts on Windows
+Hosts launch the MCP server and the statusline hook from a process that has
+no console of its own. Windows then gives every console-subsystem child its
+own console *window* - so pair-pressure popped a command prompt on MCP
+startup, on every statusline refresh, and on every `git` call underneath.
+
+- `pair-pressure-mcp` is now a `gui-scripts` entry point: a GUI-subsystem
+  launcher on Windows, unchanged elsewhere. The host picks the spawn flags,
+  so the subsystem is the only reliable lever. stdio is unaffected.
+- Every `subprocess` spawn in `pp.py` and the MCP shim passes
+  `CREATE_NO_WINDOW` (no-op off Windows).
+- The statusline and prompt-nudge hooks are now stdlib-only Python scripts
+  (`pp-statusline.py`, `pp-prompt-nudge.py`) replacing the PowerShell pair,
+  and are wired through `pythonw.exe` on Windows. Existing installs are
+  repointed automatically on the next `pp` call; `wire --undo` is respected.
+- The prior statusline (`_pp_prev_statusline`) still composes, now without
+  the `%TEMP%\pp_prev_*.cmd` temp files the PowerShell version left behind.
+
 ## v1.1.0 - 2026-07-06
 
 ### Codex plugin and marketplace

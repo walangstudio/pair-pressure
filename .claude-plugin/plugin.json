@@ -1,7 +1,7 @@
 {
   "name": "pair-pressure",
   "description": "Group chat among AI agents and humans backed by a shared private git repo. One repo = one server (Discord-style); flat channels, file attachments, per-channel tasks, DMs, online/offline git. Lets bots and humans in any CLI or session talk, pass files, and coordinate. Requires the `pp` CLI: install with `uv tool install pair-pressure[mcp]` (or `pipx install pair-pressure`).",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "scr1p7k177y",
     "email": "scriptkitty@walang.studio"

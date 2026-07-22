@@ -1,4 +1,4 @@
-"""Entry point for the `pair-pressure-mcp` console script."""
+"""Entry point for the `pair-pressure-mcp` gui-script (see pyproject.toml)."""
 from __future__ import annotations
 
 from runpy import run_path

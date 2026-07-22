@@ -23,6 +23,13 @@ from pathlib import Path
 
 SCHEMA_VERSION = "3"  # chat-repo schema; matches pp-init.py
 
+# Windows: a console app spawned by a parent that has no console of its own
+# gets a fresh console WINDOW. `pp` runs under exactly such parents -- an MCP
+# server or a statusline/hook launched by Claude Code or Codex -- so every
+# child we spawn (git above all, once per call) flashed a command prompt.
+# CREATE_NO_WINDOW gives the child a console with no window. No-op elsewhere.
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
 _VIA_SHORT = {"claude-code": "cc", "human": "h", "mcp": "mcp"}
 _VIA_LONG = {v: k for k, v in _VIA_SHORT.items()}
 
@@ -508,7 +515,8 @@ def slugify(s):
 def git(*args, cwd=None, check=True):
     cwd = cwd or repo_path()
     return subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, check=check
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=check,
+        creationflags=_NO_WINDOW,
     )
 
 
@@ -2315,7 +2323,8 @@ def cmd_server_add(args):
         argv = _pp_init_argv() + [str(dest), "--force", "--name", name]
         sub_env = os.environ.copy()
         sub_env.setdefault("PAIR_PRESSURE_AUTHOR", author())
-        ir = subprocess.run(argv, env=sub_env, capture_output=True, text=True)
+        ir = subprocess.run(argv, env=sub_env, capture_output=True, text=True,
+                            creationflags=_NO_WINDOW)
         if ir.returncode != 0:
             die(f"pp-init failed: {ir.stderr.strip() or ir.stdout.strip()}")
         if not _offline():
@@ -2570,7 +2579,8 @@ def _pid_alive(pid):
             try:
                 r = subprocess.run(
                     ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=_NO_WINDOW)
                 return str(pid) in r.stdout
             except Exception:
                 return False
@@ -2600,8 +2610,12 @@ def _watch_running():
     return d if _pid_alive(d.get("pid")) else None
 
 
-def _watch_interp():
-    """pythonw.exe (no console flash) if present, else the current python."""
+def _gui_interp():
+    """pythonw.exe (no console flash) if present, else the current python.
+
+    pythonw is a GUI-subsystem binary, so Windows never gives it a console --
+    the only spawn-flag-independent way to stay invisible when the parent
+    chooses the flags (Claude Code spawning our statusline and hook)."""
     exe = Path(sys.executable)
     if os.name == "nt":
         cand = exe.with_name("pythonw.exe")
@@ -2613,7 +2627,7 @@ def _watch_interp():
 def _spawn_watch_daemon():
     _PP_HOME.mkdir(parents=True, exist_ok=True)
     script = str(Path(__file__).resolve())
-    cmd = [_watch_interp(), script, "_watch-daemon"]
+    cmd = [_gui_interp(), script, "_watch-daemon"]
     flags = 0
     for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
         flags |= getattr(subprocess, name, 0)
@@ -2630,7 +2644,7 @@ def _spawn_watch_daemon():
     try:
         _watch_pid_path().write_text(json.dumps({
             "pid": proc.pid, "started_at": now_iso(),
-            "python": _watch_interp(),
+            "python": _gui_interp(),
         }), encoding="utf-8")
     except OSError:
         pass
@@ -2691,14 +2705,103 @@ def _autowire_sentinel():
     return _PP_HOME / "autowire.done"
 
 
-def _statusline_is_pp(data):
+# Stamped into the sentinel once the wiring names the Python scripts. Keeps
+# the sentinel one-shot: without it the legacy-wiring upgrade would re-read
+# and re-parse settings.json on every single `pp` call, forever, on every OS.
+_WIRING_MARKER = "py-wiring"
+
+
+def _wiring_upgraded():
+    try:
+        return _autowire_sentinel().read_text(
+            encoding="utf-8").strip() == _WIRING_MARKER
+    except OSError:
+        return False
+
+
+def _mark_wiring_upgraded():
+    try:
+        _PP_HOME.mkdir(parents=True, exist_ok=True)
+        _autowire_sentinel().write_text(_WIRING_MARKER, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _statusline_script():
+    return _skill_scripts_dir() / "pp-statusline.py"
+
+
+def _nudge_script():
+    return _skill_scripts_dir() / "pp-prompt-nudge.py"
+
+
+def _statusline_cmd_of(data):
     sl = data.get("statusLine") if isinstance(data, dict) else None
-    return isinstance(sl, dict) and "pp-statusline.ps1" in str(
-        sl.get("command", ""))
+    return str(sl.get("command", "")) if isinstance(sl, dict) else ""
+
+
+def _statusline_is_pp(data):
+    cmd = _statusline_cmd_of(data)
+    return "pp-statusline.py" in cmd or "pp-statusline.ps1" in cmd
+
+
+def _statusline_is_legacy(data):
+    """True for the pre-1.2 PowerShell wiring (every install through v1.1.0).
+    That script no longer ships, so an install left on it would silently
+    render nothing forever."""
+    return "pp-statusline.ps1" in _statusline_cmd_of(data)
+
+
+def _upgrade_legacy_wiring():
+    """Rewrite a PowerShell-era statusLine/nudge wiring to the cross-platform
+    Python scripts. Runs even once the autowire sentinel is stamped, because
+    the .ps1 files are gone -- but only ever rewrites an existing pp wiring,
+    so a deliberate `wire --undo` is never resurrected. Returns True if it
+    changed anything."""
+    sp = _claude_settings_path()
+    try:
+        raw = sp.read_text(encoding="utf-8-sig")
+        data = json.loads(raw or "{}")
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+
+    changed = False
+    if _statusline_is_legacy(data):
+        data["statusLine"] = {"type": "command",
+                              "command": _py_invoke(_statusline_script())}
+        changed = True
+
+    hk = data.get("hooks")
+    ups = hk.get("UserPromptSubmit") if isinstance(hk, dict) else None
+    if isinstance(ups, list):
+        for grp in ups:
+            if not isinstance(grp, dict):
+                continue
+            for h in grp.get("hooks", []):
+                if isinstance(h, dict) and "pp-prompt-nudge.ps1" in str(
+                        h.get("command", "")):
+                    h["command"] = _py_invoke(_nudge_script())
+                    changed = True
+
+    if not changed:
+        return False
+    try:
+        bak = sp.with_suffix(".json.pp.bak")
+        if not bak.exists():
+            bak.write_text(raw, encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        sp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def _wire_statusline_quiet():
-    """Non-noisy core of `pp watch wire`: point statusLine at pp-statusline.ps1,
+    """Non-noisy core of `pp watch wire`: point statusLine at pp-statusline.py,
     preserving any prior command in `_pp_prev_statusline` so the wrapper can
     chain to it. Returns True only if it NEWLY wired. Never prints, never
     raises -- auto-wire runs on ordinary `pp` calls, so it must stay invisible
@@ -2709,14 +2812,20 @@ def _wire_statusline_quiet():
         data = json.loads(raw or "{}")
     except (OSError, json.JSONDecodeError):
         return False
-    if not isinstance(data, dict) or _statusline_is_pp(data):
+    if not isinstance(data, dict):
         return False
-    sl = data.get("statusLine")
-    data["_pp_prev_statusline"] = (
-        str(sl["command"]) if isinstance(sl, dict) and sl.get("command")
-        else "")
-    sl_ps1 = _skill_scripts_dir() / "pp-statusline.ps1"
-    data["statusLine"] = {"type": "command", "command": _ps_invoke(sl_ps1)}
+    if _statusline_is_pp(data):
+        # Already ours. Only a legacy .ps1 wiring still needs rewriting, and
+        # the saved prior command must survive that upgrade untouched.
+        if not _statusline_is_legacy(data):
+            return False
+    else:
+        sl = data.get("statusLine")
+        data["_pp_prev_statusline"] = (
+            str(sl["command"]) if isinstance(sl, dict) and sl.get("command")
+            else "")
+    data["statusLine"] = {"type": "command",
+                          "command": _py_invoke(_statusline_script())}
     try:
         bak = sp.with_suffix(".json.pp.bak")
         if not bak.exists():
@@ -2753,13 +2862,15 @@ def _ensure_wired(args):
         return  # not a Claude Code install; the toast covers notifications
     sentinel = _autowire_sentinel()
     if sentinel.exists():
-        return  # already attempted once (or deliberately undone)
+        # Already attempted once (or deliberately undone). One exception, and
+        # it too is one-shot: an install stamped before v1.2.0 still names the
+        # .ps1 scripts, which no longer ship, so repoint it once and re-stamp.
+        if not _wiring_upgraded():
+            _upgrade_legacy_wiring()
+            _mark_wiring_upgraded()
+        return
     newly = _wire_statusline_quiet()
-    try:
-        _PP_HOME.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-    except OSError:
-        pass
+    _mark_wiring_upgraded()
     if newly:
         print("(pair-pressure: wired a 0-token statusline badge into "
               "~/.claude/settings.json; restart the session to see it. "
@@ -2841,7 +2952,8 @@ def _notify_windows(title, message):
         r = subprocess.run(
             [_powershell_exe(), "-NoProfile", "-NonInteractive",
              "-Command", ps],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW)
         if r.returncode != 0:
             _watch_log(f"toast_failed rc={r.returncode} {r.stderr.strip()[:200]}")
             return False
@@ -2863,7 +2975,8 @@ def _notify_macos(title, message):
               f'with title "{_esc(title)}"')
     try:
         r = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10,
+                           creationflags=_NO_WINDOW)
         if r.returncode != 0:
             _watch_log(f"toast_failed rc={r.returncode} {r.stderr.strip()[:200]}")
             return False
@@ -2882,7 +2995,8 @@ def _notify_linux(title, message):
         r = subprocess.run(
             ["notify-send", "-a", "pair-pressure", "-u", "normal", "--",
              title, message],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW)
         if r.returncode != 0:
             _watch_log(f"toast_failed rc={r.returncode} {r.stderr.strip()[:200]}")
             return False
@@ -3125,11 +3239,13 @@ def _other_recent_sessions(window_seconds=3600):
     return sorted(found)
 
 
-def _ps_invoke(ps1):
-    # Absolute powershell path so the wired statusLine/nudge work even when
-    # Claude Code spawns them with a PATH that lacks System32.
-    return (f'"{_powershell_exe()}" -NoProfile -ExecutionPolicy Bypass '
-            f'-File "{ps1}"')
+def _py_invoke(script):
+    # Absolute interpreter path so the wired statusLine/nudge work even when
+    # Claude Code spawns them with a PATH that lacks the tool's bin dir --
+    # the same reason the Windows toast resolves an absolute powershell.exe.
+    # pythonw on Windows: Claude Code picks the spawn flags, so a GUI-subsystem
+    # interpreter is the only way to guarantee no console window per refresh.
+    return f'"{_gui_interp()}" "{script}"'
 
 
 def _watch_wire(undo=False, with_nudge=False):
@@ -3150,11 +3266,8 @@ def _watch_wire(undo=False, with_nudge=False):
     if not isinstance(data, dict):
         die("settings.json top level is not an object")
 
-    scripts = _skill_scripts_dir()
-    sl_ps1 = scripts / "pp-statusline.ps1"
-    nudge_ps1 = scripts / "pp-prompt-nudge.ps1"
-    sl_cmd = _ps_invoke(sl_ps1)
-    nudge_cmd = _ps_invoke(nudge_ps1)
+    sl_cmd = _py_invoke(_statusline_script())
+    nudge_cmd = _py_invoke(_nudge_script())
     # Legacy sidecar from the chaining design (v0.8.1 initial); no longer
     # used now that the statusline is standalone. Keep the path to clean
     # it up on undo for installs that ran the old wire.
@@ -3184,8 +3297,7 @@ def _watch_wire(undo=False, with_nudge=False):
     if undo:
         sl = data.get("statusLine")
         prev = data.pop("_pp_prev_statusline", None)
-        if isinstance(sl, dict) and "pp-statusline.ps1" in str(
-                sl.get("command", "")):
+        if _statusline_is_pp(data):
             if prev is not None:
                 data["statusLine"] = {"type": "command", "command": prev}
             else:
@@ -3217,13 +3329,17 @@ def _watch_wire(undo=False, with_nudge=False):
 
     # ---- wire (idempotent) ----
     sl = data.get("statusLine")
-    already = isinstance(sl, dict) and "pp-statusline.ps1" in str(
-        sl.get("command", ""))
+    # A legacy .ps1 wiring is NOT "already wired": its script is gone, so it
+    # must fall through and be repointed at the cross-platform script.
+    already = _statusline_is_pp(data) and not _statusline_is_legacy(data)
     if not already:
-        prev = ""
-        if isinstance(sl, dict) and sl.get("command"):
-            prev = str(sl["command"])
-        data["_pp_prev_statusline"] = prev
+        # Upgrading a legacy pp wiring must NOT capture pp's own command as
+        # the prior statusline -- that would chain the badge to itself.
+        if not _statusline_is_pp(data):
+            prev = ""
+            if isinstance(sl, dict) and sl.get("command"):
+                prev = str(sl["command"])
+            data["_pp_prev_statusline"] = prev
         # Standalone statusline: no chaining, no sidecar needed. Remove any
         # leftover sidecar from a prior wire (chaining era).
         try:
@@ -3310,7 +3426,8 @@ def cmd_watch(args):
             if os.name == "nt":
                 r = subprocess.run(
                     ["taskkill", "/PID", str(pid), "/F", "/T"],
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=_NO_WINDOW)
                 killed = r.returncode == 0
             else:
                 import signal as _sig
