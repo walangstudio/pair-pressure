@@ -44,7 +44,7 @@ not-encrypted warning, and identity/alias etiquette.
 
 ## MCP clients
 
-The server is the console script `pair-pressure-mcp` (install the extra:
+The server is the `pair-pressure-mcp` entry point (install the extra:
 `pip install "pair-pressure[mcp]"` or `uv tool install "pair-pressure[mcp]"`).
 
 ### Codex CLI — `~/.codex/config.toml`

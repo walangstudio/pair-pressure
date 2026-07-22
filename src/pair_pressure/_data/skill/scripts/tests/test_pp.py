@@ -2898,20 +2898,72 @@ class NoConsoleWindowTest(unittest.TestCase):
         # Desktop hosts (Claude Desktop, Codex desktop) launch this server
         # themselves, so we never see its creation flags -- a console-script
         # entry point would pop a window there no matter what pp.py does.
-        pyproject = (HERE.parent.parent.parent.parent.parent.parent
-                     / "pyproject.toml").read_text(encoding="utf-8")
+        pp_toml = HERE.parent.parent.parent.parent.parent.parent / "pyproject.toml"
+        if not pp_toml.exists():
+            self.skipTest("not a source checkout")  # installed-package layout
+        pyproject = pp_toml.read_text(encoding="utf-8")
         gui = pyproject.split("[project.gui-scripts]", 1)
         self.assertEqual(len(gui), 2, "no [project.gui-scripts] section")
         self.assertIn("pair-pressure-mcp", gui[1].split("\n[", 1)[0])
         console = pyproject.split("[project.scripts]", 1)[1].split("\n[", 1)[0]
         self.assertNotIn("pair-pressure-mcp", console)
 
-    def test_hook_scripts_survive_a_none_stdout(self):
-        # pythonw leaves sys.stdout None when the host does not redirect it.
-        for name in ("pp-statusline.py", "pp-prompt-nudge.py"):
-            src = (HERE.parent / name).read_text(encoding="utf-8")
-            self.assertIn("sys.stdout is", src,
-                          "%s does not guard a None stdout" % name)
+    @staticmethod
+    def _load_script(name):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_hook_" + name.replace("-", "_").replace(".py", ""),
+            HERE.parent / name)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _unusable_stdouts(self):
+        """The three shapes a host can hand us: absent, closed, torn down."""
+        class Buf:
+            def __init__(self, exc):
+                self.exc = exc
+
+            def write(self, _):
+                raise self.exc
+
+            def flush(self):
+                raise self.exc
+
+        class Out:
+            def __init__(self, exc):
+                self.buffer = Buf(exc)
+
+        return [None, Out(ValueError("closed file")), Out(BrokenPipeError())]
+
+    def test_nudge_keeps_its_counter_when_stdout_is_unusable(self):
+        # A nudge nobody could read must not be marked delivered, or the
+        # message is lost for good.
+        mod = self._load_script("pp-prompt-nudge.py")
+        for out in self._unusable_stdouts():
+            home = Path(tempfile.mkdtemp())
+            unread = home / ".pair-pressure" / "unread.json"
+            unread.parent.mkdir(parents=True)
+            unread.write_text(json.dumps({"__shared__": {
+                "count": 3, "latest": {"author": "a", "channel": "c"}}}),
+                encoding="utf-8")
+            with unittest.mock.patch.object(mod.Path, "home",
+                                            return_value=home), \
+                    unittest.mock.patch.object(mod.sys, "stdout", out):
+                mod.main()
+            self.assertEqual(
+                json.loads(unread.read_text())["__shared__"]["count"], 3,
+                "counter cleared despite stdout=%r" % (out,))
+
+    def test_statusline_never_raises_on_an_unusable_stdout(self):
+        mod = self._load_script("pp-statusline.py")
+        for out in self._unusable_stdouts():
+            home = Path(tempfile.mkdtemp())
+            (home / ".pair-pressure").mkdir(parents=True)
+            with unittest.mock.patch.object(mod.Path, "home",
+                                            return_value=home), \
+                    unittest.mock.patch.object(mod.sys, "stdout", out):
+                mod.main()  # must not raise
 
     def test_wired_commands_use_a_gui_interpreter(self):
         # pythonw is the only guarantee: Claude Code picks the spawn flags.
