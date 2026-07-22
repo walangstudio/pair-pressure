@@ -126,11 +126,14 @@ def main():
         line = prev_out + " " + badge
     else:
         line = prev_out or badge
-    # Claude Code accepts a blank statusline. sys.stdout is None under a
-    # GUI-subsystem interpreter when the host leaves stdout unredirected --
-    # nothing to render to, and crashing here would break the session.
-    if sys.stdout is not None:
+    # Claude Code accepts a blank statusline. stdout is None under a
+    # GUI-subsystem interpreter when the host leaves it unredirected, and
+    # closed or broken when the host tore the pipe down first. Nothing to
+    # render to in any of those cases, and raising would break the session.
+    try:
         sys.stdout.buffer.write(line.encode("utf-8") + b"\n")
+    except (AttributeError, ValueError, OSError):
+        pass
 
 
 if __name__ == "__main__":

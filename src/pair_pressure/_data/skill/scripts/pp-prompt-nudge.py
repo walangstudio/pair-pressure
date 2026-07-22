@@ -21,11 +21,6 @@ def main():
     except Exception:
         pass
 
-    # sys.stdout is None under a GUI-subsystem interpreter when the host
-    # leaves stdout unredirected. Bail BEFORE the counter is cleared -- a
-    # nudge nobody can read must not count as delivered.
-    if sys.stdout is None:
-        return
 
     unread = Path.home() / ".pair-pressure" / "unread.json"
     try:
@@ -63,7 +58,15 @@ def main():
     else:
         line = ("[pair-pressure] {} new messages (latest from {}{}) - run "
                 "/pp-chat:read to view".format(count, who, where))
-    sys.stdout.buffer.write(line.encode("utf-8") + b"\n")
+    # Delivery gates the ack. stdout is None under a GUI-subsystem
+    # interpreter when the host leaves it unredirected, and closed or broken
+    # when the host tore the pipe down first; in every one of those cases the
+    # nudge was never read, so the counter must survive to the next prompt.
+    try:
+        sys.stdout.buffer.write(line.encode("utf-8") + b"\n")
+        sys.stdout.buffer.flush()
+    except (AttributeError, ValueError, OSError):
+        return
 
     # Ack THIS bucket only so other sessions keep their badges.
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
