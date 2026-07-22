@@ -22,9 +22,10 @@ startup, on every statusline refresh, and on every `git` call underneath.
 - Verified against both the CLI and desktop shapes of Claude and Codex: a
   desktop host has no console to inherit, a CLI host has a pseudoconsole.
   The MCP stdio handshake is identical either way (18 tools). The hook
-  scripts now tolerate `sys.stdout is None`, which a GUI-subsystem
-  interpreter yields when the host leaves stdout unredirected; the nudge
-  bails before clearing its counter so an undelivered nudge is not lost.
+  scripts now tolerate an unusable stdout in all three shapes a host can
+  hand them: absent (`None`, which a GUI-subsystem interpreter yields when
+  stdout is unredirected), already closed, and torn down mid-run. Delivery
+  gates the nudge's ack, so a nudge nobody could read is never marked read.
 
 ## v1.1.0 - 2026-07-06
 
