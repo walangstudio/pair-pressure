@@ -33,10 +33,14 @@ from typing import Optional
 try:
     from mcp.server.fastmcp import FastMCP
 except ImportError as e:
-    sys.stderr.write(
-        "mcp SDK not installed. Run: pip install mcp\n"
-        f"({e})\n"
-    )
+    # sys.stderr is None when a GUI-subsystem host leaves stderr unredirected
+    # (this is a gui-scripts entry point). Exiting nonzero is the real signal;
+    # an AttributeError here would just bury it.
+    if sys.stderr is not None:
+        sys.stderr.write(
+            "mcp SDK not installed. Run: pip install mcp\n"
+            f"({e})\n"
+        )
     sys.exit(1)
 
 
@@ -47,6 +51,11 @@ PP = SKILL_ROOT / "scripts" / "pp.py"
 
 mcp = FastMCP("pair-pressure")
 
+# Windows: MCP hosts launch this server without a console of their own, so a
+# console-app child gets its own console WINDOW -- a command prompt flashing
+# on every single tool call. CREATE_NO_WINDOW suppresses it; no-op elsewhere.
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
 
 def _run(*args: str, body: Optional[str] = None):
     """Invoke pp.py and parse its JSON. Errors surface as {"error": "..."}."""
@@ -56,6 +65,7 @@ def _run(*args: str, body: Optional[str] = None):
         capture_output=True,
         text=True,
         env=os.environ.copy(),
+        creationflags=_NO_WINDOW,
     )
     if res.returncode != 0:
         # pp.py emits {"error": "..."} on stderr for handled failures.

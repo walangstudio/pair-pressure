@@ -38,6 +38,12 @@ pp-init = "pair_pressure._init:main"
 pp-setup = "pair_pressure._setup:main"
 # Legacy alias of pp-setup; kept so existing docs and CI scripts keep working.
 pp-install = "pair_pressure._setup:main"
+
+[project.gui-scripts]
+# GUI-subsystem launcher on Windows (identical to a console script elsewhere).
+# MCP hosts spawn this server themselves, so we do not control its creation
+# flags -- and a console-subsystem exe launched from a console-less host pops
+# a visible command prompt. stdio still works: the host supplies the pipes.
 pair-pressure-mcp = "pair_pressure._mcp:main"
 
 [project.urls]
