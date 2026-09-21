@@ -2756,8 +2756,10 @@ def _upgrade_legacy_wiring():
     """Rewrite a PowerShell-era statusLine/nudge wiring to the cross-platform
     Python scripts. Runs even once the autowire sentinel is stamped, because
     the .ps1 files are gone -- but only ever rewrites an existing pp wiring,
-    so a deliberate `wire --undo` is never resurrected. Returns True if it
-    changed anything."""
+    so a deliberate `wire --undo` is never resurrected. Returns True on a
+    successful rewrite, None when nothing needed upgrading, and False only
+    when an upgrade was needed but the settings write failed -- the caller
+    then leaves the sentinel unstamped so a later call retries."""
     sp = _claude_settings_path()
     try:
         raw = sp.read_text(encoding="utf-8-sig")
@@ -2786,7 +2788,7 @@ def _upgrade_legacy_wiring():
                     changed = True
 
     if not changed:
-        return False
+        return None
     try:
         bak = sp.with_suffix(".json.pp.bak")
         if not bak.exists():
@@ -2866,8 +2868,12 @@ def _ensure_wired(args):
         # it too is one-shot: an install stamped before v1.2.0 still names the
         # .ps1 scripts, which no longer ship, so repoint it once and re-stamp.
         if not _wiring_upgraded():
-            _upgrade_legacy_wiring()
-            _mark_wiring_upgraded()
+            # Stamp only if the upgrade completed (True) or there was nothing
+            # to upgrade (None). False means the write failed -- leave the
+            # sentinel unstamped so a later call retries, else a transient
+            # error would strand the install on the deleted .ps1 forever.
+            if _upgrade_legacy_wiring() is not False:
+                _mark_wiring_upgraded()
         return
     newly = _wire_statusline_quiet()
     _mark_wiring_upgraded()
@@ -3295,7 +3301,6 @@ def _watch_wire(undo=False, with_nudge=False):
         return out_l
 
     if undo:
-        sl = data.get("statusLine")
         prev = data.pop("_pp_prev_statusline", None)
         if _statusline_is_pp(data):
             if prev is not None:

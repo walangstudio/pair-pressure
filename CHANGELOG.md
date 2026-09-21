@@ -26,6 +26,12 @@ startup, on every statusline refresh, and on every `git` call underneath.
   hand them: absent (`None`, which a GUI-subsystem interpreter yields when
   stdout is unredirected), already closed, and torn down mid-run. Delivery
   gates the nudge's ack, so a nudge nobody could read is never marked read.
+- The legacy `.ps1`->`.py` upgrade only stamps itself done when the
+  settings write actually succeeds; a transient write failure now retries
+  on the next `pp` call instead of stranding the install on the deleted
+  `.ps1` statusline. The composed prior statusline also runs with an
+  absolute `cmd.exe` and a spawn timeout so a PATH gap or a hung prior
+  command can't take the badge down.
 
 ## v1.1.0 - 2026-07-06
 

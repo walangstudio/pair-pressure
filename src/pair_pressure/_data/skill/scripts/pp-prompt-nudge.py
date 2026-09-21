@@ -12,7 +12,7 @@ Enable/disable via `pp watch wire [--nudge] [--undo]`.
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -70,7 +70,7 @@ def main():
         return
 
     # Ack THIS bucket only so other sessions keep their badges.
-    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     cleared = {"count": 0, "latest": None, "updated_at": now}
     if legacy_flat:
         # migrate-in-place: wrap legacy as __shared__ and reset it
@@ -82,6 +82,9 @@ def main():
         unread.write_text(json.dumps(out, separators=(",", ":")),
                           encoding="utf-8")
     except OSError:
+        # Deliberate at-least-once: a transient write failure leaves the
+        # counter set, so the next prompt re-delivers (~15-25 tokens) rather
+        # than dropping the nudge. Re-charging beats losing a message.
         pass
 
 
