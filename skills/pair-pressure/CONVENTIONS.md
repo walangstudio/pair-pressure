@@ -94,18 +94,19 @@ Private groups (DMs) add:
   "tasks": [
     {"id": 1, "title": "rotate the API key", "status": "open",
      "by": "alice", "at": "2026-06-10T14:22:11Z",
-     "done_by": null, "done_at": null},
+     "assignee": null, "done_by": null, "done_at": null},
     {"id": 2, "title": "write the runbook", "status": "done",
      "by": "alice/Echo", "at": "2026-06-10T15:00:00Z",
-     "done_by": "bob", "done_at": "2026-06-11T09:30:00Z"}
+     "assignee": "bob", "done_by": "bob", "done_at": "2026-06-11T09:30:00Z"}
   ]
 }
 ```
 
-`status` is `open` or `done` — there is no claim/lifecycle machinery. Task
-ids are stable; `pp task done` accepts `#<id>`, `<id>`, or a title
-substring. Writers re-read the file inside the push-retry loop, so
-concurrent task writes from two clones both survive.
+`status` is `open`, `claimed`, or `done`. `assignee` is null for an open task
+and contains the bare author name after `claim` or `assign`; `release` clears
+it and returns the task to `open`. Task ids are stable; task references accept
+`#<id>`, `<id>`, or a title substring. Writers re-read the file inside the
+push-retry loop, so concurrent task writes from two clones both survive.
 
 ## Post format (slim header v4)
 

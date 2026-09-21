@@ -1,5 +1,56 @@
 # Changelog
 
+## v1.2.0 - 2026-07-22
+
+### No more flashing command prompts on Windows
+Hosts launch the MCP server and the statusline hook from a process that has
+no console of its own. Windows then gives every console-subsystem child its
+own console *window* - so pair-pressure popped a command prompt on MCP
+startup, on every statusline refresh, and on every `git` call underneath.
+
+- `pair-pressure-mcp` is now a `gui-scripts` entry point: a GUI-subsystem
+  launcher on Windows, unchanged elsewhere. The host picks the spawn flags,
+  so the subsystem is the only reliable lever. stdio is unaffected.
+- Every `subprocess` spawn in `pp.py` and the MCP shim passes
+  `CREATE_NO_WINDOW` (no-op off Windows).
+- The statusline and prompt-nudge hooks are now stdlib-only Python scripts
+  (`pp-statusline.py`, `pp-prompt-nudge.py`) replacing the PowerShell pair,
+  and are wired through `pythonw.exe` on Windows. Existing installs are
+  repointed automatically on the next `pp` call; `wire --undo` is respected.
+- The prior statusline (`_pp_prev_statusline`) still composes, now without
+  the `%TEMP%\pp_prev_*.cmd` temp files the PowerShell version left behind.
+- Verified against both the CLI and desktop shapes of Claude and Codex: a
+  desktop host has no console to inherit, a CLI host has a pseudoconsole.
+  The MCP stdio handshake is identical either way (18 tools). The hook
+  scripts now tolerate an unusable stdout in all three shapes a host can
+  hand them: absent (`None`, which a GUI-subsystem interpreter yields when
+  stdout is unredirected), already closed, and torn down mid-run. Delivery
+  gates the nudge's ack, so a nudge nobody could read is never marked read.
+- The legacy `.ps1`->`.py` upgrade only stamps itself done when the
+  settings write actually succeeds; a transient write failure now retries
+  on the next `pp` call instead of stranding the install on the deleted
+  `.ps1` statusline. The composed prior statusline also runs with an
+  absolute `cmd.exe` and a spawn timeout so a PATH gap or a hung prior
+  command can't take the badge down.
+
+## v1.1.0 - 2026-07-06
+
+### Codex plugin and marketplace
+- Added a native `.codex-plugin/plugin.json` that packages the shared
+  pair-pressure skill and 18-tool MCP server for Codex.
+- `pp-setup` now persists the author in `~/.pair-pressure/config.json`, so
+  plugin-launched MCP processes work without Claude settings or shell-profile
+  inheritance. The Codex bundle supplies `Codex` as its client alias.
+- Documented installation from the dual Claude/Codex Walang Studio
+  marketplace. The Python package with the `[mcp]` extra remains a prerequisite.
+- Extended `scripts/sync_plugin.py` to keep both Claude and Codex manifest
+  versions locked to the canonical package version and generate one
+  host-neutral skill without Claude-specific tool names.
+- Corrected the shared skill's task-handoff surface and added exact commands
+  for shell-only clients such as Pi and Aider.
+- Updated the canonical task schema documentation to include `claimed` state
+  and the `assignee` field used by claim/assign/release.
+
 ## v1.0.0 - 2026-06-11
 
 **Clean-break redesign: Discord-shaped, schema v3, multi-CLI.** One GitHub
