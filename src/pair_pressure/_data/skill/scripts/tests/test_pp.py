@@ -2807,6 +2807,26 @@ class EnsureWiredTests(PPBase):
             pp._ensure_wired(self._args())
         self.assertEqual(self.settings.read_text(), upgraded)
 
+    def test_legacy_upgrade_write_failure_leaves_sentinel_unstamped(self):
+        # A transient settings-write failure must NOT stamp the upgrade done,
+        # else the install is stranded on the deleted .ps1 forever. The next
+        # call has to retry and succeed.
+        self.sentinel.touch()
+        self.settings.write_text(json.dumps({
+            "statusLine": {
+                "type": "command",
+                "command": '"powershell.EXE" -File "/x/pp-statusline.ps1"'},
+        }), encoding="utf-8")
+        with unittest.mock.patch.object(
+                pp, "_upgrade_legacy_wiring", return_value=False):
+            pp._ensure_wired(self._args())
+        self.assertFalse(pp._wiring_upgraded())  # unstamped -> will retry
+
+        with self._silence():
+            pp._ensure_wired(self._args())  # real retry upgrades now
+        self.assertIn("pp-statusline.py", self.settings.read_text())
+        self.assertTrue(pp._wiring_upgraded())
+
     def test_legacy_upgrade_backs_up_settings(self):
         self.sentinel.touch()
         original = json.dumps({
@@ -2942,6 +2962,7 @@ class NoConsoleWindowTest(unittest.TestCase):
         mod = self._load_script("pp-prompt-nudge.py")
         for out in self._unusable_stdouts():
             home = Path(tempfile.mkdtemp())
+            self.addCleanup(_rmtree, home)
             unread = home / ".pair-pressure" / "unread.json"
             unread.parent.mkdir(parents=True)
             unread.write_text(json.dumps({"__shared__": {
@@ -2959,6 +2980,7 @@ class NoConsoleWindowTest(unittest.TestCase):
         mod = self._load_script("pp-statusline.py")
         for out in self._unusable_stdouts():
             home = Path(tempfile.mkdtemp())
+            self.addCleanup(_rmtree, home)
             (home / ".pair-pressure").mkdir(parents=True)
             with unittest.mock.patch.object(mod.Path, "home",
                                             return_value=home), \

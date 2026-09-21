@@ -23,6 +23,18 @@ from pathlib import Path
 _CREATE_NO_WINDOW = 0x08000000
 
 
+def _comspec():
+    """Absolute cmd.exe. COMSPEC first, then the System32 literal that always
+    exists -- bare "cmd.exe" is unresolvable when the host spawns this hook
+    with a PATH stripped of System32."""
+    exe = os.environ.get("COMSPEC")
+    if exe and os.path.exists(exe):
+        return exe
+    sysroot = os.environ.get("SystemRoot") or r"C:\Windows"
+    cand = os.path.join(sysroot, "System32", "cmd.exe")
+    return cand if os.path.exists(cand) else "cmd.exe"
+
+
 def _load(path):
     try:
         return json.loads(path.read_text(encoding="utf-8-sig") or "{}")
@@ -67,16 +79,19 @@ def _run_prev(prev, stdin_bytes):
         if os.name == "nt":
             # `cmd /s /c "<command>"` strips exactly the first and last quote
             # and takes the rest verbatim, which is what survives prior
-            # commands containing quoted paths with spaces.
-            comspec = os.environ.get("COMSPEC") or "cmd.exe"
-            args = '"{}" /s /c "{}"'.format(comspec, prev)
+            # commands containing quoted paths with spaces. Resolve cmd.exe
+            # absolutely: a hook spawned by the host can run with a PATH that
+            # lacks System32, where bare "cmd.exe" is unresolvable.
+            args = '"{}" /s /c "{}"'.format(_comspec(), prev)
             kwargs = {"creationflags": _CREATE_NO_WINDOW}
         else:
             args = ["/bin/sh", "-c", prev]
             kwargs = {}
+        # A hung prior statusline must not freeze every refresh; on timeout
+        # subprocess kills it and the broad except below yields ''.
         res = subprocess.run(
             args, input=stdin_bytes, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, **kwargs
+            stderr=subprocess.DEVNULL, timeout=5, **kwargs
         )
         return res.stdout.decode("utf-8", "replace").rstrip("\r\n")
     except Exception:
